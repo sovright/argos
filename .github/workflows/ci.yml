@@ -387,6 +387,20 @@ jobs:
           echo "reorg tests passed: $passed"
           test "$passed" -ge 1
 
+      # The pack builder against a real node: a pack built from the chain
+      # must scan exactly like the chain (same notes, anchor and JoinSplit
+      # count), and a second build must reproduce the manifest. Two builders
+      # agreeing on a hash cannot catch a builder bug; this can. Release
+      # step 4 in docs/sprout-pack.md requires it before shipping a pin.
+      - name: Sprout pack test
+        run: |
+          set -o pipefail
+          cargo test -p argos-core --test sprout_pack_regtest \
+            -- --ignored --nocapture 2>&1 | tee pack-test.log
+          passed=$(grep -cE '^test .* \.\.\. ok$' pack-test.log || true)
+          echo "pack tests passed: $passed"
+          test "$passed" -ge 1
+
       # The spend half, and the reason it is no longer optional: `rcm` is now
       # sampled per §4.7.1 rather than derived, which changes *every*
       # commitment Argos produces. A commitment the circuit and the chain

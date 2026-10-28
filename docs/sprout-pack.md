@@ -103,7 +103,8 @@ re-reads every chunk and prints the same summary.
    or txid byte order would pass both and hide notes from every user of
    the release. Before pinning:
    - `cargo test -p argos-core --test sprout_pack_regtest -- --ignored`
-     must pass against the regtest Sprout node at the release commit;
+     must pass against the regtest Sprout node at the release commit
+     (CI's `sprout-node-tests` job runs it on every push);
    - a pack-assisted mainnet scan and a plain p2p scan over the same
      range must agree on the tree root, the cursor, the full nullifier
      set, and the notes found for known test keys.
