@@ -91,13 +91,28 @@ re-reads every chunk and prints the same summary.
    one zebrad). **The two manifest SHA-256 values must match.**
 3. Cross-check the printed Sprout tree root against `zcash-cli
    z_gettreestate <H>` (`sprout.commitments.finalRoot`) on a zcashd node.
-4. Add the printed entry to `PINNED_PACKS` in
+4. Check the builder itself, not only the node. Steps 2 and 3 cannot catch
+   a builder bug: both maintainers run the same builder, so a bug gives
+   both the same hash, and the tree root covers only commitments. A
+   swapped nullifier, ciphertext, ephemeral key, `random_seed`, `js_index`
+   or txid byte order would pass both and hide notes from every user of
+   the release. Before pinning:
+   - `cargo test -p argos-core --test sprout_pack_regtest -- --ignored`
+     must pass against the regtest Sprout node at the release commit;
+   - a pack-assisted mainnet scan and a plain p2p scan over the same
+     range must agree on the tree root, the cursor, the full nullifier
+     set, and the notes found for known test keys.
+5. Add the printed entry to `PINNED_PACKS` in
    `crates/zeck-core/src/sprout_pack.rs` and ship it in the release.
-5. Upload `manifest.bin` and every chunk as release assets. Each chunk is
+6. Upload `manifest.bin` and every chunk as release assets. Each chunk is
    far under GitHub's 2 GiB per-asset limit. Mirrors (CDN, torrent) are
    fine: the pinned hash makes the download source irrelevant.
 
 ## Not done yet
+
+- **No equivalence tool.** Step 4's mainnet comparison has to be done by
+  hand today; a command that runs both scans and diffs the results is not
+  written yet.
 
 - **No pinned pack yet.** `PINNED_PACKS` is empty until the first mainnet
   pack has been built and reproduced, so mainnet scans refuse every pack

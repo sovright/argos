@@ -2266,7 +2266,8 @@ pub async fn run_sprout_scan_with_options(
     // Held across load, reconciliation and every atomic replacement. A
     // reviewed sweep proposal holds the same stable sidecar lock, so a scan
     // cannot replace the exact checkpoint while cleanup authority is live.
-    let checkpoint_lease = CheckpointLease::acquire_for(checkpoint_file, network, spending_keys)?;
+    let mut checkpoint_lease =
+        CheckpointLease::acquire_for(checkpoint_file, network, spending_keys)?;
 
     // `fetched` counts blocks, so reaching the anchor's height means having
     // fetched one past it.
@@ -2304,14 +2305,14 @@ pub async fn run_sprout_scan_with_options(
 
     if let Some(pack) = options.pack {
         let feed = PackFeed {
-            lease: &checkpoint_lease,
+            lease: &mut checkpoint_lease,
             pack,
             network,
             tip_anchor,
             floor,
             checkpoint_file,
         };
-        feed_pack(&feed, &mut scanner, &mut progress)?;
+        feed_pack(feed, &mut scanner, &mut progress).await?;
     }
 
     let mut height = first_scan_height(scanner.cursor());
@@ -2523,8 +2524,12 @@ pub async fn run_sprout_scan_with_options(
 const PACK_PAGE_BLOCKS: usize = crate::p2p::peer::MAX_PAGE_BLOCKS;
 
 /// What [`feed_pack`] needs besides the scanner.
+///
+/// Taken by value and holding the lease by `&mut`: [`CheckpointLease`] is
+/// deliberately not `Sync`, so a shared reference to it held across
+/// [`feed_pack`]'s yields would make the whole scan future not `Send`.
 struct PackFeed<'a> {
-    lease: &'a CheckpointLease,
+    lease: &'a mut CheckpointLease,
     pack: &'a crate::sprout_pack::SproutPack,
     network: P2pNetwork,
     tip_anchor: Option<TipAnchor>,
@@ -2548,10 +2553,19 @@ struct PackFeed<'a> {
 /// to be corrupt, and the caller drops it, so the checkpoint on disk still
 /// ends at the last verified chunk. Before the last chunk is saved, the
 /// rebuilt Sprout tree root must also equal the manifest's.
-fn feed_pack(
-    feed: &PackFeed<'_>,
+///
+/// # Cancellable between pages
+///
+/// Reading and trial-decrypting a pack is CPU work with no I/O to wait on,
+/// so without an explicit yield this would run to the end of the pack
+/// without ever returning to the runtime. Aborting the task (the GUI's
+/// release, which promises the keys are gone now) only takes effect at an
+/// `.await`, so it yields after every page. Stopping there is safe: nothing
+/// from a chunk is saved until the whole chunk has been verified.
+async fn feed_pack(
+    feed: PackFeed<'_>,
     scanner: &mut SproutScanner,
-    progress: &mut dyn FnMut(ScanTick),
+    progress: &mut impl FnMut(ScanTick),
 ) -> ZeckResult<()> {
     // Checked again here, not only in `SproutPack::open`: a pack opened for
     // inspection must not reach a mainnet scan by another route.
@@ -2627,6 +2641,7 @@ fn feed_pack(
             page.blocks.push((block.hash, block.joinsplits));
             if page.blocks.len() == PACK_PAGE_BLOCKS {
                 flush(&mut page, &mut page_start)?;
+                tokio::task::yield_now().await;
             }
         }
         flush(&mut page, &mut page_start)?;
@@ -2639,7 +2654,7 @@ fn feed_pack(
                 ),
             ));
         }
-        save_checkpoint_while_leased(feed.lease, scanner, feed.network, feed.checkpoint_file)?;
+        save_checkpoint_while_leased(&*feed.lease, scanner, feed.network, feed.checkpoint_file)?;
     }
     Ok(())
 }
@@ -6644,16 +6659,87 @@ mod tests {
         path: &Path,
         keys: &[[u8; 32]],
     ) -> ZeckResult<()> {
-        let lease = CheckpointLease::acquire_for(path, P2pNetwork::Regtest, keys)?;
+        let mut lease = CheckpointLease::acquire_for(path, P2pNetwork::Regtest, keys)?;
         let feed = PackFeed {
-            lease: &lease,
+            lease: &mut lease,
             pack,
             network: P2pNetwork::Regtest,
             tip_anchor: None,
             floor: 0,
             checkpoint_file: path,
         };
-        feed_pack(&feed, scanner, &mut |_| {})
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(feed_pack(feed, scanner, &mut |_| {}))
+    }
+
+    /// Review of #292: `feed_pack` never reached an `.await`, so aborting the
+    /// scan task (the GUI's release) waited for the whole pack, keeping the
+    /// spending keys in memory and the checkpoint being written after the
+    /// user was told the session was gone. On a single-threaded runtime the
+    /// abort can only land if the pack phase yields.
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_a_scan_during_its_pack_phase_stops_it_promptly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = ScratchDir::new("pack-abort");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        let pack_dir = pack_tmp.path().to_owned();
+        let end = 20_000;
+        crate::sprout_pack::test_support::write_pack(&pack_dir, P2pNetwork::Regtest, end);
+        let pages = (end as usize).div_ceil(PACK_PAGE_BLOCKS);
+
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let task = {
+            let ticks = ticks.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                let pack =
+                    crate::sprout_pack::SproutPack::open(&pack_dir, P2pNetwork::Regtest).unwrap();
+                let mut lease =
+                    CheckpointLease::acquire_for(&path, P2pNetwork::Regtest, &keys).unwrap();
+                let feed = PackFeed {
+                    lease: &mut lease,
+                    pack: &pack,
+                    network: P2pNetwork::Regtest,
+                    tip_anchor: None,
+                    floor: 0,
+                    checkpoint_file: &path,
+                };
+                let mut scanner = SproutScanner::new(&keys);
+                let mut started = Some(started_tx);
+                feed_pack(feed, &mut scanner, &mut |_| {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    if let Some(tx) = started.take() {
+                        let _ = tx.send(());
+                    }
+                })
+                .await
+            })
+        };
+
+        started_rx.await.expect("the pack phase started");
+        task.abort();
+        let outcome = task.await;
+        assert!(
+            outcome.as_ref().is_err_and(|e| e.is_cancelled()),
+            "the pack phase ran to the end instead of stopping: {outcome:?}"
+        );
+        let seen = ticks.load(Ordering::SeqCst);
+        assert!(
+            seen < pages,
+            "{seen} of {pages} pages were read after the abort"
+        );
+        assert!(
+            load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+                .unwrap()
+                .is_none(),
+            "nothing from the unfinished chunk was saved"
+        );
     }
 
     fn scanned_directly(keys: &[[u8; 32]], end_height: u32) -> SproutScanner {
