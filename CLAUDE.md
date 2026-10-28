@@ -209,10 +209,14 @@ corrupt chunk keeps nothing; and a mainnet scan refuses an unpinned pack
 (checked in `SproutPack::open` and again in `feed_pack`). A bad pack cannot
 mark a live note spent (nullifiers are keyed by `a_sk`), but it can hide
 notes (ciphertexts are not bound by the tree root) or omit real spends.
-`PINNED_PACKS` is empty until two maintainers reproduce the same manifest
-hash from independent nodes *and* the builder is checked independently
-(regtest pack test plus a mainnet pack-vs-p2p equivalence scan), since
-identical builders reproduce identical bugs. `feed_pack` yields after every
+`PINNED_PACKS` holds one mainnet pack (blocks 1 to 3,500,000), whose
+manifest hash two Zebra nodes in different regions reproduced. Reproduction
+is not enough on its own, since identical builders reproduce identical bugs:
+no release may ship with a pin until the builder is checked independently
+(regtest pack test plus a mainnet pack-vs-p2p equivalence scan), and the
+3,500,000 pin has not passed that check yet. No live node returns the Sprout
+tree root any more (Zebra omits it from `z_gettreestate`), so `verify`
+rebuilding it from the chunks is the only root check. `feed_pack` yields after every
 page so aborting a scan (the GUI's release) stops it promptly. The
 pack is built by the maintainer-only `argos-sprout-pack` binary
 (`sprout_pack_build`), which dials only the named nodes
