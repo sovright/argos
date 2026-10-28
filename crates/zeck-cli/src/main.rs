@@ -1505,6 +1505,7 @@ async fn scan_sprout(
             decrypt_from,
             pack: pack.as_ref(),
             stop_at: None,
+            digest_joinsplits: false,
         },
         |tick| {
             // A wait for a peer is printed every time it is announced, not

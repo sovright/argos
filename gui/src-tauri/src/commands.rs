@@ -453,9 +453,21 @@ pub struct SproutPackSummary {
 
 /// Open a Sprout pack's manifest with the same rules the scan applies, so a
 /// wrong folder or an unpinned mainnet pack is reported when it is chosen.
+///
+/// Async, with the read on a blocking thread: a sync command runs on the main
+/// thread, and a slow disk or network folder would freeze the window.
 #[tauri::command]
-pub fn describe_sprout_pack(path: String, network: String) -> Result<SproutPackSummary, String> {
-    let network = sprout_network(&network)?;
+pub async fn describe_sprout_pack(
+    path: String,
+    network: String,
+) -> Result<SproutPackSummary, String> {
+    tokio::task::spawn_blocking(move || describe_sprout_pack_blocking(&path, &network))
+        .await
+        .map_err(|err| format!("checking the Sprout pack stopped unexpectedly: {err}"))?
+}
+
+fn describe_sprout_pack_blocking(path: &str, network: &str) -> Result<SproutPackSummary, String> {
+    let network = sprout_network(network)?;
     let pack = argos_core::sprout_pack::SproutPack::open(
         std::path::Path::new(path.trim()),
         network.into(),
@@ -2235,6 +2247,8 @@ pub async fn start_sprout_scan(
             argos_core::sprout_scan_run::SproutScanOptions {
                 decrypt_from,
                 pack: pack.as_ref(),
+                stop_at: None,
+                digest_joinsplits: false,
             },
             move |tick| {
                 let _ = emitter.emit(
@@ -3595,6 +3609,27 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{sprout_nu7_warning, summary_nu7_warning};
+
+    /// Review of #292: the pack check read the manifest on the main thread,
+    /// so a slow disk or network folder froze the window. It is async now and
+    /// reads on a blocking thread; a folder without a pack still says so.
+    #[tokio::test]
+    async fn describing_a_folder_without_a_pack_reports_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-describe-pack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result =
+            super::describe_sprout_pack(dir.to_string_lossy().into_owned(), "mainnet".to_owned())
+                .await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+    }
 
     #[test]
     fn resume_wallet_input_does_not_require_a_seed_phrase() {

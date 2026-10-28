@@ -95,6 +95,7 @@ async fn a_pack_built_from_a_node_scans_like_the_chain() {
             decrypt_from: None,
             pack: Some(&pack),
             stop_at: None,
+            digest_joinsplits: false,
         },
         |_| {},
     )
@@ -139,6 +140,7 @@ async fn a_pack_built_from_a_node_scans_like_the_chain() {
             P2pNetwork::Regtest,
         )
     };
+    let mut digests = Vec::new();
     for (dir, pack) in [("stop-with-pack", Some(&pack)), ("stop-without", None)] {
         let result = sprout_scan_run::run_sprout_scan_with_options(
             &[a_sk],
@@ -150,13 +152,19 @@ async fn a_pack_built_from_a_node_scans_like_the_chain() {
                 decrypt_from: None,
                 pack,
                 stop_at: Some(end_height),
+                digest_joinsplits: true,
             },
             |_| {},
         )
         .await
         .expect("stopped scan");
         assert_eq!(result.progress.last_height, end_height, "{dir}");
+        digests.push(result.joinsplit_digest.expect("digest requested"));
     }
+    assert_eq!(
+        digests[0], digests[1],
+        "the pack's JoinSplits must equal the chain's, field by field"
+    );
     let differences = sprout_scan_run::compare_saved_scans(
         &stopped("stop-with-pack"),
         &stopped("stop-without"),

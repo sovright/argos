@@ -85,14 +85,17 @@ enum Command {
     ///
     /// The pack scan runs first and reads only the pack; the p2p scan then
     /// walks the chain from --peer, which it tries first, and from the
-    /// built-in peers a normal scan uses. Both stop at the pack's end height, and the
-    /// saved tree root, cursor, progress, spent-nullifier set and notes must
-    /// be identical. Exits non-zero on any difference. Re-running with the
-    /// same --work-dir resumes an interrupted p2p scan.
+    /// built-in peers a normal scan uses. Both stop at the pack's end height.
+    /// Their running digests over every JoinSplit field, in chain order, must
+    /// match, and so must the saved tree root, cursor, progress,
+    /// spent-nullifier set and notes. Exits non-zero on any difference.
+    ///
+    /// --work-dir must be new or empty: both scans start from nothing, so a
+    /// result can never come from an earlier pack or an earlier run.
     ///
     /// Scans with a fixed, published key that holds no funds: the scan needs
-    /// a key to trial-decrypt with, and nothing compared here depends on it
-    /// except the notes, of which it has none.
+    /// a key to trial-decrypt with. The digest, not the key, is what covers
+    /// the fields that decide whether a note is found.
     Compare {
         #[arg(long, value_enum, default_value = "mainnet")]
         network: Network,
@@ -103,14 +106,13 @@ enum Command {
         /// The pack directory. On mainnet it must be pinned in this build.
         #[arg(long)]
         pack: PathBuf,
-        /// Directory for the two scans' checkpoints.
+        /// Directory for the two scans' checkpoints. Must be new or empty.
         #[arg(long)]
         work_dir: PathBuf,
     },
 }
 
-/// The key `compare` scans with. Public on purpose: it holds no funds, and
-/// a fixed key keeps the checkpoint paths stable so a re-run resumes. The
+/// The key `compare` scans with. Public on purpose: it holds no funds. The
 /// top four bits are clear, as a Sprout spending key requires.
 const COMPARE_KEY: [u8; 32] = [0x0a; 32];
 
@@ -146,6 +148,14 @@ async fn compare(
     }
     .with_context(|| format!("opening {}", pack_dir.display()))?;
     let end_height = pack.end_height();
+    let reused = std::fs::read_dir(&work_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !reused,
+        "{} is not empty. Use a new --work-dir: both scans must start from nothing.",
+        work_dir.display()
+    );
     let keys = [COMPARE_KEY];
     let checkpoint = |name: &str| {
         sprout_scan_run::checkpoint_path_for_network(&work_dir.join(name), &keys, network)
@@ -155,18 +165,28 @@ async fn compare(
     // The pack scan first: it reads only local files and takes minutes, so
     // a problem with it shows before the long p2p scan rather than after.
     eprintln!("Scanning heights 1 to {end_height} from the pack.");
-    scan_to(network, &peers, &from_pack, Some(&pack), end_height).await?;
+    let pack_digest = scan_to(network, &peers, &from_pack, Some(&pack), end_height).await?;
     eprintln!("Scanning heights 1 to {end_height} over p2p.");
-    scan_to(network, &peers, &over_p2p, None, end_height).await?;
+    let p2p_digest = scan_to(network, &peers, &over_p2p, None, end_height).await?;
 
-    let differences = sprout_scan_run::compare_saved_scans(&over_p2p, &from_pack, network, &keys)
-        .context("comparing the two scans")?;
+    let mut differences =
+        sprout_scan_run::compare_saved_scans(&over_p2p, &from_pack, network, &keys)
+            .context("comparing the two scans")?;
+    if p2p_digest != pack_digest {
+        differences.push(format!(
+            "JoinSplit digest: {} over p2p vs {} from the pack",
+            to_hex(&p2p_digest),
+            to_hex(&pack_digest)
+        ));
+    }
     println!();
     println!("  pack manifest      {}", to_hex(&pack.manifest_sha256()));
     println!("  compared heights   1 to {end_height}");
+    println!("  JoinSplit digest   {}", to_hex(&pack_digest));
     if differences.is_empty() {
         println!(
-            "  result             identical: tree root, cursor, progress, spent nullifiers, notes"
+            "  result             identical: every JoinSplit field, tree root, cursor, \
+             progress, spent nullifiers, notes"
         );
         Ok(())
     } else {
@@ -183,7 +203,7 @@ async fn scan_to(
     checkpoint: &Path,
     pack: Option<&SproutPack>,
     end_height: u32,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     let started = Instant::now();
     let mut last_report = Instant::now();
     let result = sprout_scan_run::run_sprout_scan_with_options(
@@ -196,6 +216,7 @@ async fn scan_to(
             decrypt_from: None,
             pack,
             stop_at: Some(end_height),
+            digest_joinsplits: true,
         },
         |tick: ScanTick| {
             if let Some(wait) = tick.peer_wait {
@@ -224,7 +245,9 @@ async fn scan_to(
         result.progress.joinsplits_seen,
         started.elapsed()
     );
-    Ok(())
+    result
+        .joinsplit_digest
+        .context("the scan returned no JoinSplit digest (it was rewound)")
 }
 
 async fn build(
