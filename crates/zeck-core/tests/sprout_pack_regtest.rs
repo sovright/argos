@@ -94,6 +94,7 @@ async fn a_pack_built_from_a_node_scans_like_the_chain() {
         SproutScanOptions {
             decrypt_from: None,
             pack: Some(&pack),
+            stop_at: None,
         },
         |_| {},
     )
@@ -119,4 +120,49 @@ async fn a_pack_built_from_a_node_scans_like_the_chain() {
         assert_eq!(a.anchor, b.anchor, "the pack must give the same witness");
         assert_eq!(a.outpoint, b.outpoint);
     }
+    let differences = sprout_scan_run::compare_saved_scans(
+        &sprout_scan_run::checkpoint_path_for_network(&with_pack_dir, &[a_sk], P2pNetwork::Regtest),
+        &sprout_scan_run::checkpoint_path_for_network(&without_dir, &[a_sk], P2pNetwork::Regtest),
+        P2pNetwork::Regtest,
+        &[a_sk],
+    )
+    .expect("compare at the tip");
+    assert!(differences.is_empty(), "at the tip: {differences:?}");
+
+    // Release procedure step 4, as `argos-sprout-pack compare` runs it: both
+    // scans stop at the pack's end height, one from the pack and one over
+    // p2p, and their saved states must not differ.
+    let stopped = |dir: &str| {
+        sprout_scan_run::checkpoint_path_for_network(
+            &parent.path().join(dir),
+            &[a_sk],
+            P2pNetwork::Regtest,
+        )
+    };
+    for (dir, pack) in [("stop-with-pack", Some(&pack)), ("stop-without", None)] {
+        let result = sprout_scan_run::run_sprout_scan_with_options(
+            &[a_sk],
+            P2pNetwork::Regtest,
+            &[NODE_P2P.to_owned()],
+            None,
+            &stopped(dir),
+            SproutScanOptions {
+                decrypt_from: None,
+                pack,
+                stop_at: Some(end_height),
+            },
+            |_| {},
+        )
+        .await
+        .expect("stopped scan");
+        assert_eq!(result.progress.last_height, end_height, "{dir}");
+    }
+    let differences = sprout_scan_run::compare_saved_scans(
+        &stopped("stop-with-pack"),
+        &stopped("stop-without"),
+        P2pNetwork::Regtest,
+        &[a_sk],
+    )
+    .expect("compare at the pack end");
+    assert!(differences.is_empty(), "at the pack end: {differences:?}");
 }

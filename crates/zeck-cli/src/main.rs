@@ -1504,6 +1504,7 @@ async fn scan_sprout(
         argos_core::sprout_scan_run::SproutScanOptions {
             decrypt_from,
             pack: pack.as_ref(),
+            stop_at: None,
         },
         |tick| {
             // A wait for a peer is printed every time it is announced, not

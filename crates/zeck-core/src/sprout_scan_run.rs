@@ -2226,6 +2226,7 @@ pub async fn run_sprout_scan_with_decrypt_from(
         SproutScanOptions {
             decrypt_from,
             pack: None,
+            stop_at: None,
         },
         progress,
     )
@@ -2245,6 +2246,14 @@ pub struct SproutScanOptions<'a> {
     /// reconciliation that every resumed scan already performs asks live
     /// peers to confirm it before the walk continues.
     pub pack: Option<&'a crate::sprout_pack::SproutPack>,
+    /// Stop once this height has been scanned, instead of at the chain tip.
+    ///
+    /// For comparing two scans over the same range, such as a pack-assisted
+    /// scan and a plain p2p scan (release procedure step 4 in
+    /// `docs/sprout-pack.md`). The checkpoint is saved as incomplete, so it
+    /// never reads as full coverage. With a pack, the stop may not be below
+    /// the pack's end height; at exactly the end height no peer is dialled.
+    pub stop_at: Option<u32>,
 }
 
 /// [`run_sprout_scan`] with every option.
@@ -2303,6 +2312,17 @@ pub async fn run_sprout_scan_with_options(
         None => SproutScanner::with_decrypt_from(spending_keys, decrypt_from),
     };
 
+    let stop_at = options.stop_at;
+    if let (Some(stop), Some(pack)) = (stop_at, options.pack) {
+        if stop < pack.end_height() {
+            return Err(ZeckError::ScanNotReady(format!(
+                "the stop height {stop} is below the Sprout pack's end height {}; a \
+                 pack is read whole.",
+                pack.end_height()
+            )));
+        }
+    }
+
     if let Some(pack) = options.pack {
         let feed = PackFeed {
             lease: &mut checkpoint_lease,
@@ -2313,6 +2333,19 @@ pub async fn run_sprout_scan_with_options(
             checkpoint_file,
         };
         feed_pack(feed, &mut scanner, &mut progress).await?;
+    }
+
+    if let Some(stop) = stop_at {
+        let scanned = scanner.cursor().map_or(0, |c| c.last_height);
+        if scanned > stop {
+            return Err(ZeckError::ScanNotReady(format!(
+                "the saved scan is already at height {scanned}, past the stop height \
+                 {stop}. Start from an empty checkpoint."
+            )));
+        }
+        if scanned == stop {
+            return finish_stopped_scan(checkpoint_lease, scanner, network, checkpoint_file);
+        }
     }
 
     let mut height = first_scan_height(scanner.cursor());
@@ -2466,9 +2499,10 @@ pub async fn run_sprout_scan_with_options(
                 return Err(err);
             }
         };
-        let Some(page) = page else {
+        let Some(mut page) = page else {
             break;
         };
+        clip_page_to_stop(&mut page, height, stop_at);
 
         // Already in header order, and already complete: `next_page`
         // assembles the page in the order the headers came in and treats a
@@ -2499,6 +2533,11 @@ pub async fn run_sprout_scan_with_options(
             joinsplits_seen: p.joinsplits_seen,
             peer_wait: None,
         });
+
+        if stop_at.is_some_and(|stop| height > stop) {
+            drop(fetch_task);
+            return finish_stopped_scan(checkpoint_lease, scanner, network, checkpoint_file);
+        }
     }
 
     // The fetcher has already returned after reporting the tip; dropping it
@@ -2707,6 +2746,112 @@ fn consume_page_or_save(
         height,
         checkpoint_file,
     )
+}
+
+/// Drop the blocks of a page that lie above the stop height. `height` is the
+/// height of the page's first block.
+fn clip_page_to_stop(page: &mut Page, height: u32, stop_at: Option<u32>) {
+    if let Some(stop) = stop_at {
+        let keep = stop.saturating_add(1).saturating_sub(height) as usize;
+        page.blocks.truncate(keep);
+    }
+}
+
+/// End a scan at its stop height. Saved as incomplete: the scan did not
+/// reach the tip, so its checkpoint must not read as full coverage.
+fn finish_stopped_scan(
+    lease: CheckpointLease,
+    mut scanner: SproutScanner,
+    network: P2pNetwork,
+    checkpoint_file: &Path,
+) -> ZeckResult<SproutScanResult> {
+    scanner.mark_incomplete();
+    save_checkpoint_while_leased(&lease, &scanner, network, checkpoint_file)?;
+    let generation = lease.generation(checkpoint_file)?;
+    lease.verify_for(checkpoint_file)?;
+    let mut result = scanner
+        .finish()
+        .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))?;
+    result.checkpoint_generation = Some(generation);
+    Ok(result)
+}
+
+/// Compare two saved scans of the same keys on the same network.
+///
+/// Returns one line per difference, each starting with what differs: tree
+/// root, cursor, progress, spent nullifiers, or notes. Empty means the two
+/// scans ended in the same state. This is the comparison release procedure
+/// step 4 asks for between a pack-assisted scan and a plain p2p scan.
+pub fn compare_saved_scans(
+    first: &Path,
+    second: &Path,
+    network: P2pNetwork,
+    spending_keys: &[[u8; 32]],
+) -> ZeckResult<Vec<String>> {
+    let load = |path: &Path| {
+        load_checkpoint(path, network, spending_keys)?.ok_or_else(|| {
+            ZeckError::ScanNotReady(format!("there is no saved scan at {}", path.display()))
+        })
+    };
+    let (a, b) = (load(first)?, load(second)?);
+    let hex = crate::sprout_pack::to_hex;
+    let mut differences = Vec::new();
+
+    if a.anchor() != b.anchor() {
+        differences.push(format!(
+            "tree root: {} vs {}",
+            hex(&a.anchor()),
+            hex(&b.anchor())
+        ));
+    }
+    if a.cursor() != b.cursor() {
+        differences.push(format!("cursor: {:?} vs {:?}", a.cursor(), b.cursor()));
+    }
+    if a.progress() != b.progress() {
+        differences.push(format!(
+            "progress: {:?} vs {:?}",
+            a.progress(),
+            b.progress()
+        ));
+    }
+    let (na, nb) = (a.spent_nullifiers(), b.spent_nullifiers());
+    if na != nb {
+        let only_first = na.keys().filter(|nf| !nb.contains_key(*nf)).count();
+        let only_second = nb.keys().filter(|nf| !na.contains_key(*nf)).count();
+        let changed = na
+            .iter()
+            .filter(|(nf, spender)| nb.get(*nf).is_some_and(|other| other != *spender))
+            .count();
+        differences.push(format!(
+            "spent nullifiers: {} vs {}; {only_first} only in the first, {only_second} \
+             only in the second, {changed} spent by a different transaction",
+            na.len(),
+            nb.len()
+        ));
+    }
+
+    let finish = |scanner: SproutScanner| {
+        scanner
+            .finish()
+            .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))
+    };
+    let (ra, rb) = (finish(a)?, finish(b)?);
+    let notes = |r: &SproutScanResult| {
+        r.notes
+            .iter()
+            .map(|n| format!("{:?} anchor {}", n.outpoint, hex(&n.anchor)))
+            .collect::<Vec<_>>()
+    };
+    if ra.spent_notes != rb.spent_notes || notes(&ra) != notes(&rb) {
+        differences.push(format!(
+            "notes: {} unspent and {} spent vs {} unspent and {} spent",
+            ra.notes.len(),
+            ra.spent_notes,
+            rb.notes.len(),
+            rb.spent_notes
+        ));
+    }
+    Ok(differences)
 }
 
 fn consume_page_or_save_while_leased(
@@ -6798,6 +6943,149 @@ mod tests {
         feed_from(&pack, &mut again, &path, &keys).unwrap();
         assert_same_scan(&again, &scanner);
         discard_checkpoint(&path).unwrap();
+    }
+
+    fn page_from(first_height: u32, last_height: u32) -> Page {
+        use crate::sprout_pack::test_support::{block_hash, block_joinsplits};
+        Page {
+            parent: block_hash(first_height - 1),
+            blocks: (first_height..=last_height)
+                .map(|h| (block_hash(h), block_joinsplits(h)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_page_is_clipped_to_the_stop_height() {
+        let mut page = page_from(10, 14);
+        clip_page_to_stop(&mut page, 10, Some(12));
+        assert_eq!(page.blocks.len(), 3);
+
+        let mut page = page_from(10, 14);
+        clip_page_to_stop(&mut page, 10, Some(14));
+        assert_eq!(page.blocks.len(), 5);
+
+        let mut page = page_from(10, 14);
+        clip_page_to_stop(&mut page, 10, None);
+        assert_eq!(page.blocks.len(), 5);
+    }
+
+    /// The step-4 comparison: two scans of the same blocks, one from a pack
+    /// and one block by block, have no differences.
+    #[test]
+    fn saved_scans_of_the_same_blocks_compare_equal() {
+        let dir = ScratchDir::new("compare-equal");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        crate::sprout_pack::test_support::write_pack(pack_tmp.path(), P2pNetwork::Regtest, 700);
+        let pack =
+            crate::sprout_pack::SproutPack::open(pack_tmp.path(), P2pNetwork::Regtest).unwrap();
+        let keys = [[0x11; 32]];
+
+        let from_pack = checkpoint_path_for_network(&dir.0.join("a"), &keys, P2pNetwork::Regtest);
+        feed_from(&pack, &mut SproutScanner::new(&keys), &from_pack, &keys).unwrap();
+        let direct = checkpoint_path_for_network(&dir.0.join("b"), &keys, P2pNetwork::Regtest);
+        save_checkpoint(&scanned_directly(&keys, 700), P2pNetwork::Regtest, &direct).unwrap();
+
+        let differences =
+            compare_saved_scans(&from_pack, &direct, P2pNetwork::Regtest, &keys).unwrap();
+        assert!(differences.is_empty(), "{differences:?}");
+    }
+
+    #[test]
+    fn saved_scans_that_end_apart_report_each_difference() {
+        let dir = ScratchDir::new("compare-apart");
+        let keys = [[0x11; 32]];
+        let a = checkpoint_path_for_network(&dir.0.join("a"), &keys, P2pNetwork::Regtest);
+        save_checkpoint(&scanned_directly(&keys, 700), P2pNetwork::Regtest, &a).unwrap();
+        let b = checkpoint_path_for_network(&dir.0.join("b"), &keys, P2pNetwork::Regtest);
+        save_checkpoint(&scanned_directly(&keys, 650), P2pNetwork::Regtest, &b).unwrap();
+
+        let differences = compare_saved_scans(&a, &b, P2pNetwork::Regtest, &keys).unwrap();
+        for field in ["tree root", "cursor", "progress"] {
+            assert!(
+                differences.iter().any(|d| d.starts_with(field)),
+                "no {field} difference in {differences:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparing_a_missing_scan_is_an_error() {
+        let dir = ScratchDir::new("compare-missing");
+        let keys = [[0x11; 32]];
+        let a = checkpoint_path_for_network(&dir.0.join("a"), &keys, P2pNetwork::Regtest);
+        save_checkpoint(&scanned_directly(&keys, 10), P2pNetwork::Regtest, &a).unwrap();
+        let b = checkpoint_path_for_network(&dir.0.join("b"), &keys, P2pNetwork::Regtest);
+        assert!(compare_saved_scans(&a, &b, P2pNetwork::Regtest, &keys).is_err());
+    }
+
+    /// With the stop at the pack's end, the scan never dials a peer: there
+    /// are none to dial here, so reaching the network would fail the scan.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_scan_stopped_at_the_pack_end_reads_nothing_from_the_network() {
+        let dir = ScratchDir::new("stop-at-pack-end");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        crate::sprout_pack::test_support::write_pack(pack_tmp.path(), P2pNetwork::Regtest, 700);
+        let pack =
+            crate::sprout_pack::SproutPack::open(pack_tmp.path(), P2pNetwork::Regtest).unwrap();
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+
+        let result = run_sprout_scan_with_options(
+            &keys,
+            P2pNetwork::Regtest,
+            &[],
+            None,
+            &path,
+            SproutScanOptions {
+                decrypt_from: None,
+                pack: Some(&pack),
+                stop_at: Some(700),
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.progress, scanned_directly(&keys, 700).progress());
+
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .unwrap()
+            .expect("saved");
+        assert_same_scan(&saved, &scanned_directly(&keys, 700));
+        assert!(
+            !saved.is_complete(),
+            "a stopped scan must not read as full coverage"
+        );
+        discard_checkpoint(&path).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_below_the_pack_end_is_refused() {
+        let dir = ScratchDir::new("stop-below-pack");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        crate::sprout_pack::test_support::write_pack(pack_tmp.path(), P2pNetwork::Regtest, 700);
+        let pack =
+            crate::sprout_pack::SproutPack::open(pack_tmp.path(), P2pNetwork::Regtest).unwrap();
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+
+        let err = run_sprout_scan_with_options(
+            &keys,
+            P2pNetwork::Regtest,
+            &[],
+            None,
+            &path,
+            SproutScanOptions {
+                decrypt_from: None,
+                pack: Some(&pack),
+                stop_at: Some(500),
+            },
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("stop height"), "{err}");
     }
 
     /// A corrupt chunk keeps nothing from itself: the checkpoint ends at the
