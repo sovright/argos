@@ -123,12 +123,11 @@ use zcash_protocol::consensus::BranchId;
 
 /// The height of the first block a walk will scan.
 ///
-/// Height 1 for a fresh scan, not genesis. `getheaders` returns the blocks
-/// *after* the locator, so an all-zero locator yields the child of genesis:
-/// the peer never serves genesis itself, and an earlier comment here claiming
-/// otherwise ("the all-zero locator makes the peer include genesis") was
-/// simply wrong. Confirmed directly against a node — the first header of a
-/// fresh walk has genesis as its `prev_hash`.
+/// Height 1 for a fresh scan, not genesis. zcashd answers an all-zero
+/// locator with the child of genesis; Zebra answers it starting at genesis
+/// itself, and [`select_page_headers`] drops it. Either way the first block a
+/// fresh walk scans is height 1. (Earlier comments here each described only
+/// one implementation, which is how the Zebra case went unhandled.)
 ///
 /// Nothing is lost by starting at 1. A Zcash genesis block holds a single
 /// coinbase transaction and therefore no JoinSplit, so it contributes no
@@ -2780,6 +2779,69 @@ fn consume_page(
 /// them `&mut` out-params — carried through a function that needed an
 /// `#[allow(clippy::too_many_arguments)]` to exist. They are one thing: the
 /// fetcher's own state.
+/// What a `headers` reply is good for, once linkage is checked.
+#[derive(Debug)]
+enum FreshPage {
+    /// The headers to fetch, starting with the block after the locator.
+    Headers(Vec<crate::p2p::wire::BlockHeader>),
+    /// A fresh walk's reply held genesis and nothing after it; carries the
+    /// genesis hash to ask from next.
+    OnlyGenesis([u8; 32]),
+    /// Does not continue from the locator, or is not itself a chain.
+    Unusable,
+}
+
+/// Choose the headers of one page from a peer's `headers` reply.
+///
+/// The peer must be continuing from exactly where we asked, and the page must
+/// itself be a chain. A peer that does not recognise the locator serves from
+/// genesis, which would re-append the whole prefix into a tree that already
+/// contains it; a peer starting partway would skip the blocks before it.
+/// Either silently shifts every later commitment position.
+///
+/// A fresh walk asks with an all-zero locator, which is not a block hash, and
+/// the two node implementations answer it differently. zcashd serves the
+/// blocks after genesis, so `headers[0]` is height 1 and its parent, genesis,
+/// is something we have never seen: that first link cannot be checked.
+/// Zebra serves genesis itself first. Genesis is the only block whose parent
+/// is all zero, so it is recognised by that and dropped: the walk counts its
+/// first block as height 1 ([`first_scan_height`]), and keeping genesis
+/// labelled every later block one too high. The pack build against Zebra
+/// stopped at the first pinned checkpoint, 100,000, on exactly that. Dropping
+/// it loses nothing, since a genesis coinbase holds no JoinSplit. With genesis
+/// in hand, the next header must link to it, which is stricter than a zcashd
+/// reply allows.
+///
+/// The relaxation is tied to the locator being the all-zero sentinel, true
+/// exactly once, on the first page of a fresh walk. It is deliberately not the
+/// old `height > 0` guard, which skipped the check whenever the counter
+/// happened to be zero and so accepted a first page starting anywhere.
+fn select_page_headers(
+    locator: [u8; 32],
+    mut headers: Vec<crate::p2p::wire::BlockHeader>,
+) -> FreshPage {
+    const NO_PARENT: [u8; 32] = [0u8; 32];
+    let Some(first) = headers.first() else {
+        return FreshPage::Unusable;
+    };
+    let fresh_walk = locator == NO_PARENT;
+    if fresh_walk && first.prev_hash == NO_PARENT {
+        let genesis = headers.remove(0).hash;
+        match headers.first() {
+            None => return FreshPage::OnlyGenesis(genesis),
+            Some(next) if next.prev_hash != genesis => return FreshPage::Unusable,
+            Some(_) => {}
+        }
+    } else if !fresh_walk && first.prev_hash != locator {
+        return FreshPage::Unusable;
+    }
+    if headers.windows(2).all(|w| w[1].prev_hash == w[0].hash) {
+        FreshPage::Headers(headers)
+    } else {
+        FreshPage::Unusable
+    }
+}
+
 pub(crate) struct PageFetcher {
     peer: crate::p2p::peer::Peer,
     locator: [u8; 32],
@@ -3019,40 +3081,29 @@ impl PageFetcher {
                 .await;
         }
 
-        // The peer must be continuing from exactly where we asked, and the
-        // page must itself be a chain. A peer that does not recognise the
-        // locator serves from genesis, which would re-append the whole prefix
-        // into a tree that already contains it; a peer starting partway would
-        // skip the blocks before it. Either silently shifts every later
-        // commitment position.
-        //
-        // A fresh walk cannot check the first link, because there is nothing
-        // to check it against: `getheaders` serves the blocks *after* the
-        // locator, and an all-zero locator is not a block hash, so
-        // `headers[0]` is the child of genesis and its `prev_hash` is the
-        // genesis hash. Requiring it to equal the locator rejected every fresh
-        // scan's first page.
-        //
-        // This is deliberately not the old `height > 0` guard, which skipped
-        // the check whenever the counter happened to be zero and so accepted a
-        // first page starting anywhere. The relaxation is tied to the locator
-        // being the all-zero sentinel, true exactly once, on the first page of
-        // a fresh walk.
-        let fresh_walk = self.locator == [0u8; 32];
-        let first_link_ok = fresh_walk || headers[0].prev_hash == self.locator;
-        if !first_link_ok || !headers.windows(2).all(|w| w[1].prev_hash == w[0].hash) {
-            // Charged against the same budget as an empty reply: a peer that
-            // answers with an unusable page is no more useful than one that
-            // answers with nothing, and without this the scan switches peers
-            // forever rather than stopping with an explanation.
-            return self
-                .rotate(format!(
-                    "no peer would serve a usable chain of blocks from height {height}. \
-                     The scan is incomplete and its results would be wrong, so it stops \
-                     here. Progress is saved; re-run to continue."
-                ))
-                .await;
-        }
+        let headers = match select_page_headers(self.locator, headers) {
+            FreshPage::Headers(headers) => headers,
+            // Nothing past genesis in this reply: ask for the blocks after it.
+            // Not charged: the peer answered correctly, just briefly.
+            FreshPage::OnlyGenesis(genesis) => {
+                self.locator = genesis;
+                return Ok(None);
+            }
+            FreshPage::Unusable => {
+                // Charged against the same budget as an empty reply: a peer
+                // that answers with an unusable page is no more useful than
+                // one that answers with nothing, and without this the scan
+                // switches peers forever rather than stopping with an
+                // explanation.
+                return self
+                    .rotate(format!(
+                        "no peer would serve a usable chain of blocks from height {height}. \
+                         The scan is incomplete and its results would be wrong, so it \
+                         stops here. Progress is saved; re-run to continue."
+                    ))
+                    .await;
+            }
+        };
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
         let blocks = match self.peer.get_blocks(&hashes).await {
             Ok(b) => b,
@@ -3811,6 +3862,66 @@ mod tests {
             prev_hash: [prev; 32],
             raw: Vec::new(),
         }
+    }
+
+    /// The east4 pack build: a fresh walk against Zebra stopped at height
+    /// 100,000 with "does not match the pinned checkpoint". Zebra answers an
+    /// all-zero locator starting *at* genesis; zcashd starts at its child.
+    /// Labelling genesis as height 1 shifted every later block by one, and
+    /// the first pinned checkpoint was the first place it showed.
+    #[test]
+    fn a_fresh_walk_drops_genesis_when_the_peer_serves_it() {
+        // Genesis has an all-zero parent; 1 and 2 follow it.
+        let zebra = vec![hdr(0xA0, 0), hdr(1, 0xA0), hdr(2, 1)];
+        let FreshPage::Headers(headers) = select_page_headers([0; 32], zebra) else {
+            panic!("a Zebra-shaped first page is usable");
+        };
+        let hashes: Vec<u8> = headers.iter().map(|h| h.hash[0]).collect();
+        assert_eq!(hashes, vec![1, 2], "the first block handed on is height 1");
+
+        // zcashd: the same chain without genesis is taken as it is.
+        let zcashd = vec![hdr(1, 0xA0), hdr(2, 1)];
+        let FreshPage::Headers(headers) = select_page_headers([0; 32], zcashd) else {
+            panic!("a zcashd-shaped first page is usable");
+        };
+        assert_eq!(headers[0].hash, [1; 32]);
+    }
+
+    /// Stricter than before: once genesis is known, the block after it must
+    /// link to it. Without genesis in the reply there is nothing to check.
+    #[test]
+    fn the_block_after_a_served_genesis_must_link_to_it() {
+        let broken = vec![hdr(0xA0, 0), hdr(1, 0xBB), hdr(2, 1)];
+        assert!(matches!(
+            select_page_headers([0; 32], broken),
+            FreshPage::Unusable
+        ));
+    }
+
+    /// A reply holding only genesis moves the walk on to ask for the blocks
+    /// after it, rather than handing on an empty page that reads as the tip.
+    #[test]
+    fn a_reply_of_only_genesis_asks_again_from_genesis() {
+        assert!(matches!(
+            select_page_headers([0; 32], vec![hdr(0xA0, 0)]),
+            FreshPage::OnlyGenesis([0xA0, ..])
+        ));
+    }
+
+    /// Only a fresh walk may drop a leading block. Past genesis, a header
+    /// with an all-zero parent is a page that does not continue from the
+    /// locator, and is refused as before.
+    #[test]
+    fn a_resumed_walk_never_drops_its_first_block() {
+        assert!(matches!(
+            select_page_headers([7; 32], vec![hdr(0xA0, 0), hdr(1, 0xA0)]),
+            FreshPage::Unusable
+        ));
+        let FreshPage::Headers(headers) = select_page_headers([7; 32], vec![hdr(8, 7), hdr(9, 8)])
+        else {
+            panic!("a page continuing from the locator is usable");
+        };
+        assert_eq!(headers.len(), 2);
     }
 
     /// Newest first, as `rollback_locators` returns them: blocks 3, 2, 1
@@ -5547,9 +5658,8 @@ mod tests {
     /// (419,200) — the failure this test exists to prevent, and it still does.
     ///
     /// It previously asserted 0, on the premise that a fresh walk scans
-    /// genesis. It does not: `getheaders` serves the blocks *after* the
-    /// locator, so an all-zero locator returns the child of genesis and the
-    /// peer never sends genesis at all. Checked directly against a node. So
+    /// genesis. It does not: zcashd never sends genesis for an all-zero
+    /// locator, and when Zebra does, `select_page_headers` drops it. So
     /// the first block a fresh walk actually receives is height 1, and
     /// starting the counter at 0 mislabelled it — the same off-by-one this
     /// test guards against, in the other direction, and it made every fresh
