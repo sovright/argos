@@ -130,7 +130,7 @@ pub const PINNED_PACKS: &[PinnedPack] = &[PinnedPack {
     end_height: 3500000,
     mirrors: &[
         "https://storage.googleapis.com/sovright-argos-sprout-packs/sprout-pack/mainnet-3500000-805435e6/",
-        "https://github.com/sovright/argos/releases/download/v1.6.0/",
+        "https://github.com/sovright/argos/releases/download/v1.6.1/",
     ],
 }];
 

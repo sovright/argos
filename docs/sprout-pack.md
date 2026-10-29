@@ -157,7 +157,7 @@ height>-<manifest hash>/`, then scans from it:
 
 - **Mainnet, blocks 1 to 3,500,000** (manifest
   `805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d`,
-  first shipped in 1.6.0). Built twice on 2026-10-28, from two Zebra 7.0.0
+  first shipped in 1.6.1). Built twice on 2026-10-28, from two Zebra 7.0.0
   nodes in different regions; both builds produced the same hash. Both
   halves of step 4 passed. The regtest pack test passes (CI runs it on
   every push). The mainnet comparison passed on 2026-10-29: run with
