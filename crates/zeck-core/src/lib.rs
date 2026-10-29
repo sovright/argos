@@ -52,6 +52,10 @@ pub mod reconciliation;
 // What a Sprout scan costs in time, bandwidth and disk, and the wording
 // that tells the user -- shared so the CLI and GUI cannot drift apart.
 pub mod sprout_scan_cost;
+// Every JoinSplit up to a pinned height, shipped as files so a Sprout scan
+// need not download the whole chain over p2p.
+pub mod sprout_pack;
+pub mod sprout_pack_build;
 // Drives a scan: connects, walks the chain, checkpoints. SproutScanner
 // itself is a passive consumer and knows nothing about the network.
 pub mod sprout_scan_run;

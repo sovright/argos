@@ -1718,6 +1718,47 @@ function sproutScanKeys() {
   return sproutScanKeyEntries().map(({ key }) => key);
 }
 
+// A Sprout pack folder. Checked with the backend's own rules as soon as it
+// is chosen, so a wrong folder or an unpinned mainnet pack is reported here
+// rather than when the scan starts.
+async function describeSproutPack() {
+  const path = $("sprout-scan-pack").value.trim();
+  if (!path) {
+    setStatus("sprout-scan-pack-status", "", "");
+    return;
+  }
+  try {
+    const pack = await invoke("describe_sprout_pack", {
+      path,
+      network: $("network-select").value,
+    });
+    const gb = (pack.bytes / 1e9).toFixed(1);
+    const trust = pack.pinned
+      ? "pinned by this version of Argos"
+      : "not pinned (accepted only on testnet)";
+    setStatus(
+      "sprout-scan-pack-status",
+      `✓ Blocks 1 to ${pack.endHeight.toLocaleString()}, ` +
+        `${pack.joinsplits.toLocaleString()} Sprout transactions, ${gb} GB; ${trust}.`,
+      "success",
+    );
+  } catch (err) {
+    setStatus("sprout-scan-pack-status", `✗ ${err}`, "error");
+  }
+}
+
+$("sprout-scan-pack")?.addEventListener("change", describeSproutPack);
+$("sprout-scan-pack-browse")?.addEventListener("click", async () => {
+  try {
+    const path = await invoke("pick_sprout_pack_folder");
+    if (!path) return;
+    $("sprout-scan-pack").value = path;
+    await describeSproutPack();
+  } catch (err) {
+    setStatus("sprout-scan-pack-status", `✗ ${err}`, "error");
+  }
+});
+
 // Custom P2P peers, for when every public peer's inbound slots are full.
 // A light mirror of `parse_custom_peers` in the backend, which is the
 // authority: this only catches the obvious typo before a connection attempt.
@@ -1875,6 +1916,7 @@ async function runSproutScan() {
       peers,
       birthdayFloor: decrypt.birthdayFloor,
       decryptEveryBlock: decrypt.decryptEveryBlock,
+      sproutPack: $("sprout-scan-pack").value.trim() || null,
     });
     if (generation !== sproutScanGeneration) {
       invoke("release_sprout_scan", { handle }).catch(() => {});
