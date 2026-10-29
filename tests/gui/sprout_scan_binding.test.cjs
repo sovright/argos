@@ -486,3 +486,40 @@ test("a malformed peer edit does not discard retained Sprout retry keys", async 
   await h.scan();
   assert.equal(h.calls.filter(({ command }) => command === "retry_sprout_scan").length, 1);
 });
+
+// Review of #290, finding 1: birthday auto-detect, estimate-from-date and the
+// network default set the wallet birthday in code, with no input event, so
+// retry authority survived and retry reused the old decrypt plan. An earlier
+// birthday then left the blocks between the two never trial-decrypted.
+test("a birthday changed in code releases retry authority instead of reusing the old plan", async () => {
+  const h = harness();
+  h.peek("birthdayTouched = true");
+  h.$("birthday-height").value = "5000";
+  await h.scan();
+  await flush();
+  h.emit("sprout-scan-complete", { handle: "scan-1", status: "failed", report: null, error: "timed out" });
+  assert.equal(h.peek("sproutScanRetryHandle"), "scan-1");
+
+  h.$("birthday-height").value = "1000"; // as auto-detect does: no event
+  await h.scan();
+  await flush();
+  assert.equal(h.calls.filter(({ command }) => command === "retry_sprout_scan").length, 0,
+    "retry must not reuse a decrypt plan built from another birthday");
+  assert.ok(h.calls.some(({ command, args }) => command === "release_sprout_scan" && args.handle === "scan-1"));
+  assert.equal(h.peek("sproutScanRetryHandle"), null);
+  assert.match(h.$("sprout-scan-status").textContent, /birthday/i);
+});
+
+test("an unchanged birthday still retries with the retained plan", async () => {
+  const h = harness();
+  h.peek("birthdayTouched = true");
+  h.$("birthday-height").value = "5000";
+  await h.scan();
+  await flush();
+  h.emit("sprout-scan-complete", { handle: "scan-1", status: "failed", report: null, error: "timed out" });
+  await h.scan();
+  await flush();
+  const retries = h.calls.filter(({ command }) => command === "retry_sprout_scan");
+  assert.equal(retries.length, 1);
+  assert.equal(retries[0].args.handle, "scan-1");
+});

@@ -1580,6 +1580,9 @@ let sproutScanHandle = null;
 // Peer edits may reuse it; changing the wallet, keys or chain configuration
 // releases it. No passphrase or spending key needs to return to the webview.
 let sproutScanRetryHandle = null;
+// The decrypt request the retained source's plan was built from. A retry
+// reuses that plan, so it may only run while the form still asks for it.
+let sproutScanRetryDecrypt = null;
 let sproutScanPausePromise = Promise.resolve();
 let sproutScanGeneration = 0;
 let sproutScanResult = null;
@@ -1624,6 +1627,7 @@ function invalidateSproutScanSource({ preserveRetry = false, pause = true } = {}
   const handles = new Set([sproutScanHandle, sproutScanRetryHandle].filter(Boolean));
   const retained = preserveRetry ? sproutScanRetryHandle : null;
   sproutScanRetryHandle = retained;
+  if (!retained) sproutScanRetryDecrypt = null;
   sproutScanHandle = null;
   sproutScanResult = null;
   invalidateSproutScanReview();
@@ -1811,6 +1815,11 @@ function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
   return { birthdayFloor, decryptEveryBlock: !!everyBlock };
 }
 
+function sameSproutDecrypt(a, b) {
+  return !!a && !!b && !a.error && !b.error &&
+    a.birthdayFloor === b.birthdayFloor && a.decryptEveryBlock === b.decryptEveryBlock;
+}
+
 function currentSproutDecryptRequest() {
   return sproutDecryptRequest(
     $("sprout-scan-birthday").value,
@@ -1870,8 +1879,25 @@ async function runSproutScan() {
   }
 
   // A retry uses its original backend-owned decrypt plan, not a re-derived
-  // wallet birthday after the passphrase and pasted keys have been wiped.
-  const decrypt = retryHandle ? null : currentSproutDecryptRequest();
+  // wallet birthday after the passphrase and pasted keys have been wiped. So
+  // it may only run while the form asks for the plan it was built from.
+  // Birthday auto-detect, estimate-from-date and the network default change
+  // the birthday in code, without the input events that release the source;
+  // an earlier birthday would otherwise leave the blocks between the two
+  // never trial-decrypted.
+  const requested = currentSproutDecryptRequest();
+  if (retryHandle && !sameSproutDecrypt(requested, sproutScanRetryDecrypt)) {
+    invalidateSproutScanSource();
+    setStatus(
+      "sprout-scan-status",
+      "✗ The wallet birthday or the decrypt setting changed since this scan stopped, " +
+        "so its keys were released instead of scanning under the old setting. Paste the " +
+        "Sprout keys again or reopen the wallet file, then run the scan.",
+      "error",
+    );
+    return;
+  }
+  const decrypt = retryHandle ? null : requested;
   if (decrypt?.error) {
     setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
     return;
@@ -1918,6 +1944,7 @@ async function runSproutScan() {
     }
     sproutScanHandle = handle;
     sproutScanRetryHandle = handle;
+    if (!retryHandle) sproutScanRetryDecrypt = decrypt;
     clearTransientSecrets();
     const listenersReady = await sproutScanListenersReady;
     if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
