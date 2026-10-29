@@ -523,3 +523,22 @@ test("an unchanged birthday still retries with the retained plan", async () => {
   assert.equal(retries.length, 1);
   assert.equal(retries[0].args.handle, "scan-1");
 });
+
+// Merging #292 into #290: a retry reads blocks from the pack the panel names
+// now, as it does with the peers. The pack never decides which notes are
+// found (on mainnet only the pinned one opens), so it is not part of the
+// retained plan.
+test("a retry sends the Sprout pack folder the panel names now", async () => {
+  const h = harness();
+  h.$("sprout-scan-pack").value = "/packs/first";
+  await h.scan();
+  await flush();
+  assert.equal(h.calls.find(({ command }) => command === "start_sprout_scan").args.sproutPack, "/packs/first");
+  h.emit("sprout-scan-complete", { handle: "scan-1", status: "failed", report: null, error: "timed out" });
+  h.$("sprout-scan-pack").value = " /packs/second ";
+  await h.scan();
+  await flush();
+  const retry = h.calls.find(({ command }) => command === "retry_sprout_scan");
+  assert.equal(retry.args.handle, "scan-1");
+  assert.equal(retry.args.sproutPack, "/packs/second");
+});

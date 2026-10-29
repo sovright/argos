@@ -1745,6 +1745,47 @@ function sproutScanKeys() {
   return sproutScanKeyEntries().map(({ key }) => key);
 }
 
+// A Sprout pack folder. Checked with the backend's own rules as soon as it
+// is chosen, so a wrong folder or an unpinned mainnet pack is reported here
+// rather than when the scan starts.
+async function describeSproutPack() {
+  const path = $("sprout-scan-pack").value.trim();
+  if (!path) {
+    setStatus("sprout-scan-pack-status", "", "");
+    return;
+  }
+  try {
+    const pack = await invoke("describe_sprout_pack", {
+      path,
+      network: $("network-select").value,
+    });
+    const gb = (pack.bytes / 1e9).toFixed(1);
+    const trust = pack.pinned
+      ? "pinned by this version of Argos"
+      : "not pinned (accepted only on testnet)";
+    setStatus(
+      "sprout-scan-pack-status",
+      `✓ Blocks 1 to ${pack.endHeight.toLocaleString()}, ` +
+        `${pack.joinsplits.toLocaleString()} Sprout transactions, ${gb} GB; ${trust}.`,
+      "success",
+    );
+  } catch (err) {
+    setStatus("sprout-scan-pack-status", `✗ ${err}`, "error");
+  }
+}
+
+$("sprout-scan-pack")?.addEventListener("change", describeSproutPack);
+$("sprout-scan-pack-browse")?.addEventListener("click", async () => {
+  try {
+    const path = await invoke("pick_sprout_pack_folder");
+    if (!path) return;
+    $("sprout-scan-pack").value = path;
+    await describeSproutPack();
+  } catch (err) {
+    setStatus("sprout-scan-pack-status", `✗ ${err}`, "error");
+  }
+});
+
 // Custom P2P peers, for when every public peer's inbound slots are full.
 // A light mirror of `parse_custom_peers` in the backend, which is the
 // authority: this only catches the obvious typo before a connection attempt.
@@ -1915,20 +1956,27 @@ async function runSproutScan() {
   try {
     await pausing.catch(() => {});
     if (generation !== sproutScanGeneration) return;
+    // Like the peers, the pack only changes where blocks are read from, so a
+    // retry takes the folder the panel names now.
+    const sproutPack = $("sprout-scan-pack").value.trim() || null;
     const handle = retryHandle
-      ? await invoke("retry_sprout_scan", { handle: retryHandle, peers })
+      ? await invoke("retry_sprout_scan", { handle: retryHandle, peers, sproutPack })
       : await invoke("start_sprout_scan", {
         keys: sproutScanKeyLines(),
+        // The wallet file's own Sprout keys are merged in by the backend, so
+        // leaving the box blank genuinely works now.
         reviewId: walletFile ? walletFile.reviewId : null,
         passphrase: walletFile ? walletFile.passphrase : null,
         network: $("network-select").value,
         dataDir: $("data-dir").value.trim(),
-        // Only to confirm the chain tip independently of the P2P peer.
+        // Only to confirm the chain tip independently of the peer; the scan
+        // itself reads blocks from the p2p network.
         lightwalletdUrl: $("lightwalletd-url").value.trim(),
         confirmationSources: confirmationSourcesFromForm(),
         peers,
         birthdayFloor: decrypt.birthdayFloor,
         decryptEveryBlock: decrypt.decryptEveryBlock,
+        sproutPack,
       });
     if (generation !== sproutScanGeneration) {
       // A peer edit may land while a retry rotates its opaque handle. Keep
@@ -3038,6 +3086,22 @@ function scanStatusFields(progress, etaState, era, primaryEndpoint) {
   return { terminal, server, serverTitle, progressText, barPercent, etaText };
 }
 
+function scanAccountTotalText(progress, amount) {
+  const count = progress.accounts.length;
+  const estimate = progress.summary.authoritative_balances ? "" : " (estimates)";
+  if (progress.phase === "complete") return `Scan total: ${amount}${estimate} across ${count} checked accounts.`;
+  if (["cancelled", "error"].includes(progress.phase)) {
+    return `Partial total: ${amount}${estimate} · ${count} accounts loaded; scan unfinished.`;
+  }
+  return `Found so far: ${amount}${estimate} · ${count} accounts loaded; scan in progress.`;
+}
+
+function gapExtensionDetail(extension) {
+  return `Activity was found in account ${extension.trigger_account_index}. ` +
+    `Additional accounts ${extension.accounts_from}–${extension.accounts_to} are being checked ` +
+    `(extension #${extension.pass}). `;
+}
+
 function updateScanUI(progress) {
   state.lastProgress = progress;
 
@@ -3076,9 +3140,7 @@ function updateScanUI(progress) {
 
   if (progress.summary) {
     const s = progress.summary;
-    const acctCount = progress.accounts.length;
-    $("scan-totals").textContent =
-      `Grand total: ${fmt(s.total_zatoshis)} across ${acctCount} account(s).${s.authoritative_balances ? "" : " (estimates)"}`;
+    $("scan-totals").textContent = scanAccountTotalText(progress, fmt(s.total_zatoshis));
     $("scan-workspace").textContent = `Workspace: ${s.workspace_dir}`;
   }
 
@@ -3103,10 +3165,7 @@ function updateScanUI(progress) {
   // Only while actively scanning — the completion screen tells the full story.
   const inTerminalPhase = ["complete", "cancelled", "error"].includes(progress.phase);
   if (progress.gap_extension && !inTerminalPhase) {
-    const g = progress.gap_extension;
-    $("scan-gap-extension-detail").textContent =
-      `Found activity in account ${g.trigger_account_index}, so the search widened to accounts ` +
-      `${g.accounts_from}–${g.accounts_to} (extension #${g.pass}). `;
+    $("scan-gap-extension-detail").textContent = gapExtensionDetail(progress.gap_extension);
     $("scan-gap-extension-banner").style.display = "";
   } else {
     $("scan-gap-extension-banner").style.display = "none";
@@ -3237,7 +3296,7 @@ function invalidateScanAuthority() {
   $("scan-rows").innerHTML = "";
   $("scan-discoveries").innerHTML = "";
   $("scan-discoveries").style.display = "none";
-  $("scan-totals").textContent = "Grand total: 0.00000000 ZEC across 0 accounts.";
+  $("scan-totals").textContent = "Balance: 0.00000000 ZEC · 0 accounts loaded.";
   $("scan-workspace").textContent = "Workspace: not initialized";
   $("scan-sleep-banner").style.display = "none";
   $("scan-sandblasting-banner").style.display = "none";
@@ -4209,7 +4268,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("scan-rows").innerHTML = "";
   $("scan-discoveries").innerHTML = "";
   $("scan-discoveries").style.display = "none";
-  $("scan-totals").textContent = "Grand total: 0.00000000 ZEC across 0 accounts.";
+  $("scan-totals").textContent = "Balance: 0.00000000 ZEC · 0 accounts loaded.";
   $("scan-workspace").textContent = "Workspace: not initialized";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;

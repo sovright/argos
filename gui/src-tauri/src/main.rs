@@ -108,6 +108,8 @@ fn main() {
             commands::start_sprout_scan,
             commands::retry_sprout_scan,
             commands::pause_sprout_scan,
+            commands::pick_sprout_pack_folder,
+            commands::describe_sprout_pack,
             commands::get_sprout_scan,
             commands::release_sprout_scan,
             commands::release_sprout_proposal,

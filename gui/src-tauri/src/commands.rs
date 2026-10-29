@@ -417,6 +417,71 @@ pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> 
         .map(|path| path.to_string_lossy().into_owned()))
 }
 
+/// Show a native folder picker for a Sprout pack and return its path.
+///
+/// Same arrangement as [`pick_wallet_file`]: the dialog is opened from Rust,
+/// so the webview needs no `dialog:` permission. `None` when cancelled.
+#[tauri::command]
+pub async fn pick_sprout_pack_folder(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose the Sprout pack folder")
+        .pick_folder(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let picked = rx
+        .await
+        .map_err(|_| "the folder picker closed unexpectedly".to_owned())?;
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+/// What a Sprout pack folder holds, for the scan panel to show before the
+/// scan starts.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SproutPackSummary {
+    pub end_height: u32,
+    pub joinsplits: u64,
+    pub bytes: u64,
+    pub pinned: bool,
+}
+
+/// Open a Sprout pack's manifest with the same rules the scan applies, so a
+/// wrong folder or an unpinned mainnet pack is reported when it is chosen.
+///
+/// Async, with the read on a blocking thread: a sync command runs on the main
+/// thread, and a slow disk or network folder would freeze the window.
+#[tauri::command]
+pub async fn describe_sprout_pack(
+    path: String,
+    network: String,
+) -> Result<SproutPackSummary, String> {
+    tokio::task::spawn_blocking(move || describe_sprout_pack_blocking(&path, &network))
+        .await
+        .map_err(|err| format!("checking the Sprout pack stopped unexpectedly: {err}"))?
+}
+
+fn describe_sprout_pack_blocking(path: &str, network: &str) -> Result<SproutPackSummary, String> {
+    let network = sprout_network(network)?;
+    let pack = argos_core::sprout_pack::SproutPack::open(
+        std::path::Path::new(path.trim()),
+        network.into(),
+    )
+    .map_err(|err| err.to_string())?;
+    let manifest = pack.manifest();
+    Ok(SproutPackSummary {
+        end_height: manifest.end_height,
+        joinsplits: manifest.total_joinsplits,
+        bytes: manifest.total_bytes(),
+        pinned: pack.trust() == argos_core::sprout_pack::PackTrust::Pinned,
+    })
+}
+
 /// Drop every Sprout key that does not control the address it was filed
 /// under, and say why for each. The rule `inspect` applies, so a review and
 /// the inspection of the same file agree on which keys count.
@@ -2088,12 +2153,31 @@ async fn run_attached_scan_worker<F>(
 /// Both first start and retained-key retry use this worker and supervisor.
 /// There is no await between session insertion and attachment; cancellation
 /// before the task's first poll still drops its checkpoint and key owners.
+/// Open the Sprout pack folder the panel names, with the rules the scan
+/// applies, so a wrong folder or an unpinned mainnet pack is refused before
+/// the scan starts. Blank means no pack.
+fn open_sprout_pack(
+    folder: Option<&str>,
+    network: ZeckNetwork,
+) -> Result<Option<argos_core::sprout_pack::SproutPack>, String> {
+    folder
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| {
+            argos_core::sprout_pack::SproutPack::open(std::path::Path::new(dir), network.into())
+                .map_err(|err| err.to_string())
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_sprout_scan_worker(
     app: AppHandle,
     store: &ReviewedIntentStore,
     handle: &SproutScanHandle,
     material: ScanMaterial,
     checkpoint_reservation: CheckpointReservation,
+    pack: Option<argos_core::sprout_pack::SproutPack>,
 ) {
     let decrypt_from = material.decrypt_plan.decrypt_from;
     let decrypt_line = material.decrypt_plan.decrypt_line.clone();
@@ -2107,13 +2191,18 @@ fn spawn_sprout_scan_worker(
         let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
         let emitter = scan_app;
         let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
-        argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
+        argos_core::sprout_scan_run::run_sprout_scan_with_options(
             material.keys.as_slice(),
             p2p,
             &material.peers,
             tip_anchor,
             &material.checkpoint,
-            decrypt_from,
+            argos_core::sprout_scan_run::SproutScanOptions {
+                decrypt_from,
+                pack: pack.as_ref(),
+                stop_at: None,
+                digest_joinsplits: false,
+            },
             move |tick| {
                 let _ = emitter.emit(
                     "sprout-scan-progress",
@@ -2203,9 +2292,13 @@ pub async fn start_sprout_scan(
     peers: Vec<String>,
     birthday_floor: Option<u32>,
     decrypt_every_block: Option<bool>,
+    sprout_pack: Option<String>,
 ) -> Result<SproutScanHandle, String> {
     ensure_tos_accepted(&app)?;
     let network = sprout_network(&network)?;
+    // Opened before anything else, so a wrong folder or an unpinned mainnet
+    // pack is refused at once rather than after the scan has started.
+    let pack = open_sprout_pack(sprout_pack.as_deref(), network)?;
     let confirmation_sources = parse_gui_confirmation_sources(
         &lightwalletd_url,
         confirmation_sources.as_deref().unwrap_or(&[]),
@@ -2261,7 +2354,7 @@ pub async fn start_sprout_scan(
         peers,
         decrypt_plan,
     )?;
-    spawn_sprout_scan_worker(app, &store, &handle, material, checkpoint_reservation);
+    spawn_sprout_scan_worker(app, &store, &handle, material, checkpoint_reservation, pack);
     Ok(handle)
 }
 
@@ -2287,16 +2380,22 @@ pub async fn retry_sprout_scan(
     state: State<'_, AppState>,
     handle: SproutScanHandle,
     peers: Vec<String>,
+    sprout_pack: Option<String>,
 ) -> Result<SproutScanHandle, String> {
     ensure_tos_accepted(&app)?;
     let store = &state.reviewed_intent;
+    // Like the peers, the pack changes only where blocks are read from, not
+    // which notes are found: on mainnet only the pinned pack opens. So a
+    // retry takes the panel's current folder rather than the original's.
+    let network = store.scan_material(&handle)?.network;
+    let pack = open_sprout_pack(sprout_pack.as_deref(), network)?;
     let (replacement, material, reservation) =
         prepare_sprout_scan_retry(store, &handle, &peers).await?;
     let _ = app.emit(
         "sprout-scan-plan",
         material.decrypt_plan.decrypt_line.clone(),
     );
-    spawn_sprout_scan_worker(app, store, &replacement, material, reservation);
+    spawn_sprout_scan_worker(app, store, &replacement, material, reservation, pack);
     Ok(replacement)
 }
 
@@ -3592,6 +3691,27 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{sprout_nu7_warning, summary_nu7_warning};
+
+    /// Review of #292: the pack check read the manifest on the main thread,
+    /// so a slow disk or network folder froze the window. It is async now and
+    /// reads on a blocking thread; a folder without a pack still says so.
+    #[tokio::test]
+    async fn describing_a_folder_without_a_pack_reports_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-describe-pack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result =
+            super::describe_sprout_pack(dir.to_string_lossy().into_owned(), "mainnet".to_owned())
+                .await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+    }
 
     #[test]
     fn resume_wallet_input_does_not_require_a_seed_phrase() {
@@ -5305,8 +5425,15 @@ mod tests {
 
     #[test]
     fn retained_key_retry_and_pause_accept_only_backend_authority() {
-        let _retry: fn(AppHandle, State<'static, AppState>, SproutScanHandle, Vec<String>) -> _ =
-            super::retry_sprout_scan;
+        // Besides the handle, a retry takes only where to read blocks from:
+        // the peers and the Sprout pack folder. Neither carries key material.
+        let _retry: fn(
+            AppHandle,
+            State<'static, AppState>,
+            SproutScanHandle,
+            Vec<String>,
+            Option<String>,
+        ) -> _ = super::retry_sprout_scan;
         let _pause: fn(State<'static, AppState>, SproutScanHandle) -> _ = super::pause_sprout_scan;
     }
 

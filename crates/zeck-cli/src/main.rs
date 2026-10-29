@@ -396,6 +396,15 @@ enum Commands {
         #[arg(long)]
         peer: Vec<String>,
 
+        /// A Sprout pack: the folder holding `manifest.bin` and the
+        /// `chunk-NNNN.bin` files published with this release. Blocks up to
+        /// the pack's end are read from it instead of downloaded, and the
+        /// scan continues over the network from there, so the result is the
+        /// same as a full walk. On mainnet only the pack whose hash this
+        /// release pins is accepted.
+        #[arg(long)]
+        sprout_pack: Option<PathBuf>,
+
         /// Path to sprout-groth16.params (~725 MB). Only needed when sweeping.
         /// Defaults to the file named by $ARGOS_SPROUT_PARAMS, then
         /// ~/.zcash-params/sprout-groth16.params.
@@ -1355,6 +1364,12 @@ fn apply_checkpoint_cleanup_error(
         .push(format!("Checkpoint cleanup failed: {err}"));
 }
 
+/// Where a Sprout scan reads blocks from.
+struct SproutScanSources<'a> {
+    peers: &'a [String],
+    pack: Option<&'a Path>,
+}
+
 /// Scan the chain for a set of Sprout keys, then optionally sweep what it finds.
 #[allow(clippy::too_many_arguments)]
 async fn scan_sprout(
@@ -1363,7 +1378,7 @@ async fn scan_sprout(
     lightwalletd_url: &str,
     confirmation_source: &[String],
     data_dir: &Path,
-    peers: &[String],
+    sources: SproutScanSources<'_>,
     destination: Option<&str>,
     sprout_params: Option<PathBuf>,
     confirm_sweep: bool,
@@ -1371,6 +1386,14 @@ async fn scan_sprout(
 ) -> Result<()> {
     print_sprout_nu7_warning(network);
     let p2p_network: P2pNetwork = network.into();
+    let peers = sources.peers;
+
+    // Opened first, so a wrong folder or an unpinned pack fails in a second
+    // rather than after the tip lookup and checkpoint checks.
+    let pack = sources
+        .pack
+        .map(|dir| argos_core::sprout_pack::SproutPack::open(dir, p2p_network))
+        .transpose()?;
 
     // The destination is validated before the scan, not after. Discovering
     // that an address has no Sapling receiver at the end of a six-hour scan
@@ -1401,7 +1424,27 @@ async fn scan_sprout(
         println!("  scanning for {addr}");
     }
     println!();
-    print_sprout_scan_cost_warning(network);
+    match &pack {
+        Some(pack) => {
+            let manifest = pack.manifest();
+            eprintln!(
+                "Using the Sprout pack in {}: blocks 1 to {} ({} JoinSplits, {:.1} GB) are \
+                 read from it, and the rest of the chain is downloaded as usual.",
+                pack.dir().display(),
+                manifest.end_height,
+                manifest.total_joinsplits,
+                manifest.total_bytes() as f64 / 1e9
+            );
+            if pack.trust() == argos_core::sprout_pack::PackTrust::Unpinned {
+                eprintln!(
+                    "  This pack is not pinned by this release. That is accepted only off \
+                     mainnet; its contents decide which notes are found."
+                );
+            }
+            eprintln!();
+        }
+        None => print_sprout_scan_cost_warning(network),
+    }
 
     let (tip_anchor, tip_warning) = sprout_tip_anchor(network, lightwalletd_url).await;
     let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
@@ -1429,11 +1472,21 @@ async fn scan_sprout(
     }
     // Worded for what exists: nothing is written until the first
     // checkpoint, and a scan that has not started must not look saved.
-    eprintln!(
-        "Progress will be saved to {} (first written after {} blocks).",
-        checkpoint.display(),
-        argos_core::sprout_scan_run::CHECKPOINT_EVERY
-    );
+    if pack.is_some() {
+        eprintln!(
+            "Progress will be saved to {} after each pack chunk is verified ({} blocks), \
+             then every {} blocks.",
+            checkpoint.display(),
+            argos_core::sprout_pack::CHUNK_BLOCKS,
+            argos_core::sprout_scan_run::CHECKPOINT_EVERY
+        );
+    } else {
+        eprintln!(
+            "Progress will be saved to {} (first written after {} blocks).",
+            checkpoint.display(),
+            argos_core::sprout_scan_run::CHECKPOINT_EVERY
+        );
+    }
     eprintln!("Interrupt with Ctrl-C at any time and re-run to resume.");
     eprintln!();
 
@@ -1441,13 +1494,18 @@ async fn scan_sprout(
     let mut last_report = std::time::Instant::now();
     // A resume that would change which blocks were decrypted fails here
     // with the core's own explanation, which already names the way out.
-    let result = argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
+    let result = argos_core::sprout_scan_run::run_sprout_scan_with_options(
         keys,
         p2p_network,
         peers,
         tip_anchor,
         &checkpoint,
-        decrypt_from,
+        argos_core::sprout_scan_run::SproutScanOptions {
+            decrypt_from,
+            pack: pack.as_ref(),
+            stop_at: None,
+            digest_joinsplits: false,
+        },
         |tick| {
             // A wait for a peer is printed every time it is announced, not
             // rate-limited with the rest: the core already spaces these out,
@@ -2085,6 +2143,12 @@ fn print_sprout_scan_cost_warning(network: ZeckNetwork) {
             eprintln!("    {wrapped}");
         }
     }
+    if let Some(line) = argos_core::sprout_pack::pack_available_line(network.into()) {
+        eprintln!();
+        for wrapped in wrap_text(&line, 72) {
+            eprintln!("    {wrapped}");
+        }
+    }
     eprintln!();
 }
 
@@ -2693,6 +2757,7 @@ async fn main() -> Result<()> {
     if let Commands::ScanSprout {
         destination,
         peer,
+        sprout_pack,
         sprout_params,
         confirm_sweep,
     } = &cli.command
@@ -2733,7 +2798,10 @@ async fn main() -> Result<()> {
             &cli.lightwalletd_url,
             &cli.confirmation_source,
             &cli.data_dir,
-            peer,
+            SproutScanSources {
+                peers: peer,
+                pack: sprout_pack.as_deref(),
+            },
             destination.as_deref(),
             sprout_params.clone(),
             *confirm_sweep,

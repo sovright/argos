@@ -417,6 +417,33 @@ pub async fn connect_to_any_except(
     .await
 }
 
+/// [`connect_to_any_except`] restricted to `listed`: no DNS seeds and no
+/// fallback nodes are ever dialled.
+///
+/// For a caller that has its own node and must not drift off it, such as
+/// the Sprout pack builder: a pack must be a function of one node's chain,
+/// and a scan that wanders onto a public peer mid-walk would make it a
+/// function of whichever peer answered.
+pub async fn connect_to_listed_except(
+    network: P2pNetwork,
+    listed: &[String],
+    excluded: &[String],
+    max_rounds: usize,
+) -> Result<Peer, PoolError> {
+    let mut seen = excluded
+        .iter()
+        .map(|addr| candidate_identity(addr))
+        .collect();
+    let tier_limit = max_rounds.max(1).saturating_mul(CONCURRENT_ATTEMPTS);
+    let listed = unique_candidates(listed, &mut seen, tier_limit);
+    let mut tried = 0;
+    let mut tally = FailureTally::default();
+    if let Some(peer) = race_tier(&listed, network, max_rounds, &mut tried, &mut tally).await {
+        return Ok(peer);
+    }
+    Err(tally.into_error(tried))
+}
+
 async fn connect_with_resolver(
     network: P2pNetwork,
     extra: &[String],
