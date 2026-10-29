@@ -32,7 +32,7 @@ function functionSource(source, name) {
 
 // The scan code and its real event handlers run in a VM. Only Tauri IPC and
 // the DOM boundary are simulated; the returned handles are opaque strings.
-function harness(intercept = (_, __, fallback) => fallback(), { failCompletionListener = false } = {}) {
+function harness(intercept = (_, __, fallback) => fallback(), { failCompletionListener = false, stored = {} } = {}) {
   const ids = new Set([...fs.readFileSync("gui/src/index.html", "utf8").matchAll(/\bid="([^"]+)"/g)]
     .map((match) => match[1]));
   const elements = new Map();
@@ -58,8 +58,13 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   $("sprout-scan-keys").value = "SK-fixture";
   $("sprout-scan-sweep").hidden = true;
   $("sprout-scan-sweep-run").disabled = true;
+  const storage = new Map(Object.entries(stored));
   const context = vm.createContext({
     $, document: { createElement: element }, fmt: (n) => String(n),
+    localStorage: {
+      getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+      setItem: (key, value) => storage.set(key, String(value)),
+    },
     confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
     clearTransientSecrets() {},
     setTimeout: (callback) => setImmediate(callback),
@@ -102,7 +107,7 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   ].map((name) => functionSource(source, name)).join("\n"), context);
   vm.runInContext(source.slice(start, end), context);
   return {
-    $, calls,
+    $, calls, storage,
     edit(id, value, event = "input") { $(id).value = value; $(id).dispatch(event); },
     emit(name, payload) { assert.ok(listeners.has(name), `No ${name} listener`); listeners.get(name)({ payload }); },
     scan: () => vm.runInContext("runSproutScan()", context),
@@ -541,4 +546,62 @@ test("a retry sends the Sprout pack folder the panel names now", async () => {
   const retry = h.calls.find(({ command }) => command === "retry_sprout_scan");
   assert.equal(retry.args.handle, "scan-1");
   assert.equal(retry.args.sproutPack, "/packs/second");
+});
+
+// The pinned Sprout pack is downloaded by the scan worker unless the panel
+// turns that off. The choice is a per-viewer setting, remembered.
+test("a Sprout scan asks the backend to download the pack by default", async () => {
+  const h = harness();
+  assert.equal(h.$("sprout-pack-auto").checked, true);
+  await h.scan();
+  await flush();
+  assert.equal(h.calls.find(({ command }) => command === "start_sprout_scan").args.downloadSproutPack, true);
+});
+
+test("turning the pack download off is sent and remembered", async () => {
+  const h = harness();
+  h.$("sprout-pack-auto").checked = false;
+  h.$("sprout-pack-auto").dispatch("change");
+  assert.equal(h.storage.get("argos-sprout-pack-auto-download-v1"), "false");
+  await h.scan();
+  await flush();
+  assert.equal(h.calls.find(({ command }) => command === "start_sprout_scan").args.downloadSproutPack, false);
+  // A later session starts with it off.
+  const later = harness(undefined, { stored: { "argos-sprout-pack-auto-download-v1": "false" } });
+  assert.equal(later.$("sprout-pack-auto").checked, false);
+});
+
+test("a retry sends the pack download setting the panel has now", async () => {
+  const h = harness();
+  await h.scan();
+  await flush();
+  h.emit("sprout-scan-complete", { handle: "scan-1", status: "failed", report: null, error: "timed out" });
+  h.$("sprout-pack-auto").checked = false;
+  await h.scan();
+  await flush();
+  assert.equal(h.calls.find(({ command }) => command === "retry_sprout_scan").args.downloadSproutPack, false);
+});
+
+test("pack download progress is shown for this scan only", async () => {
+  const h = harness();
+  await h.scan();
+  await flush();
+  h.emit("sprout-pack-download", { handle: "scan-1", bytesDone: 420e6, bytesTotal: 1284e6,
+    chunksDone: 12, chunksTotal: 35, error: null });
+  assert.match(h.$("sprout-scan-status").textContent, /Sprout pack/);
+  assert.match(h.$("sprout-scan-status").textContent, /0\.42 \/ 1\.28 GB/);
+  h.emit("sprout-pack-download", { handle: "old-scan", bytesDone: 1, bytesTotal: 2,
+    chunksDone: 0, chunksTotal: 35, error: null });
+  assert.match(h.$("sprout-scan-status").textContent, /0\.42 \/ 1\.28 GB/);
+});
+
+test("a failed pack download says the scan continues without it", async () => {
+  const h = harness();
+  await h.scan();
+  await flush();
+  h.emit("sprout-pack-download", { handle: "scan-1", bytesDone: 0, bytesTotal: 0,
+    chunksDone: 0, chunksTotal: 0, error: "Sprout pack: no usable https mirror" });
+  const status = h.$("sprout-scan-status").textContent;
+  assert.match(status, /no usable https mirror/);
+  assert.match(status, /every block/);
 });

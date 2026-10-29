@@ -2072,7 +2072,8 @@ test("an encrypted wallet retries a failed Sprout scan without reopening or rese
   assert.equal(starts.length, 1, "retry must not reopen the encrypted file");
   assert.equal(retries.length, 1);
   assert.deepEqual(retries[0].args,
-    { handle: "retry-fixture-1", peers: ["192.0.2.7:8233"], sproutPack: null });
+    { handle: "retry-fixture-1", peers: ["192.0.2.7:8233"], sproutPack: null,
+      downloadSproutPack: true });
   assert.equal(h.peek("sproutScanHandle"), "retry-fixture-2");
 });
 
@@ -2098,7 +2099,8 @@ test("editing peers pauses a Sprout scan and retries its retained source with th
   assert.equal(h.peek("sproutScanHandle"), null, "old results lose display authority");
   await h.scan();
   assert.deepEqual(calls.find(({ command }) => command === "retry_sprout_scan").args,
-    { handle: "retry-fixture-1", peers: ["192.0.2.8:8233"], sproutPack: null });
+    { handle: "retry-fixture-1", peers: ["192.0.2.8:8233"], sproutPack: null,
+      downloadSproutPack: true });
 });
 
 test("changing the Sprout key source releases the retained retry source", async () => {

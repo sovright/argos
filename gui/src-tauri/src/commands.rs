@@ -2153,6 +2153,121 @@ async fn run_attached_scan_worker<F>(
 /// Both first start and retained-key retry use this worker and supervisor.
 /// There is no await between session insertion and attachment; cancellation
 /// before the task's first poll still drops its checkpoint and key owners.
+/// Where a Sprout scan reads blocks up to the pack's end from.
+enum ScanPack {
+    /// Nowhere: every block is downloaded over p2p.
+    Off,
+    /// A folder the panel names, already opened and checked.
+    Folder(argos_core::sprout_pack::SproutPack),
+    /// The pinned pack, downloaded by the scan worker before it scans.
+    Download {
+        source: argos_core::sprout_pack_fetch::PackSource,
+        dir: std::path::PathBuf,
+    },
+}
+
+/// Decide where the scan reads the pack from. A folder wins; otherwise the
+/// pinned pack is downloaded when `download` is on and a scan that has
+/// reached `scanned_to` would read it.
+fn scan_pack(
+    folder: Option<argos_core::sprout_pack::SproutPack>,
+    download: bool,
+    network: ZeckNetwork,
+    data_dir: &std::path::Path,
+    scanned_to: Option<u32>,
+) -> ScanPack {
+    if let Some(pack) = folder {
+        return ScanPack::Folder(pack);
+    }
+    if !download {
+        return ScanPack::Off;
+    }
+    match argos_core::sprout_pack_fetch::pack_to_download(network.into(), scanned_to) {
+        Some(source) => ScanPack::Download {
+            dir: source.cache_dir(data_dir),
+            source,
+        },
+        None => ScanPack::Off,
+    }
+}
+
+/// How far the saved scan for these keys got. A checkpoint that cannot be
+/// read counts as none here; the scan itself reports it.
+fn saved_scan_height(
+    material_checkpoint: &std::path::Path,
+    network: ZeckNetwork,
+    keys: &[[u8; 32]],
+) -> Option<u32> {
+    argos_core::sprout_scan_run::saved_scan_height(material_checkpoint, network.into(), keys)
+        .ok()
+        .flatten()
+}
+
+/// Download progress for the Sprout panel. `error` is set once, when the
+/// download gives up and the scan continues without the pack.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SproutPackDownloadEvent {
+    handle: SproutScanHandle,
+    bytes_done: u64,
+    bytes_total: u64,
+    chunks_done: usize,
+    chunks_total: usize,
+    error: Option<String>,
+}
+
+/// Download the pinned pack for the scan `handle`, reporting progress.
+/// `None` when it cannot be had: the scan then reads every block over p2p.
+/// Pausing or cancelling the scan aborts this task; finished files are kept.
+async fn download_scan_pack(
+    app: &AppHandle,
+    handle: &SproutScanHandle,
+    source: &argos_core::sprout_pack_fetch::PackSource,
+    dir: &std::path::Path,
+) -> Option<argos_core::sprout_pack::SproutPack> {
+    let event = |p: argos_core::sprout_pack_fetch::FetchProgress, error: Option<String>| {
+        SproutPackDownloadEvent {
+            handle: handle.clone(),
+            bytes_done: p.bytes_done,
+            bytes_total: p.bytes_total,
+            chunks_done: p.chunks_done,
+            chunks_total: p.chunks_total,
+            error,
+        }
+    };
+    // About one event per 8 MB and one per finished file.
+    let mut last_bytes = 0u64;
+    let mut last_chunks = usize::MAX;
+    let mut latest = argos_core::sprout_pack_fetch::FetchProgress {
+        bytes_done: 0,
+        bytes_total: 0,
+        chunks_done: 0,
+        chunks_total: 0,
+    };
+    let result = argos_core::sprout_pack_fetch::fetch_pack(
+        source,
+        dir,
+        &argos_core::sprout_pack_fetch::FetchOptions::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+        |p| {
+            latest = p;
+            if p.chunks_done != last_chunks || p.bytes_done >= last_bytes + 8_000_000 {
+                last_chunks = p.chunks_done;
+                last_bytes = p.bytes_done;
+                let _ = app.emit("sprout-pack-download", event(p, None));
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(pack) => Some(pack),
+        Err(err) => {
+            let _ = app.emit("sprout-pack-download", event(latest, Some(err.to_string())));
+            None
+        }
+    }
+}
+
 /// Open the Sprout pack folder the panel names, with the rules the scan
 /// applies, so a wrong folder or an unpinned mainnet pack is refused before
 /// the scan starts. Blank means no pack.
@@ -2177,15 +2292,24 @@ fn spawn_sprout_scan_worker(
     handle: &SproutScanHandle,
     material: ScanMaterial,
     checkpoint_reservation: CheckpointReservation,
-    pack: Option<argos_core::sprout_pack::SproutPack>,
+    pack: ScanPack,
 ) {
     let decrypt_from = material.decrypt_plan.decrypt_from;
     let decrypt_line = material.decrypt_plan.decrypt_line.clone();
     let worker_handle = handle.clone();
     let scan_app = app.clone();
     let progress_handle = worker_handle.clone();
+    let download_app = app.clone();
+    let download_handle = handle.clone();
     let scan_task = tokio::spawn(async move {
         let _checkpoint_reservation = checkpoint_reservation;
+        let pack = match pack {
+            ScanPack::Off => None,
+            ScanPack::Folder(pack) => Some(pack),
+            ScanPack::Download { source, dir } => {
+                download_scan_pack(&download_app, &download_handle, &source, &dir).await
+            }
+        };
         let (tip_anchor, tip_warning) =
             sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
         let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
@@ -2293,6 +2417,7 @@ pub async fn start_sprout_scan(
     birthday_floor: Option<u32>,
     decrypt_every_block: Option<bool>,
     sprout_pack: Option<String>,
+    download_sprout_pack: Option<bool>,
 ) -> Result<SproutScanHandle, String> {
     ensure_tos_accepted(&app)?;
     let network = sprout_network(&network)?;
@@ -2343,6 +2468,24 @@ pub async fn start_sprout_scan(
     // and sweep — a blank field must not write a CWD-relative checkpoint that
     // those then never find.
     let dir = resolve_data_dir(&app, Some(&data_dir))?;
+    // Decided after every input is checked, so a mistake is reported before
+    // the worker spends a 1.3 GB download on it.
+    let scanned_to = saved_scan_height(
+        &argos_core::sprout_scan_run::checkpoint_path_for_network(
+            &dir,
+            decoded.as_slice(),
+            network.into(),
+        ),
+        network,
+        decoded.as_slice(),
+    );
+    let pack = scan_pack(
+        pack,
+        download_sprout_pack.unwrap_or(false),
+        network,
+        &dir,
+        scanned_to,
+    );
     let store = state.reviewed_intent.clone();
     let (handle, material, checkpoint_reservation) = begin_sprout_scan_session(
         &store,
@@ -2381,14 +2524,32 @@ pub async fn retry_sprout_scan(
     handle: SproutScanHandle,
     peers: Vec<String>,
     sprout_pack: Option<String>,
+    download_sprout_pack: Option<bool>,
 ) -> Result<SproutScanHandle, String> {
     ensure_tos_accepted(&app)?;
     let store = &state.reviewed_intent;
     // Like the peers, the pack changes only where blocks are read from, not
     // which notes are found: on mainnet only the pinned pack opens. So a
     // retry takes the panel's current folder rather than the original's.
-    let network = store.scan_material(&handle)?.network;
-    let pack = open_sprout_pack(sprout_pack.as_deref(), network)?;
+    let retained = store.scan_material(&handle)?;
+    let network = retained.network;
+    let folder = open_sprout_pack(sprout_pack.as_deref(), network)?;
+    let keys = retained.keys.as_slice();
+    let data_dir = argos_core::sprout_scan_run::checkpoint_data_dir(
+        &retained.checkpoint,
+        keys,
+        network.into(),
+    )
+    .map_err(|err| err.to_string())?
+    .to_path_buf();
+    let pack = scan_pack(
+        folder,
+        download_sprout_pack.unwrap_or(false),
+        network,
+        &data_dir,
+        saved_scan_height(&retained.checkpoint, network, keys),
+    );
+    drop(retained);
     let (replacement, material, reservation) =
         prepare_sprout_scan_retry(store, &handle, &peers).await?;
     let _ = app.emit(
@@ -3690,6 +3851,34 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The worker downloads the pinned pack only when the panel names no
+    /// folder, the download is on, and the scan would read the pack.
+    #[test]
+    fn a_scan_downloads_the_pack_only_when_it_would_read_it() {
+        use super::{scan_pack, ScanPack};
+        use argos_core::ZeckNetwork as Network;
+        let data = std::path::Path::new("/data");
+        match scan_pack(None, true, Network::Mainnet, data, None) {
+            ScanPack::Download { dir, source } => {
+                assert_eq!(dir, source.cache_dir(data));
+                assert!(dir.starts_with("/data/sprout-packs"));
+            }
+            _ => panic!("a fresh mainnet scan downloads the pack"),
+        }
+        assert!(matches!(
+            scan_pack(None, false, Network::Mainnet, data, None),
+            ScanPack::Off
+        ));
+        assert!(matches!(
+            scan_pack(None, true, Network::Testnet, data, None),
+            ScanPack::Off
+        ));
+        assert!(matches!(
+            scan_pack(None, true, Network::Mainnet, data, Some(u32::MAX)),
+            ScanPack::Off
+        ));
+    }
+
     use super::{sprout_nu7_warning, summary_nu7_warning};
 
     /// Review of #292: the pack check read the manifest on the main thread,
@@ -5424,15 +5613,19 @@ mod tests {
     }
 
     #[test]
+    // The full signature is the point of this test.
+    #[allow(clippy::type_complexity)]
     fn retained_key_retry_and_pause_accept_only_backend_authority() {
         // Besides the handle, a retry takes only where to read blocks from:
-        // the peers and the Sprout pack folder. Neither carries key material.
+        // the peers, the Sprout pack folder, and whether to download the
+        // pack. None of them carries key material.
         let _retry: fn(
             AppHandle,
             State<'static, AppState>,
             SproutScanHandle,
             Vec<String>,
             Option<String>,
+            Option<bool>,
         ) -> _ = super::retry_sprout_scan;
         let _pause: fn(State<'static, AppState>, SproutScanHandle) -> _ = super::pause_sprout_scan;
     }
