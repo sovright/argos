@@ -381,6 +381,11 @@ criteria = "safe-to-deploy"
 version = "0.21.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.deranged]]
+version = "0.5.9"
+criteria = "safe-to-deploy"
+notes = "Transitive dependency of the time advisory update. Review backlog; this exemption is not a source audit."
+
 [[exemptions.derive_builder]]
 version = "0.20.2"
 criteria = "safe-to-deploy"
@@ -502,8 +507,9 @@ version = "0.3.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.event-listener]]
-version = "5.4.1"
+version = "5.4.2"
 criteria = "safe-to-deploy"
+notes = "Update for RUSTSEC-2026-0221. Review backlog; this exemption is not a source audit."
 
 [[exemptions.event-listener-strategy]]
 version = "0.5.4"
@@ -606,10 +612,6 @@ version = "0.14.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.getrandom]]
-version = "0.1.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
 version = "0.2.17"
 criteria = "safe-to-deploy"
 
@@ -627,10 +629,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.gio-sys]]
 version = "0.18.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.glib]]
-version = "0.18.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.glib-macros]]
@@ -1082,10 +1080,6 @@ version = "0.13.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.phf_generator]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_generator]]
 version = "0.10.0"
 criteria = "safe-to-deploy"
 
@@ -1095,10 +1089,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.phf_macros]]
 version = "0.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_macros]]
-version = "0.11.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.phf_macros]]
@@ -1138,8 +1128,9 @@ version = "0.10.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.plist]]
-version = "1.8.0"
+version = "1.10.0"
 criteria = "safe-to-deploy"
+notes = "Enables quick-xml and time advisory fixes. Review backlog; this exemption is not a source audit."
 
 [[exemptions.polling]]
 version = "3.11.0"
@@ -1206,8 +1197,9 @@ version = "22.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.quick-xml]]
-version = "0.38.4"
+version = "0.41.0"
 criteria = "safe-to-deploy"
+notes = "Update for RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Review backlog; this exemption is not a source audit."
 
 [[exemptions.r-efi]]
 version = "5.3.0"
@@ -1219,26 +1211,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.radium]]
 version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_chacha]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_core]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_hc]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_pcg]]
-version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.redox_syscall]]
@@ -1291,10 +1263,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rustc-hash]]
 version = "2.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustc_version]]
-version = "0.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]
@@ -1367,10 +1335,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.serde_spanned]]
 version = "0.6.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_spanned]]
-version = "1.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_with]]
@@ -1485,9 +1449,10 @@ criteria = "safe-to-deploy"
 version = "2.0.117"
 criteria = "safe-to-deploy"
 
-[[exemptions.sync_wrapper]]
-version = "1.0.2"
+[[exemptions.syn]]
+version = "3.0.9"
 criteria = "safe-to-deploy"
+notes = "Transitive dependency of the Tokio macro update. Review backlog; this exemption is not a source audit."
 
 [[exemptions.system-deps]]
 version = "6.2.2"
@@ -1578,12 +1543,9 @@ version = "1.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.time]]
-version = "0.3.37"
+version = "0.3.47"
 criteria = "safe-to-deploy"
-
-[[exemptions.time-macros]]
-version = "0.2.19"
-criteria = "safe-to-deploy"
+notes = "Update for RUSTSEC-2026-0009; retains Rust 1.88 compatibility. Review backlog; this exemption is not a source audit."
 
 [[exemptions.tinystr]]
 version = "0.8.3"
@@ -1594,12 +1556,14 @@ version = "1.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.50.0"
+version = "1.53.3"
 criteria = "safe-to-deploy"
+notes = "Update for RUSTSEC-2026-0386; avoids the affected Tokio 1.54.0 release. Review backlog; this exemption is not a source audit."
 
 [[exemptions.tokio-macros]]
-version = "2.6.1"
+version = "2.7.2"
 criteria = "safe-to-deploy"
+notes = "Transitive dependency of the Tokio advisory update. Review backlog; this exemption is not a source audit."
 
 [[exemptions.tokio-rustls]]
 version = "0.26.4"
@@ -1629,10 +1593,6 @@ criteria = "safe-to-deploy"
 version = "0.6.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.toml_datetime]]
-version = "1.1.1+spec-1.1.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.toml_edit]]
 version = "0.19.15"
 criteria = "safe-to-deploy"
@@ -1647,10 +1607,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.toml_parser]]
 version = "1.1.2+spec-1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml_writer]]
-version = "1.1.1+spec-1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-build]]
@@ -1687,10 +1643,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing-attributes]]
 version = "0.1.31"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-core]]
-version = "0.1.36"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-subscriber]]
@@ -1735,10 +1687,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.universal-hash]]
 version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.untrusted]]
-version = "0.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.url]]
@@ -1806,10 +1754,6 @@ version = "0.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.wasi]]
-version = "0.9.0+wasi-snapshot-preview1"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasi]]
 version = "0.11.1+wasi-snapshot-preview1"
 criteria = "safe-to-deploy"
 
@@ -1839,10 +1783,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.web-sys]]
 version = "0.3.94"
-criteria = "safe-to-deploy"
-
-[[exemptions.web-time]]
-version = "1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.web_atoms]]
@@ -2187,10 +2127,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.zmij]]
-version = "1.0.21"
 criteria = "safe-to-deploy"
 
 [[exemptions.zvariant]]
