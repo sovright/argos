@@ -792,8 +792,8 @@ async function onSproutScanEntryToggle() {
 }
 
 // Start over, and a matched address-search recovery: no raw Sprout key, no
-// destination and no result may carry into the next run. The scan itself
-// does not clear the box, because its sweep re-reads the same keys.
+// destination and no result may carry into the next run. Accepted scans
+// clear plaintext inputs and retain only backend-owned key authority.
 function forgetSproutScanInputs() {
   $("sprout-scan-keys").value = "";
   $("sprout-scan-addresses").innerHTML = "";
@@ -1576,6 +1576,14 @@ async function checkSaplingKeys() {
 // for a raw key with no wallet file. Hours, so it checkpoints and resumes.
 
 let sproutScanHandle = null;
+// Opaque authority for backend-held keys, retained after a failed/paused scan.
+// Peer edits may reuse it; changing the wallet, keys or chain configuration
+// releases it. No passphrase or spending key needs to return to the webview.
+let sproutScanRetryHandle = null;
+// The decrypt request the retained source's plan was built from. A retry
+// reuses that plan, so it may only run while the form still asks for it.
+let sproutScanRetryDecrypt = null;
+let sproutScanPausePromise = Promise.resolve();
 let sproutScanGeneration = 0;
 let sproutScanResult = null;
 let sproutScanReview = null;
@@ -1604,9 +1612,22 @@ function updateSproutScanSweepButton() {
     !$("sprout-scan-confirm").checked || sproutScanExecutionPending;
 }
 
-function invalidateSproutScanSource() {
+function pauseSproutRetrySource(handle, generation) {
+  const paused = sproutScanPausePromise.catch(() => {}).then(() =>
+    invoke("pause_sprout_scan", { handle }));
+  sproutScanPausePromise = paused;
+  paused.catch((err) => {
+    if (generation !== sproutScanGeneration || handle !== sproutScanRetryHandle) return;
+    setStatus("sprout-scan-status", `Could not pause the scan: ${err}. Retry or reopen the wallet.`, "error");
+  });
+}
+
+function invalidateSproutScanSource({ preserveRetry = false, pause = true } = {}) {
   ++sproutScanGeneration;
-  const handle = sproutScanHandle;
+  const handles = new Set([sproutScanHandle, sproutScanRetryHandle].filter(Boolean));
+  const retained = preserveRetry ? sproutScanRetryHandle : null;
+  sproutScanRetryHandle = retained;
+  if (!retained) sproutScanRetryDecrypt = null;
   sproutScanHandle = null;
   sproutScanResult = null;
   invalidateSproutScanReview();
@@ -1615,7 +1636,13 @@ function invalidateSproutScanSource() {
   $("sprout-scan-run").disabled = false;
   $("sprout-scan-sweep-results").innerHTML = "";
   setStatus("sprout-scan-status", "", "");
-  if (handle) invoke("release_sprout_scan", { handle }).catch(() => {});
+  for (const handle of handles) {
+    if (handle === retained) {
+      if (pause) pauseSproutRetrySource(handle, sproutScanGeneration);
+    } else {
+      invoke("release_sprout_scan", { handle }).catch(() => {});
+    }
+  }
 }
 
 function publishSproutScanSnapshot(snapshot, generation = sproutScanGeneration) {
@@ -1829,6 +1856,11 @@ function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
   return { birthdayFloor, decryptEveryBlock: !!everyBlock };
 }
 
+function sameSproutDecrypt(a, b) {
+  return !!a && !!b && !a.error && !b.error &&
+    a.birthdayFloor === b.birthdayFloor && a.decryptEveryBlock === b.decryptEveryBlock;
+}
+
 function currentSproutDecryptRequest() {
   return sproutDecryptRequest(
     $("sprout-scan-birthday").value,
@@ -1868,10 +1900,9 @@ async function checkSproutKeys() {
 }
 
 async function runSproutScan() {
-  invalidateSproutScanSource();
-  const generation = sproutScanGeneration;
+  const retryHandle = sproutScanRetryHandle;
   const keys = sproutScanKeys();
-  if (!keys.length && !walletFile) {
+  if (!retryHandle && !keys.length && !walletFile) {
     setStatus(
       "sprout-scan-status",
       "Paste at least one Sprout spending key, or open a wallet file that holds some.",
@@ -1888,12 +1919,34 @@ async function runSproutScan() {
     return;
   }
 
-  const decrypt = currentSproutDecryptRequest();
-  if (decrypt.error) {
+  // A retry uses its original backend-owned decrypt plan, not a re-derived
+  // wallet birthday after the passphrase and pasted keys have been wiped. So
+  // it may only run while the form asks for the plan it was built from.
+  // Birthday auto-detect, estimate-from-date and the network default change
+  // the birthday in code, without the input events that release the source;
+  // an earlier birthday would otherwise leave the blocks between the two
+  // never trial-decrypted.
+  const requested = currentSproutDecryptRequest();
+  if (retryHandle && !sameSproutDecrypt(requested, sproutScanRetryDecrypt)) {
+    invalidateSproutScanSource();
+    setStatus(
+      "sprout-scan-status",
+      "✗ The wallet birthday or the decrypt setting changed since this scan stopped, " +
+        "so its keys were released instead of scanning under the old setting. Paste the " +
+        "Sprout keys again or reopen the wallet file, then run the scan.",
+      "error",
+    );
+    return;
+  }
+  const decrypt = retryHandle ? null : requested;
+  if (decrypt?.error) {
     setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
     return;
   }
 
+  const pausing = sproutScanPausePromise;
+  invalidateSproutScanSource({ preserveRetry: !!retryHandle, pause: false });
+  const generation = sproutScanGeneration;
   const button = $("sprout-scan-run");
   button.disabled = true;
   $("sprout-scan-bar").hidden = false;
@@ -1901,37 +1954,50 @@ async function runSproutScan() {
   setStatus("sprout-scan-status", "Connecting to the Zcash network…", "");
 
   try {
-    const handle = await invoke("start_sprout_scan", {
-      keys: sproutScanKeyLines(),
-      // The wallet file's own Sprout keys are merged in by the backend, so
-      // leaving the box blank genuinely works now.
-      reviewId: walletFile ? walletFile.reviewId : null,
-      passphrase: walletFile ? walletFile.passphrase : null,
-      network: $("network-select").value,
-      dataDir: $("data-dir").value.trim(),
-      // Only to confirm the chain tip independently of the peer; the scan
-      // itself reads blocks from the p2p network.
-      lightwalletdUrl: $("lightwalletd-url").value.trim(),
-      confirmationSources: confirmationSourcesFromForm(),
-      peers,
-      birthdayFloor: decrypt.birthdayFloor,
-      decryptEveryBlock: decrypt.decryptEveryBlock,
-      sproutPack: $("sprout-scan-pack").value.trim() || null,
-    });
+    await pausing.catch(() => {});
+    if (generation !== sproutScanGeneration) return;
+    // Like the peers, the pack only changes where blocks are read from, so a
+    // retry takes the folder the panel names now.
+    const sproutPack = $("sprout-scan-pack").value.trim() || null;
+    const handle = retryHandle
+      ? await invoke("retry_sprout_scan", { handle: retryHandle, peers, sproutPack })
+      : await invoke("start_sprout_scan", {
+        keys: sproutScanKeyLines(),
+        // The wallet file's own Sprout keys are merged in by the backend, so
+        // leaving the box blank genuinely works now.
+        reviewId: walletFile ? walletFile.reviewId : null,
+        passphrase: walletFile ? walletFile.passphrase : null,
+        network: $("network-select").value,
+        dataDir: $("data-dir").value.trim(),
+        // Only to confirm the chain tip independently of the peer; the scan
+        // itself reads blocks from the p2p network.
+        lightwalletdUrl: $("lightwalletd-url").value.trim(),
+        confirmationSources: confirmationSourcesFromForm(),
+        peers,
+        birthdayFloor: decrypt.birthdayFloor,
+        decryptEveryBlock: decrypt.decryptEveryBlock,
+        sproutPack,
+      });
     if (generation !== sproutScanGeneration) {
-      invoke("release_sprout_scan", { handle }).catch(() => {});
+      // A peer edit may land while a retry rotates its opaque handle. Keep
+      // the new key authority only if that exact original source is still
+      // retained; never display its stale progress or result under new peers.
+      if (retryHandle && sproutScanRetryHandle === retryHandle) {
+        sproutScanRetryHandle = handle;
+        pauseSproutRetrySource(handle, sproutScanGeneration);
+      } else {
+        invoke("release_sprout_scan", { handle }).catch(() => {});
+      }
       return;
     }
     sproutScanHandle = handle;
+    sproutScanRetryHandle = handle;
+    if (!retryHandle) sproutScanRetryDecrypt = decrypt;
     clearTransientSecrets();
-    // A scan may finish before its listeners are installed. The snapshot
-    // closes that race after both event subscriptions become active.
     const listenersReady = await sproutScanListenersReady;
     if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
     let snapshot = await invoke("get_sprout_scan", { handle });
     publishSproutScanSnapshot(snapshot, generation);
-    // If event registration failed, keep reading the retained backend state.
-    // The first snapshot alone can still be running for hours.
     while (!listenersReady && snapshot.status === "running" &&
            generation === sproutScanGeneration && handle === sproutScanHandle) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -1941,10 +2007,10 @@ async function runSproutScan() {
     }
   } catch (err) {
     if (generation !== sproutScanGeneration) return;
-    // A failed snapshot request leaves no reliable completion channel. Release
-    // local authority and let the user retry; the backend worker checkpoints.
-    invalidateSproutScanSource();
-    clearTransientSecrets();
+    // Stop an accepted scan whose completion channel failed, but retain its
+    // backend key source. A rejected initial start has not accepted any
+    // secrets: leave those inputs under their original review expiry.
+    invalidateSproutScanSource({ preserveRetry: !!sproutScanRetryHandle });
     setStatus("sprout-scan-status", `✗ ${err}`, "error");
   }
   if (generation === sproutScanGeneration && !sproutScanHandle) button.disabled = false;
@@ -2044,10 +2110,17 @@ $("sprout-scan-entry")?.addEventListener("toggle", onSproutScanEntryToggle);
 $("sprout-scan-destination").addEventListener("input", invalidateSproutScanReview);
 $("sprout-scan-destination").addEventListener("change", refreshSproutScanReview);
 $("sprout-scan-confirm").addEventListener("change", updateSproutScanSweepButton);
-for (const id of ["sprout-scan-keys", "sprout-scan-peers", "network-select",
-  "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset", "wallet-path", "wallet-passphrase"]) {
+for (const id of ["sprout-scan-keys", "network-select",
+  "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset", "wallet-path", "wallet-passphrase",
+  "sprout-scan-birthday", "sprout-scan-every-block", "birthday-height"]) {
   $(id)?.addEventListener("input", invalidateSproutScanSource);
   $(id)?.addEventListener("change", invalidateSproutScanSource);
+}
+// Peer selection does not change the keys or decrypt plan. Pause the old
+// worker and invalidate its result/proposals while retaining retry authority.
+for (const event of ["input", "change"]) {
+  $("sprout-scan-peers").addEventListener(event, () =>
+    invalidateSproutScanSource({ preserveRetry: true }));
 }
 // The scan panel's peers verify the saved scan behind a wallet review (#272),
 // so they define its notes as much as the data directory does.

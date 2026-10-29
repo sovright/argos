@@ -388,12 +388,11 @@ enum Commands {
         destination: Option<String>,
 
         /// A Zcash node to fetch blocks from, as `host:port` (zebrad or
-        /// zcashd, usually port 8233). Repeatable. Tried alongside the
-        /// public DNS-seed peers rather than instead of them: your peers are
-        /// dialled in the first round, and whichever connects first is used.
-        /// Later rounds try more DNS-seed peers and, on mainnet, four
-        /// fallback nodes run by the Argos project. The peer that serves the
-        /// scan sees which blocks are requested.
+        /// zcashd, usually port 8233). Repeatable. Your peers are tried in
+        /// their own priority batches before public DNS-seed peers. If those
+        /// attempts fail, Argos samples public peers and, on mainnet, tries
+        /// four fallback nodes run by the Argos project. The peer that serves
+        /// the scan sees which blocks are requested.
         #[arg(long)]
         peer: Vec<String>,
 

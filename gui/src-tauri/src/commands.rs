@@ -8,10 +8,10 @@ use std::{
 
 use crate::reviewed_intent::{
     CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ReviewedWalletSource,
-    ScanCatchupLease, ScanMaterial, ScanWorkerCompletion, SecretSproutKeys, SproutIntentSource,
-    SproutProposalId, SproutScanHandle, SproutScanProgressEvent, SproutScanSnapshot,
-    SproutSweepIntent, SproutSweepPreviewData, WalletCheckpointAuthority, WalletReviewId,
-    WalletReviewRegistry,
+    ScanCatchupLease, ScanDecryptPlan, ScanMaterial, ScanWorkerCompletion, SecretSproutKeys,
+    SproutIntentSource, SproutProposalId, SproutScanHandle, SproutScanProgressEvent,
+    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData, WalletCheckpointAuthority,
+    WalletReviewId, WalletReviewRegistry,
 };
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
@@ -2086,6 +2086,7 @@ fn validate_peer(entry: &str) -> Result<(), &'static str> {
 }
 
 /// Start a resumable Sprout scan and return its backend handle immediately.
+#[allow(clippy::too_many_arguments)]
 fn begin_sprout_scan_session(
     store: &ReviewedIntentStore,
     decoded: SecretSproutKeys,
@@ -2094,6 +2095,7 @@ fn begin_sprout_scan_session(
     lightwalletd_url: String,
     confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     peers: Vec<String>,
+    decrypt_plan: ScanDecryptPlan,
 ) -> Result<(SproutScanHandle, ScanMaterial, CheckpointReservation), String> {
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path_for_network(
         dir,
@@ -2102,7 +2104,7 @@ fn begin_sprout_scan_session(
     );
     let reservation = store.reserve_checkpoint(&checkpoint)?;
     let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(decoded.as_slice());
-    let handle = store.insert_scan(
+    let handle = store.insert_scan_with_plan(
         decoded,
         fingerprint,
         checkpoint,
@@ -2110,6 +2112,7 @@ fn begin_sprout_scan_session(
         lightwalletd_url,
         confirmation_sources,
         peers,
+        decrypt_plan,
     )?;
     let material = store.scan_material(&handle)?;
     Ok((handle, material, reservation))
@@ -2147,87 +2150,37 @@ async fn run_attached_scan_worker<F>(
     finish_sprout_scan_task(store, handle, scan_task.await);
 }
 
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn start_sprout_scan(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    keys: Vec<SecretString>,
-    review_id: Option<WalletReviewId>,
-    passphrase: Option<SecretString>,
-    network: String,
-    data_dir: String,
-    lightwalletd_url: String,
-    confirmation_sources: Option<Vec<String>>,
-    peers: Vec<String>,
-    birthday_floor: Option<u32>,
-    decrypt_every_block: Option<bool>,
-    sprout_pack: Option<String>,
-) -> Result<SproutScanHandle, String> {
-    ensure_tos_accepted(&app)?;
-    let network = sprout_network(&network)?;
-    // Opened before anything else, so a wrong folder or an unpinned mainnet
-    // pack is refused at once rather than after the scan has started.
-    let pack = sprout_pack
-        .as_deref()
+/// Both first start and retained-key retry use this worker and supervisor.
+/// There is no await between session insertion and attachment; cancellation
+/// before the task's first poll still drops its checkpoint and key owners.
+/// Open the Sprout pack folder the panel names, with the rules the scan
+/// applies, so a wrong folder or an unpinned mainnet pack is refused before
+/// the scan starts. Blank means no pack.
+fn open_sprout_pack(
+    folder: Option<&str>,
+    network: ZeckNetwork,
+) -> Result<Option<argos_core::sprout_pack::SproutPack>, String> {
+    folder
         .map(str::trim)
         .filter(|dir| !dir.is_empty())
         .map(|dir| {
             argos_core::sprout_pack::SproutPack::open(std::path::Path::new(dir), network.into())
                 .map_err(|err| err.to_string())
         })
-        .transpose()?;
-    let confirmation_sources = parse_gui_confirmation_sources(
-        &lightwalletd_url,
-        confirmation_sources.as_deref().unwrap_or(&[]),
-    )?;
-    let peers = parse_custom_peers(&peers)?;
+        .transpose()
+}
 
-    // The panel offers to use the wallet file's own keys; it now actually
-    // can. Previously this took typed keys only, so the one user it exists
-    // for — a wallet holding Sprout keys but no note data — was told to
-    // leave the box blank and then refused, with no way to see the keys.
-    let wallet_snapshot = match review_id.as_ref() {
-        Some(review_id) => Some(state.wallet_reviews.verify(review_id)?.1),
-        None => None,
-    };
-    let scan_keys = collect_scan_keys_from_bytes(
-        wallet_snapshot.as_ref().map(|snapshot| snapshot.bytes()),
-        passphrase.as_ref(),
-        &keys,
-        network,
-    )?;
-    // Planned here, not in the worker: the wallet file's `ImportedKeys` are
-    // needed only for this decision and die with this command rather than
-    // living as long as an hours-long scan.
-    let plan = sprout_scan_plan(
-        scan_keys.wallet.as_ref(),
-        scan_keys.typed.as_slice(),
-        network,
-        birthday_floor,
-        decrypt_every_block.unwrap_or(false),
-        argos_core::unix_time_now(),
-    );
-    let decrypt_line = sprout_plan_line(&plan);
-    let decrypt_from = plan.decrypt_from;
-    // Before any network step, so the panel says what will be left
-    // undecrypted while the hours run, not only at the end.
-    let _ = app.emit("sprout-scan-plan", decrypt_line.clone());
-    let decoded = scan_keys.all;
-    // Blank resolves to the app default, as it does for inspection, preview
-    // and sweep — a blank field must not write a CWD-relative checkpoint that
-    // those then never find.
-    let dir = resolve_data_dir(&app, Some(&data_dir))?;
-    let store = state.reviewed_intent.clone();
-    let (handle, material, checkpoint_reservation) = begin_sprout_scan_session(
-        &store,
-        decoded,
-        &dir,
-        network,
-        lightwalletd_url,
-        confirmation_sources,
-        peers,
-    )?;
+#[allow(clippy::too_many_arguments)]
+fn spawn_sprout_scan_worker(
+    app: AppHandle,
+    store: &ReviewedIntentStore,
+    handle: &SproutScanHandle,
+    material: ScanMaterial,
+    checkpoint_reservation: CheckpointReservation,
+    pack: Option<argos_core::sprout_pack::SproutPack>,
+) {
+    let decrypt_from = material.decrypt_plan.decrypt_from;
+    let decrypt_line = material.decrypt_plan.decrypt_line.clone();
     let worker_handle = handle.clone();
     let scan_app = app.clone();
     let progress_handle = worker_handle.clone();
@@ -2322,7 +2275,136 @@ pub async fn start_sprout_scan(
     // scan and wait for the supervisor to observe its drop before it reports
     // that the secret session is gone.
     store.attach_worker(&worker_handle, abort, completion);
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn start_sprout_scan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    keys: Vec<SecretString>,
+    review_id: Option<WalletReviewId>,
+    passphrase: Option<SecretString>,
+    network: String,
+    data_dir: String,
+    lightwalletd_url: String,
+    confirmation_sources: Option<Vec<String>>,
+    peers: Vec<String>,
+    birthday_floor: Option<u32>,
+    decrypt_every_block: Option<bool>,
+    sprout_pack: Option<String>,
+) -> Result<SproutScanHandle, String> {
+    ensure_tos_accepted(&app)?;
+    let network = sprout_network(&network)?;
+    // Opened before anything else, so a wrong folder or an unpinned mainnet
+    // pack is refused at once rather than after the scan has started.
+    let pack = open_sprout_pack(sprout_pack.as_deref(), network)?;
+    let confirmation_sources = parse_gui_confirmation_sources(
+        &lightwalletd_url,
+        confirmation_sources.as_deref().unwrap_or(&[]),
+    )?;
+    let peers = parse_custom_peers(&peers)?;
+
+    // The panel offers to use the wallet file's own keys; it now actually
+    // can. Previously this took typed keys only, so the one user it exists
+    // for — a wallet holding Sprout keys but no note data — was told to
+    // leave the box blank and then refused, with no way to see the keys.
+    let wallet_snapshot = match review_id.as_ref() {
+        Some(review_id) => Some(state.wallet_reviews.verify(review_id)?.1),
+        None => None,
+    };
+    let scan_keys = collect_scan_keys_from_bytes(
+        wallet_snapshot.as_ref().map(|snapshot| snapshot.bytes()),
+        passphrase.as_ref(),
+        &keys,
+        network,
+    )?;
+    // Planned here, not in the worker: the wallet file's `ImportedKeys` are
+    // needed only for this decision and die with this command rather than
+    // living as long as an hours-long scan.
+    let plan = sprout_scan_plan(
+        scan_keys.wallet.as_ref(),
+        scan_keys.typed.as_slice(),
+        network,
+        birthday_floor,
+        decrypt_every_block.unwrap_or(false),
+        argos_core::unix_time_now(),
+    );
+    let decrypt_line = sprout_plan_line(&plan);
+    let decrypt_plan = ScanDecryptPlan {
+        decrypt_from: plan.decrypt_from,
+        decrypt_line: decrypt_line.clone(),
+    };
+    // Before any network step, so the panel says what will be left
+    // undecrypted while the hours run, not only at the end.
+    let _ = app.emit("sprout-scan-plan", decrypt_line.clone());
+    let decoded = scan_keys.all;
+    // Blank resolves to the app default, as it does for inspection, preview
+    // and sweep — a blank field must not write a CWD-relative checkpoint that
+    // those then never find.
+    let dir = resolve_data_dir(&app, Some(&data_dir))?;
+    let store = state.reviewed_intent.clone();
+    let (handle, material, checkpoint_reservation) = begin_sprout_scan_session(
+        &store,
+        decoded,
+        &dir,
+        network,
+        lightwalletd_url,
+        confirmation_sources,
+        peers,
+        decrypt_plan,
+    )?;
+    spawn_sprout_scan_worker(app, &store, &handle, material, checkpoint_reservation, pack);
     Ok(handle)
+}
+
+/// Validate peer edits before changing the old session. A failed reservation
+/// or replacement leaves its retained backend source available for retry.
+async fn prepare_sprout_scan_retry(
+    store: &ReviewedIntentStore,
+    handle: &SproutScanHandle,
+    peers: &[String],
+) -> Result<(SproutScanHandle, ScanMaterial, CheckpointReservation), String> {
+    let peers = parse_custom_peers(peers)?;
+    store.pause_scan(handle).await?;
+    let material = store.scan_material(handle)?;
+    let reservation = store.reserve_checkpoint(&material.checkpoint)?;
+    let replacement = store.replace_scan_for_retry(handle, peers.clone())?;
+    let material = ScanMaterial { peers, ..material };
+    Ok((replacement, material, reservation))
+}
+
+#[tauri::command]
+pub async fn retry_sprout_scan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    handle: SproutScanHandle,
+    peers: Vec<String>,
+    sprout_pack: Option<String>,
+) -> Result<SproutScanHandle, String> {
+    ensure_tos_accepted(&app)?;
+    let store = &state.reviewed_intent;
+    // Like the peers, the pack changes only where blocks are read from, not
+    // which notes are found: on mainnet only the pinned pack opens. So a
+    // retry takes the panel's current folder rather than the original's.
+    let network = store.scan_material(&handle)?.network;
+    let pack = open_sprout_pack(sprout_pack.as_deref(), network)?;
+    let (replacement, material, reservation) =
+        prepare_sprout_scan_retry(store, &handle, &peers).await?;
+    let _ = app.emit(
+        "sprout-scan-plan",
+        material.decrypt_plan.decrypt_line.clone(),
+    );
+    spawn_sprout_scan_worker(app, store, &replacement, material, reservation, pack);
+    Ok(replacement)
+}
+
+#[tauri::command]
+pub async fn pause_sprout_scan(
+    state: State<'_, AppState>,
+    handle: SproutScanHandle,
+) -> Result<(), String> {
+    state.reviewed_intent.pause_scan(&handle).await
 }
 
 #[tauri::command]
@@ -5342,6 +5424,177 @@ mod tests {
     }
 
     #[test]
+    fn retained_key_retry_and_pause_accept_only_backend_authority() {
+        // Besides the handle, a retry takes only where to read blocks from:
+        // the peers and the Sprout pack folder. Neither carries key material.
+        let _retry: fn(
+            AppHandle,
+            State<'static, AppState>,
+            SproutScanHandle,
+            Vec<String>,
+            Option<String>,
+        ) -> _ = super::retry_sprout_scan;
+        let _pause: fn(State<'static, AppState>, SproutScanHandle) -> _ = super::pause_sprout_scan;
+    }
+
+    #[tokio::test]
+    async fn invalid_retry_preserves_running_source_and_checkpoint_failure_preserves_stopped_source(
+    ) {
+        let store = ReviewedIntentStore::default();
+        let dir = unused_artifact_data_dir("retry-failure");
+        let (handle, original, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[71; 32]].into(),
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://original.invalid".into(),
+            Vec::new(),
+            vec!["original-peer:8233".into()],
+            super::ScanDecryptPlan {
+                decrypt_from: Some(42),
+                decrypt_line: "original plan".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            super::prepare_sprout_scan_retry(&store, &handle, &["bad peer".into()])
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store.snapshot(&handle).unwrap().status,
+            crate::reviewed_intent::SproutScanStatus::Running
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &original.keys,
+            &store.scan_material(&handle).unwrap().keys
+        ));
+        // This external reservation intentionally survives pause; restart may
+        // fail, but the stopped source stays retryable under its original ID.
+        assert!(
+            super::prepare_sprout_scan_retry(&store, &handle, &["new-peer:8233".into()])
+                .await
+                .is_err()
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &original.keys,
+            &store.scan_material(&handle).unwrap().keys
+        ));
+        assert_eq!(
+            store.scan_material(&handle).unwrap().peers,
+            vec!["original-peer:8233"]
+        );
+        drop(reservation);
+        let (replacement, material, reservation) =
+            super::prepare_sprout_scan_retry(&store, &handle, &[" new-peer:8233 ".into()])
+                .await
+                .unwrap();
+        assert_eq!(material.peers, vec!["new-peer:8233"]);
+        assert_eq!(material.decrypt_plan.decrypt_from, Some(42));
+        assert_eq!(material.decrypt_plan.decrypt_line, "original plan");
+        assert!(std::sync::Arc::ptr_eq(&original.keys, &material.keys));
+        assert_eq!(material.lightwalletd_url, "https://original.invalid");
+        assert!(store.snapshot(&handle).is_err());
+        store.release_scan(&replacement).await.unwrap();
+        drop(reservation);
+        assert!(store.reserve_checkpoint(&material.checkpoint).is_ok());
+    }
+
+    #[tokio::test]
+    async fn retry_waits_for_worker_drop_before_reserving_and_uses_new_peers() {
+        let store = ReviewedIntentStore::default();
+        let dir = unused_artifact_data_dir("retry-worker");
+        let (handle, original, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[72; 32]].into(),
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://original.invalid".into(),
+            Vec::new(),
+            Vec::new(),
+            super::ScanDecryptPlan {
+                decrypt_from: None,
+                decrypt_line: "decrypt every block".into(),
+            },
+        )
+        .unwrap();
+        let (driver_store, driver_handle) = (store.clone(), handle.clone());
+        let driver = tokio::spawn(async move {
+            super::run_attached_scan_worker(&driver_store, &driver_handle, async move {
+                let _reservation = reservation;
+                std::future::pending::<Result<SproutScanReport, String>>().await
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        let (replacement, material, reservation) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::prepare_sprout_scan_retry(&store, &handle, &["replacement-peer:8233".into()]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        driver.await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original.keys, &material.keys));
+        assert_eq!(material.peers, vec!["replacement-peer:8233"]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (driver_store, driver_handle) = (store.clone(), replacement.clone());
+        let checkpoint = material.checkpoint.clone();
+        let driver = tokio::spawn(async move {
+            super::run_attached_scan_worker(&driver_store, &driver_handle, async move {
+                let _reservation = reservation;
+                let _ = started_tx.send(material.peers.clone());
+                std::future::pending::<Result<SproutScanReport, String>>().await
+            })
+            .await;
+        });
+        assert_eq!(started_rx.await.unwrap(), vec!["replacement-peer:8233"]);
+        store.release_scan(&replacement).await.unwrap();
+        driver.await.unwrap();
+        assert!(store.reserve_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[tokio::test]
+    async fn pause_before_worker_first_poll_drops_checkpoint_without_starting_work() {
+        let store = ReviewedIntentStore::default();
+        let dir = unused_artifact_data_dir("pause-unpolled");
+        let (handle, material, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[73; 32]].into(),
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://original.invalid".into(),
+            Vec::new(),
+            Vec::new(),
+            super::ScanDecryptPlan::default(),
+        )
+        .unwrap();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = started.clone();
+        let worker = tokio::spawn(async move {
+            let _reservation = reservation;
+            marker.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<Result<SproutScanReport, String>>().await
+        });
+        let completion = super::ScanWorkerCompletion::new();
+        let completion_guard = completion.guard();
+        store.attach_worker(&handle, worker.abort_handle(), completion);
+        let (driver_store, driver_handle) = (store.clone(), handle.clone());
+        tokio::spawn(async move {
+            let _completion_guard = completion_guard;
+            super::finish_sprout_scan_task(&driver_store, &driver_handle, worker.await);
+        });
+        // Current-thread runtime guarantees the spawned worker has not polled.
+        store.pause_scan(&handle).await.unwrap();
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.reserve_checkpoint(&material.checkpoint).is_ok());
+        assert!(std::sync::Arc::ptr_eq(
+            &material.keys,
+            &store.scan_material(&handle).unwrap().keys
+        ));
+    }
+
+    #[test]
     fn scan_start_reserves_the_checkpoint_before_inserting_another_session() {
         let store = ReviewedIntentStore::default();
         let dir = std::env::temp_dir().join(format!("argos-scan-start-{}", uuid::Uuid::new_v4()));
@@ -5353,6 +5606,7 @@ mod tests {
             "https://node".into(),
             Vec::new(),
             Vec::new(),
+            super::ScanDecryptPlan::default(),
         )
         .unwrap();
         assert!(super::begin_sprout_scan_session(
@@ -5362,7 +5616,8 @@ mod tests {
             ZeckNetwork::Mainnet,
             "https://node".into(),
             Vec::new(),
-            Vec::new()
+            Vec::new(),
+            super::ScanDecryptPlan::default(),
         )
         .is_err());
         assert!(store.snapshot(&handle).is_ok());
@@ -5381,6 +5636,7 @@ mod tests {
             "https://node".into(),
             Vec::new(),
             Vec::new(),
+            super::ScanDecryptPlan::default(),
         )
         .unwrap();
         store.finish_scan(
@@ -5414,6 +5670,7 @@ mod tests {
             "https://node".into(),
             Vec::new(),
             Vec::new(),
+            super::ScanDecryptPlan::default(),
         )
         .unwrap();
         store.finish_scan(
@@ -5474,6 +5731,7 @@ mod tests {
             "https://node".into(),
             Vec::new(),
             Vec::new(),
+            super::ScanDecryptPlan::default(),
         )
         .unwrap();
         let task = tokio::spawn(async move {
@@ -5701,6 +5959,7 @@ mod tests {
                 "https://node".into(),
                 Vec::new(),
                 Vec::new(),
+                super::ScanDecryptPlan::default(),
             )
             .unwrap();
             let (driver_store, driver_handle) = (store.clone(), handle.clone());

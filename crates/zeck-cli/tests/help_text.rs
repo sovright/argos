@@ -113,12 +113,20 @@ fn reconcile_help_explains_observation_and_exact_byte_resubmission() {
 }
 
 #[test]
-fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
-    // `connect_to_any` races the given peers alongside the DNS seeds and
-    // keeps whichever answers first.
+fn scan_sprout_help_describes_custom_priority_and_public_fallback() {
+    // `connect_to_any` tries custom peers in their own priority tier, then
+    // public candidates and a separate mainnet fallback tier.
     let h = help(&["scan-sprout"]);
+    let prose = h.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(!h.contains("instead of the DNS seeds"), "{h}");
-    assert!(h.contains("alongside"), "{h}");
+    assert!(
+        prose.contains("own priority batches before public DNS-seed peers"),
+        "{h}"
+    );
+    assert!(
+        prose.contains("If those attempts fail, Argos samples public peers"),
+        "{h}"
+    );
     // `first_scan_height` starts a fresh walk at 1 and the walk ends only at
     // the chain tip (`empty_reply_is_chain_tip`): the pre-Sapling era is
     // covered, so are Sprout notes after Canopy, and no birthday narrows it.
@@ -130,7 +138,7 @@ fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
         !h.contains("not including, Canopy"),
         "the scan no longer stops at Canopy: {h}"
     );
-    // `resolve_seeds` appends the project's fallback nodes on mainnet.
+    // `connect_with_resolver` gives mainnet fallbacks their own final tier.
     assert!(h.contains("fallback nodes run by the Argos project"), "{h}");
     // `default_params_path` treats the variable as the file itself.
     assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
