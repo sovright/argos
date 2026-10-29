@@ -119,25 +119,25 @@ re-reads every chunk and prints the same summary.
    far under GitHub's 2 GiB per-asset limit. Mirrors (CDN, torrent) are
    fine: the pinned hash makes the download source irrelevant.
 
+## Pinned packs
+
+- **Mainnet, blocks 1 to 3,500,000** (manifest
+  `805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d`,
+  first shipped in 1.6.0). Built twice on 2026-10-28, from two Zebra 7.0.0
+  nodes in different regions; both builds produced the same hash. Both
+  halves of step 4 passed. The regtest pack test passes (CI runs it on
+  every push). The mainnet comparison passed on 2026-10-29: run with
+  `argos-sprout-pack compare` against a Zebra 7.0.0 node, the pack scan
+  and the p2p scan of heights 1 to 3,500,000 matched on the JoinSplit
+  digest (773,651 JoinSplits, digest
+  `80629826a3a5e074b6ba4bbe4db0e893bfdcfba0f2cff7e64d13d5ffb5728ffd`),
+  the tree root, the cursor, progress, the spent nullifiers and the
+  notes.
+
 ## Not done yet
 
 - **`compare` does not resume.** Both scans start from an empty
   directory, so an interrupted p2p scan starts again from height 1.
-
-- **The first mainnet pin has passed half of step 4.** The pack for blocks 1
-  to 3,500,000 (manifest
-  `805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d`) was
-  built twice on 2026-10-28, from two Zebra 7.0.0 nodes in different
-  regions, and both builds produced the same hash. It is pinned. The
-  regtest pack test passes (CI runs it on every push), which covers the
-  field-level encoding a tree root cannot see: the planted note is found
-  from the pack, so `random_seed`, nullifiers, the JoinSplit pubkey, the
-  ciphertext, the ephemeral key, `js_index` and txid byte order all
-  round-trip. The pack-versus-p2p mainnet comparison
-  (`argos-sprout-pack compare`) is still to run. It adds what regtest
-  cannot: every mainnet JoinSplit field compared through the digest, the
-  mainnet walk itself, Zebra-specific behaviour, and spent-nullifier
-  equivalence. It must pass before a release ships with this pin.
 - **No in-app download.** Users download the release assets themselves.
   Fetching them from the app needs an HTTP client dependency, which is a
   separate dependency-review decision.
