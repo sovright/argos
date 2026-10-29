@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use argos_wallet_import::{bdb, keys::ImportedKeys, zcashd};
 use sapling_crypto::zip32::ExtendedSpendingKey;
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{PublicKey, SecretKey};
 use secrecy::{ExposeSecret, SecretString};
 
 const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
@@ -61,8 +61,7 @@ fn stored_times(
 }
 
 fn pubkey_record_key(secret: &[u8; 32]) -> Vec<u8> {
-    let secp = Secp256k1::new();
-    let pubkey = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(secret).unwrap());
+    let pubkey = PublicKey::from_secret_key(&SecretKey::from_secret_bytes(*secret).unwrap());
     // `CPubKey` serializes as CompactSize(33) || compressed pubkey.
     let mut key = vec![33u8];
     key.extend_from_slice(&pubkey.serialize());

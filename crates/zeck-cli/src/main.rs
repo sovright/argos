@@ -13,7 +13,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
-    derive_accounts, detect_birthday, estimate_birthday_from_date,
+    derive_accounts, detect_birthday, estimate_birthday_from_date_for_network,
     imported::{encode_transparent_address, imported_transparent_keys},
     transparent_recovery::{
         quote_transparent_only, scan_transparent_only, sweep_transparent_only_from_quote,
@@ -1158,6 +1158,7 @@ async fn sweep_sprout(
         destination,
         &params_path,
         argos_core::sprout_sweep::SweepOptions {
+            observation_only: false,
             source: argos_core::sprout_sweep::NoteSource::WalletFile,
             journal: &journal,
             confirmation_sources: &confirmation_sources,
@@ -1626,6 +1627,7 @@ async fn scan_sprout(
         destination,
         &params_path,
         argos_core::sprout_sweep::SweepOptions {
+            observation_only: false,
             source: argos_core::sprout_sweep::NoteSource::Scan,
             journal: &journal,
             confirmation_sources: &confirmation_sources,
@@ -1968,6 +1970,14 @@ fn print_sprout_transactions(outcome: &argos_core::sprout_sweep::SproutSweepOutc
         || outcome.error.is_some();
     for transaction in &outcome.transactions {
         let amount = sprout_lifecycle_amount(transaction.value_zatoshis);
+        if transaction.unmineable_after_nu7 {
+            retain_source = true;
+            println!(
+                "  cannot be mined under NU7; value not recovered {amount} — {}",
+                transaction.txid
+            );
+            continue;
+        }
         match transaction.state {
             argos_core::TxLifecycleState::Pending => {
                 retain_source = true;
@@ -2322,9 +2332,9 @@ async fn print_sprout_inspection(
         if !journal_read {
             return;
         }
-        if preview_plan.is_none() && lifecycle_guidance.is_some() {
+        if let (true, Some(guidance)) = (preview_plan.is_none(), lifecycle_guidance) {
             println!("  No Sprout note is ready for a new sweep.");
-            for line in wrap_text(lifecycle_guidance.expect("checked above"), 74) {
+            for line in wrap_text(guidance, 74) {
                 println!("  {line}");
             }
             println!();
@@ -2577,7 +2587,7 @@ async fn resolve_birthday(
         eprintln!("✓ {}", result.message);
         Ok(result.birthday)
     } else if let Some(date) = &cli.birthday_date {
-        Ok(estimate_birthday_from_date(date, &cli.lightwalletd_url).await?)
+        Ok(estimate_birthday_from_date_for_network(date, &cli.lightwalletd_url, network).await?)
     } else {
         Ok(cli.birthday_or_default())
     }
@@ -4356,6 +4366,7 @@ mod tests {
 
         let historical = SproutSweepOutcome {
             transactions: vec![SproutSweepTransaction {
+                unmineable_after_nu7: false,
                 txid: "historical".to_owned(),
                 value_zatoshis: Some(7),
                 state: argos_core::TxLifecycleState::Pending,

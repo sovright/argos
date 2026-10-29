@@ -14,7 +14,8 @@ use crate::reviewed_intent::{
     WalletReviewId, WalletReviewRegistry,
 };
 use argos_core::{
-    detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
+    detect_birthday as zeck_detect_birthday,
+    estimate_birthday_from_date_for_network as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
     validate_destination_address, validate_mnemonic_words, BirthdayDetectResult, IncompleteSession,
     RecoveryService, ReviewedSweepProposal, ScanConfig, ScanHandle, SweepOutcome, SweepProposalId,
@@ -1252,6 +1253,7 @@ fn plan_wallet_sprout_preview(
 /// One broadcast Sprout sweep, for the frontend.
 #[derive(Clone, Serialize)]
 pub struct SproutSweepResult {
+    pub unmineable_after_nu7: bool,
     pub txid: String,
     pub value_zatoshis: Option<u64>,
     pub state: argos_core::TxLifecycleState,
@@ -1277,6 +1279,7 @@ fn sprout_result_from_entry(
     entry: &argos_core::sprout_sweep::SproutJournalEntry,
 ) -> SproutSweepResult {
     SproutSweepResult {
+        unmineable_after_nu7: false,
         txid: entry.txid().to_string(),
         value_zatoshis: entry.value_zatoshis,
         state: entry.state,
@@ -1453,7 +1456,9 @@ pub async fn propose_wallet_sprout_sweep(
         Ok(dir.to_path_buf())
     })?;
     let raw_peers = peers.unwrap_or_default();
-    propose_wallet_sprout_sweep_core(
+    let status_url = lightwalletd_url.clone();
+    let status_sources = confirmation_sources.clone();
+    let mut review = propose_wallet_sprout_sweep_core(
         &state.reviewed_intent,
         reviewed_source,
         &mut keys,
@@ -1467,7 +1472,28 @@ pub async fn propose_wallet_sprout_sweep(
             let _ = app.emit("sprout-forged-key", warning);
         },
     )
-    .await
+    .await?;
+    let status =
+        argos_core::nu7::query_sprout_availability(network, &status_url, &status_sources).await;
+    state
+        .reviewed_intent
+        .bind_spending_availability(&review.proposal_id, &status)?;
+    decorate_sprout_availability(&mut review, &status);
+    Ok(review)
+}
+
+fn decorate_sprout_availability(
+    review: &mut ReviewedSproutSweep,
+    status: &argos_core::nu7::SproutAvailability,
+) {
+    review.allow_new_spends = status.allows_new_spends();
+    // Lifecycle evidence is retained. Retirement is an additional observation,
+    // never an invented expiry, confirmation, or successful recovery.
+    if status.state == argos_core::nu7::SproutAvailabilityState::Activated {
+        for row in &mut review.plan.active {
+            row.unmineable_after_nu7 = true;
+        }
+    }
 }
 
 /// `propose_wallet_sprout_sweep` after the file is read and decrypted, with
@@ -1540,6 +1566,7 @@ async fn propose_wallet_sprout_sweep_core(
     // accepts a path from the webview.
     let mut review = store.insert_proposal(
         SproutSweepIntent {
+            spend_authorized_until: None,
             source: SproutIntentSource::Wallet(reviewed_source),
             notes: recovered.notes,
             destination,
@@ -1702,7 +1729,13 @@ where
     F: FnOnce(SproutSweepIntent, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<SproutSweepReport, String>>,
 {
-    let chain_notice = verify_review_at_execute(&intent).await?;
+    // Status-only authority needs no spendability verdict from historical
+    // peers. The core still validates network identity before observing.
+    let chain_notice = if intent.allows_new_spends() {
+        verify_review_at_execute(&intent).await?
+    } else {
+        None
+    };
     sweep(intent, chain_notice).await
 }
 
@@ -1726,6 +1759,7 @@ async fn sweep_reviewed_intent(
             source,
             journal: &intent.journal,
             confirmation_sources: &intent.confirmation_sources,
+            observation_only: !intent.allows_new_spends(),
         },
         move |msg| {
             let _ = emitter.emit("sprout-sweep-progress", msg);
@@ -1783,9 +1817,13 @@ pub async fn execute_wallet_sprout_sweep(
     app: AppHandle,
     state: State<'_, AppState>,
     proposal_id: SproutProposalId,
+    observation_only: Option<bool>,
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
-    let intent = state.reviewed_intent.take_wallet_proposal(&proposal_id)?;
+    let mut intent = state.reviewed_intent.take_wallet_proposal(&proposal_id)?;
+    if observation_only.unwrap_or(true) {
+        intent.restrict_to_observation_only();
+    }
     let SproutIntentSource::Wallet(reviewed_source) = &intent.source else {
         return Err("proposal belongs to a scan-derived sweep".into());
     };
@@ -2506,6 +2544,7 @@ fn sprout_sweep_report(
             .transactions
             .into_iter()
             .map(|transaction| SproutSweepResult {
+                unmineable_after_nu7: transaction.unmineable_after_nu7,
                 txid: transaction.txid,
                 value_zatoshis: transaction.value_zatoshis,
                 state: transaction.state,
@@ -2660,8 +2699,15 @@ pub async fn propose_sprout_scan_sweep(
             material.network,
         )
         .map_err(|err| err.to_string())?;
-        state.reviewed_intent.insert_proposal(
+        let status = argos_core::nu7::query_sprout_availability(
+            material.network,
+            &material.lightwalletd_url,
+            &material.confirmation_sources,
+        )
+        .await;
+        let mut review = state.reviewed_intent.insert_proposal(
             SproutSweepIntent {
+                spend_authorized_until: None,
                 source: SproutIntentSource::Scan(scan_handle),
                 notes: result.notes,
                 destination,
@@ -2676,7 +2722,12 @@ pub async fn propose_sprout_scan_sweep(
                 peer_error: None,
             },
             plan,
-        )
+        )?;
+        state
+            .reviewed_intent
+            .bind_spending_availability(&review.proposal_id, &status)?;
+        decorate_sprout_availability(&mut review, &status);
+        Ok(review)
     };
     tokio::select! {
         result = work => result,
@@ -2689,9 +2740,13 @@ pub async fn execute_sprout_scan_sweep(
     app: AppHandle,
     state: State<'_, AppState>,
     proposal_id: SproutProposalId,
+    observation_only: Option<bool>,
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
-    let intent = state.reviewed_intent.take_scan_proposal(&proposal_id)?;
+    let mut intent = state.reviewed_intent.take_scan_proposal(&proposal_id)?;
+    if observation_only.unwrap_or(true) {
+        intent.restrict_to_observation_only();
+    }
     execute_reviewed_sprout_sweep(app, intent).await
 }
 
@@ -3000,9 +3055,11 @@ pub async fn estimate_birthday_from_date(
     app: AppHandle,
     date: String,
     lightwalletd_url: String,
+    network: Option<String>,
 ) -> Result<u32, String> {
     ensure_tos_accepted(&app)?;
-    estimate_birthday(&date, &lightwalletd_url)
+    let network = sprout_network(network.as_deref().unwrap_or("mainnet"))?;
+    estimate_birthday(&date, &lightwalletd_url, network)
         .await
         .map_err(|err| err.to_string())
 }
@@ -4621,7 +4678,8 @@ mod tests {
     #[test]
     fn summary_nu7_warning_follows_the_selected_network() {
         let mainnet = summary_nu7_warning(1, "mainnet");
-        assert!(mainnet.contains("November 5, 2026"), "{mainnet}");
+        assert!(mainnet.contains("3,543,405"), "{mainnet}");
+        assert!(!mainnet.contains("not yet assigned"), "{mainnet}");
         assert!(!mainnet.contains("4,465,026"), "{mainnet}");
         let testnet = summary_nu7_warning(2, "testnet");
         assert!(testnet.contains("4,465,026"), "{testnet}");
@@ -5416,10 +5474,10 @@ mod tests {
     }
 
     #[test]
-    fn sprout_execution_authority_contains_only_proposal_id() {
-        let _wallet: fn(AppHandle, State<'static, AppState>, SproutProposalId) -> _ =
+    fn sprout_execution_accepts_only_proposal_and_narrowing_mode() {
+        let _wallet: fn(AppHandle, State<'static, AppState>, SproutProposalId, Option<bool>) -> _ =
             super::execute_wallet_sprout_sweep;
-        let _scan: fn(AppHandle, State<'static, AppState>, SproutProposalId) -> _ =
+        let _scan: fn(AppHandle, State<'static, AppState>, SproutProposalId, Option<bool>) -> _ =
             super::execute_sprout_scan_sweep;
     }
 
@@ -5692,6 +5750,7 @@ mod tests {
             store
                 .insert_proposal(
                     SproutSweepIntent {
+                        spend_authorized_until: None,
                         source: SproutIntentSource::Wallet(test_wallet_source()),
                         notes: Vec::new(),
                         destination: "zs-reviewed".into(),
@@ -6044,6 +6103,7 @@ mod tests {
         let outcome = argos_core::sprout_sweep::SproutSweepOutcome {
             transactions: vec![
                 argos_core::sprout_sweep::SproutSweepTransaction {
+                    unmineable_after_nu7: false,
                     txid: "pending".to_owned(),
                     value_zatoshis: Some(7),
                     state: argos_core::TxLifecycleState::Pending,
@@ -6051,6 +6111,7 @@ mod tests {
                     superseded: false,
                 },
                 argos_core::sprout_sweep::SproutSweepTransaction {
+                    unmineable_after_nu7: false,
                     txid: "unknown".to_owned(),
                     value_zatoshis: None,
                     state: argos_core::TxLifecycleState::SubmissionUnknown,
@@ -6058,6 +6119,7 @@ mod tests {
                     superseded: false,
                 },
                 argos_core::sprout_sweep::SproutSweepTransaction {
+                    unmineable_after_nu7: false,
                     txid: "mined".to_owned(),
                     value_zatoshis: Some(11),
                     state: argos_core::TxLifecycleState::Mined,
@@ -6183,6 +6245,7 @@ mod tests {
     fn nonfresh_sprout_report_keeps_the_source_warning() {
         let outcome = argos_core::sprout_sweep::SproutSweepOutcome {
             transactions: vec![argos_core::sprout_sweep::SproutSweepTransaction {
+                unmineable_after_nu7: false,
                 txid: "stored-mined".to_owned(),
                 value_zatoshis: Some(11),
                 state: argos_core::TxLifecycleState::Mined,
@@ -6314,6 +6377,7 @@ mod tests {
     #[test]
     fn preview_response_serializes_its_current_scan_warning() {
         let preview = ReviewedSproutSweep {
+            allow_new_spends: false,
             proposal_id: crate::reviewed_intent::SproutProposalId("fixture".to_owned()),
             plan: SproutSweepPreviewData {
                 notes: 1,
@@ -6341,6 +6405,7 @@ mod tests {
     #[test]
     fn a_review_built_with_a_malformed_peer_is_refused_at_execute() {
         let intent = |peer_error: Option<String>| SproutSweepIntent {
+            spend_authorized_until: None,
             source: SproutIntentSource::Wallet(test_wallet_source()),
             notes: Vec::new(),
             destination: "zs-reviewed".into(),
@@ -6682,7 +6747,9 @@ mod tests {
         )
         .await
         .expect("a malformed peer degrades the review");
-        let refused = store.take_wallet_proposal(&review.proposal_id).unwrap();
+        let mut refused = store.take_wallet_proposal(&review.proposal_id).unwrap();
+        refused.spend_authorized_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         let err = verified_then_sweep(refused, &sweep)
             .await
             .err()
@@ -6691,8 +6758,19 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let (_, mut passing) = reviewed_one_note_wallet(&dir).await;
         passing.wallet_checkpoint = None;
+        passing.spend_authorized_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         assert!(verified_then_sweep(passing, &sweep).await.is_ok());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (_, mut status_only) = reviewed_one_note_wallet(&dir).await;
+        status_only.peer_error = Some("historical peers unavailable".into());
+        assert!(!status_only.allows_new_spends());
+        assert!(verified_then_sweep(status_only, |intent, _| async move {
+            assert!(!intent.allows_new_spends());
+            Ok(empty_sweep_report())
+        })
+        .await
+        .is_ok());
         remove_artifact_fixture(&dir);
     }
 

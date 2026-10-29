@@ -260,6 +260,8 @@ pub struct SproutSweepPreviewData {
 
 #[derive(Serialize)]
 pub struct ReviewedSproutSweep {
+    /// True only after the command validates a fresh pre-NU7 chain height.
+    pub allow_new_spends: bool,
     pub proposal_id: SproutProposalId,
     #[serde(flatten)]
     pub plan: SproutSweepPreviewData,
@@ -286,6 +288,9 @@ pub enum SproutIntentSource {
 }
 
 pub struct SproutSweepIntent {
+    /// Permission derived from this exact review, never from a later UI status.
+    /// Absence or elapsed freshness narrows execution to observation only.
+    pub spend_authorized_until: Option<Instant>,
     pub source: SproutIntentSource,
     pub notes: Vec<SpendableSproutNote>,
     pub destination: String,
@@ -305,6 +310,17 @@ pub struct SproutSweepIntent {
     /// Set when the scan panel's peer field was malformed at review time.
     /// The review degrades to a warning, but execution refuses the proposal.
     pub peer_error: Option<String>,
+}
+
+impl SproutSweepIntent {
+    pub fn allows_new_spends(&self) -> bool {
+        self.spend_authorized_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    pub fn restrict_to_observation_only(&mut self) {
+        self.spend_authorized_until = None;
+    }
 }
 
 pub struct WalletCheckpointAuthority {
@@ -1099,6 +1115,7 @@ impl ReviewedIntentStore {
         drop(inner);
         self.schedule_expiry_sweep(proposal_ttl);
         Ok(ReviewedSproutSweep {
+            allow_new_spends: false,
             proposal_id,
             plan,
             params_present,
@@ -1108,6 +1125,24 @@ impl ReviewedIntentStore {
             warnings: Vec::new(),
             scan_warning: None,
         })
+    }
+
+    /// Bind the server-derived permission to the exact one-shot proposal.
+    /// Call only after querying availability for its retained network/endpoints.
+    pub fn bind_spending_availability(
+        &self,
+        id: &SproutProposalId,
+        status: &argos_core::nu7::SproutAvailability,
+    ) -> Result<(), String> {
+        let mut inner = StoreInner::lock(&self.0)?;
+        let stored = inner
+            .proposals
+            .get_mut(id)
+            .ok_or("unknown or already used Sprout proposal")?;
+        stored.intent.spend_authorized_until = status
+            .allows_new_spends()
+            .then(|| Instant::now() + Duration::from_secs(60));
+        Ok(())
     }
 
     pub fn take_proposal(&self, id: &SproutProposalId) -> Result<SproutSweepIntent, String> {
@@ -1234,6 +1269,7 @@ mod tests {
         store
             .insert_proposal(
                 SproutSweepIntent {
+                    spend_authorized_until: None,
                     source,
                     notes: Vec::new(),
                     destination: destination.to_owned(),
@@ -1258,6 +1294,46 @@ mod tests {
             )
             .unwrap()
             .proposal_id
+    }
+
+    #[test]
+    fn sprout_spending_permission_is_bound_to_review_and_can_only_be_narrowed() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 1);
+        let id = proposal(&store, SproutIntentSource::Scan(handle), "zs-reviewed");
+        let unknown = argos_core::nu7::SproutAvailability::unknown(ZeckNetwork::Mainnet, "offline");
+        store.bind_spending_availability(&id, &unknown).unwrap();
+        let intent = store.take_proposal(&id).unwrap();
+        assert!(!intent.allows_new_spends());
+        // A later healthy status query cannot widen an already consumed review.
+        let healthy = argos_core::nu7::SproutAvailability::at_tip(
+            ZeckNetwork::Mainnet,
+            argos_core::nu7::MAINNET_ACTIVATION_HEIGHT - 100,
+        );
+        assert!(store.bind_spending_availability(&id, &healthy).is_err());
+
+        let handle = scan(&store, 2);
+        let id = proposal(&store, SproutIntentSource::Scan(handle), "zs-reviewed");
+        store.bind_spending_availability(&id, &healthy).unwrap();
+        let mut intent = store.take_proposal(&id).unwrap();
+        assert!(intent.allows_new_spends());
+        intent.restrict_to_observation_only();
+        assert!(!intent.allows_new_spends());
+    }
+
+    #[test]
+    fn old_sprout_review_cannot_authorize_new_spending() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 1);
+        let id = proposal(&store, SproutIntentSource::Scan(handle), "zs-reviewed");
+        let healthy = argos_core::nu7::SproutAvailability::at_tip(
+            ZeckNetwork::Mainnet,
+            argos_core::nu7::MAINNET_ACTIVATION_HEIGHT - 100,
+        );
+        store.bind_spending_availability(&id, &healthy).unwrap();
+        let mut intent = store.take_proposal(&id).unwrap();
+        intent.spend_authorized_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!intent.allows_new_spends());
     }
 
     #[test]
@@ -1323,6 +1399,7 @@ mod tests {
         assert!(store
             .insert_proposal(
                 SproutSweepIntent {
+                    spend_authorized_until: None,
                     source: SproutIntentSource::Scan(absent),
                     notes: Vec::new(),
                     destination: "zs-reviewed".into(),
@@ -1390,6 +1467,7 @@ mod tests {
         assert!(store
             .insert_proposal(
                 SproutSweepIntent {
+                    spend_authorized_until: None,
                     source: SproutIntentSource::Wallet(wallet_source(6)),
                     notes: Vec::new(),
                     destination: "zs-reviewed".into(),
@@ -2006,6 +2084,7 @@ mod tests {
         let review = store
             .insert_proposal(
                 SproutSweepIntent {
+                    spend_authorized_until: None,
                     source: SproutIntentSource::Scan(handle),
                     notes: Vec::new(),
                     destination: "zs-reviewed".into(),

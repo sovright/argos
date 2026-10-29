@@ -461,7 +461,7 @@ mod tests {
         )
         .unwrap();
         let orchard = |ua: &str| {
-            let (_, address) = Address::decode(ua).unwrap();
+            let (_, _, address) = Address::decode(ua).unwrap();
             address
                 .items()
                 .into_iter()

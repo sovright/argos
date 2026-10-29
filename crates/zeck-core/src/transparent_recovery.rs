@@ -591,7 +591,7 @@ where
     SP: sapling::prover::SpendProver,
     OP: sapling::prover::OutputProver,
 {
-    use rand_core::OsRng;
+    use crate::workspace::wallet_rng;
     use zcash_primitives::transaction::{
         builder::{BuildConfig, Builder, BundlePadding},
         fees::zip317::FeeRule,
@@ -676,13 +676,14 @@ where
             // needs no account.
             &[],
             &[],
-            OsRng,
+            wallet_rng(),
             spend_prover,
             output_prover,
             &fee_rule,
         )
         .map_err(|err| ZeckError::Wallet(format!("building the sweep transaction: {err:?}")))?;
 
+    crate::nu7_limits::validate_transaction(params, target_height, result.transaction())?;
     Ok(result.transaction().clone())
 }
 
@@ -741,7 +742,9 @@ pub(crate) fn check_transparent_fee(
 /// Blocks the chain may advance between a CLI quote and its execution. The
 /// transaction is built at the execute-time height, so it carries a full
 /// expiry window from then; this bound only limits how stale the reviewed
-/// UTXO set and fee may be. It is half the default expiry delta.
+/// UTXO set and fee may be. This chain-drift bound is independent of the
+/// transaction expiry delta and remains 20 at NU7; its expected elapsed
+/// lifetime becomes shorter with 25-second blocks.
 pub const TRANSPARENT_QUOTE_MAX_AGE_BLOCKS: u32 = 20;
 
 /// A quote stays executable while the consensus branch (and so the
@@ -926,6 +929,10 @@ pub(crate) async fn sweep_transparent_only_reviewed(
         fee_zatoshis: plan.fee_zatoshis,
         expiry_height: Some(u32::from(tx.expiry_height())),
     };
+    // Proving can span a consensus boundary; the signed transaction must still
+    // be mineable at the next block before any prepared record or network send.
+    let tip = crate::nu7::validated_tip_from_client(&mut client, network).await?;
+    crate::nu7::validate_transaction_for_tip(network, tip, &tx)?;
     Ok(Some(
         submit_transparent_prepared(
             store,
@@ -1157,11 +1164,23 @@ mod sweep_tests {
         ));
     }
 
+    #[test]
+    fn nu7_activation_invalidates_direct_quotes_on_both_networks() {
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).expect("NU7 schedule");
+            assert!(matches!(
+                require_quote_height_current(network, activation - 1, activation),
+                Err(ZeckError::StaleSweepProposal(_))
+            ));
+            assert!(require_quote_height_current(network, activation, activation + 1).is_ok());
+        }
+    }
+
     #[tokio::test]
     async fn reviewed_transparent_fee_is_checked_against_the_built_plan_before_network() {
         use crate::broadcast::DurableBroadcastLog;
 
-        let mut secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let mut secret = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
         let key = crate::imported::ImportedTransparentKey::new(&mut secret, addr(1));
         let utxos = vec![utxo(addr(1), 1_000_000, 9)];
         let built = plan_sweep(&MAIN_NETWORK, height(), &utxos)
@@ -1424,11 +1443,18 @@ mod destination_tests {
     pub(super) fn unified_address_for(network: zcash_protocol::consensus::NetworkType) -> String {
         use zcash_address::unified::{Address, Encoding, Receiver};
 
-        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32])
+            .expect("valid fixture Sapling key");
         let (_, payment_address) = extsk.default_address();
 
-        let ua = Address::try_from_items(vec![Receiver::Sapling(payment_address.to_bytes())])
-            .expect("a Sapling-only unified address is valid under ZIP 316");
+        let ua = Address::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Sapling(payment_address.to_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .expect("a Sapling-only unified address is valid under ZIP 316");
         ua.encode(&network)
     }
 
@@ -1526,9 +1552,15 @@ mod seedless_destination_tests {
         let sk = orchard::keys::SpendingKey::from_bytes([7u8; 32]).expect("a valid spending key");
         let fvk = orchard::keys::FullViewingKey::from(&sk);
         let address = fvk.address_at(0u32, orchard::keys::Scope::External);
-        Address::try_from_items(vec![Receiver::Orchard(address.to_raw_address_bytes())])
-            .expect("an Orchard-only unified address is valid under ZIP 316")
-            .encode(&zcash_protocol::consensus::NetworkType::Main)
+        Address::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Orchard(address.to_raw_address_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .expect("an Orchard-only unified address is valid under ZIP 316")
+        .encode(&zcash_protocol::consensus::NetworkType::Main)
     }
 
     fn with_transparent_key() -> argos_wallet_import::ImportedKeys {

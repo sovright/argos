@@ -151,9 +151,9 @@ log "Ironwood (NU6.3) present in the chain's upgrade set"
 # ── Build the funding helper ───────────────────────────────────────────────
 
 log "building argos-regtest-funder ..."
-( cd "$REPO_ROOT" && cargo build -q -p argos-core --features argos-network --bin argos-regtest-funder ) \
+( cd "$REPO_ROOT" && CARGO_INCREMENTAL=0 RUSTFLAGS='' cargo +1.89 build -q -p argos-core --features argos-network --bin argos-regtest-funder ) \
     || die "failed to build argos-regtest-funder"
-FUNDER="$REPO_ROOT/target/debug/argos-regtest-funder"
+FUNDER="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/argos-regtest-funder"
 readonly FUNDER
 [ -x "$FUNDER" ] || die "funder binary missing at $FUNDER"
 
@@ -217,7 +217,11 @@ log "mining to height $ZIP212_HEIGHT for ZIP 212 enforcement (needed by the PCZT
 while :; do
     height="$(zrpc getblockcount | sed -e 's/.*"result":\([0-9]*\).*/\1/')"
     [ "$height" -ge "$ZIP212_HEIGHT" ] && break
-    zrpc generate '[500]' >/dev/null 2>&1 || sleep 2
+    # Stop exactly at the ZIP 212 preparation height. A final full 500-block
+    # batch could cross the dedicated full-profile NU7 boundary at 32,500.
+    remaining=$((ZIP212_HEIGHT - height))
+    batch=$((remaining < 500 ? remaining : 500))
+    zrpc generate "[$batch]" >/dev/null 2>&1 || sleep 2
 done
 
 # ── Clear Zebra's gossip backlog ───────────────────────────────────────────

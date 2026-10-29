@@ -956,13 +956,10 @@ fn nu7_warning_reaches_wallet_inspection_only_when_sprout_keys_exist() {
     );
     assert!(warning.contains("Start recovery promptly"), "{warning}");
     assert!(
-        warning.contains("targeted for about November 5, 2026"),
+        warning.contains("mainnet NU7 activation height is 3,543,405"),
         "{warning}"
     );
-    assert!(
-        warning.contains("final height is not yet assigned (proposed in zcash/zips#1405)"),
-        "{warning}"
-    );
+    assert!(!warning.contains("not yet assigned"), "{warning}");
     assert!(
         warning.contains("https://zips.z.cash/zip-0259"),
         "{warning}"

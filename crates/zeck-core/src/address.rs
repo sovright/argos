@@ -54,7 +54,7 @@ pub fn validate_destination_address(
         return Err(ZeckError::DestinationMustBeUnified);
     }
 
-    let (address_net, _) = decoded.expect("is_unified implies decode succeeded");
+    let (address_net, _, _) = decoded.expect("is_unified implies decode succeeded");
     let expected_net = network_type(network);
 
     // The regtest harness derives destinations under regtest parameters, so

@@ -2,21 +2,44 @@
 //! Failed comparisons return no key material or attacker-controlled text.
 
 use sapling_crypto::zip32::ExtendedSpendingKey;
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{PublicKey, SecretKey};
 use sha2::{compress256, digest::generic_array::GenericArray};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
-use zcash_address::ZcashAddress;
+use zcash_address::{ConversionError, TryFromAddress, ZcashAddress};
 use zcash_protocol::consensus::NetworkType;
 use zcash_transparent::address::TransparentAddress;
 use zeroize::Zeroizing;
 
 use crate::{keys::EmbeddedNetwork, secret_bytes::SecretArray};
 
+// Keep wallet provenance restricted to the legacy transparent address formats.
+// NU7 moved address conversion out of zcash_transparent; do not accept a
+// unified or transparent-source-only address as an equivalent stored identity.
+struct LegacyTransparentAddress(TransparentAddress);
+
+impl TryFromAddress for LegacyTransparentAddress {
+    type Error = std::convert::Infallible;
+
+    fn try_from_transparent_p2pkh(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self(TransparentAddress::PublicKeyHash(data)))
+    }
+
+    fn try_from_transparent_p2sh(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self(TransparentAddress::ScriptHash(data)))
+    }
+}
+
 pub(crate) fn transparent_matches_pubkey(secret: &[u8; 32], stored: &[u8]) -> bool {
-    let Ok(sk) = SecretKey::from_slice(secret) else {
+    let Ok(sk) = SecretKey::from_secret_bytes(*secret) else {
         return false;
     };
-    let derived = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+    let derived = PublicKey::from_secret_key(&sk);
     match stored.len() {
         33 => derived.serialize().as_slice() == stored,
         65 => derived.serialize_uncompressed().as_slice() == stored,
@@ -28,15 +51,15 @@ pub(crate) fn transparent_matches_address(
     secret: &[u8; 32],
     stored: &str,
 ) -> Result<EmbeddedNetwork, ()> {
-    let sk = SecretKey::from_slice(secret).map_err(|_| ())?;
-    let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+    let sk = SecretKey::from_secret_bytes(*secret).map_err(|_| ())?;
+    let pubkey = PublicKey::from_secret_key(&sk);
     let expected = TransparentAddress::from_pubkey(&pubkey);
-    let (network, address): (NetworkType, TransparentAddress) =
+    let (network, address): (NetworkType, LegacyTransparentAddress) =
         ZcashAddress::try_from_encoded(stored)
             .map_err(|_| ())?
             .convert()
             .map_err(|_| ())?;
-    if address != expected {
+    if address.0 != expected {
         return Err(());
     }
     Ok(match network {

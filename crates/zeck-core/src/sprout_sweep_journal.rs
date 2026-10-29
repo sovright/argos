@@ -41,9 +41,14 @@ use crate::{
     error::{ZeckError, ZeckResult},
     models::ZeckNetwork,
     private_fs::{NamespaceLease, PrivateObjectId},
-    sprout_scan::SPROUT_REORG_WINDOW,
     sprout_scan_run::{full_key_set_fingerprint, key_set_fingerprint, CheckpointGeneration},
 };
+
+/// Existing authenticated cleanup records bind this confirmation policy as
+/// `reorg_window`. It is independent of how many block undo frames the
+/// scanner retains; increasing scanner capacity must not reject old journals
+/// or silently change permission to delete recovery material.
+const SPROUT_CLEANUP_CONFIRMATION_DEPTH: usize = 100;
 
 pub const SPROUT_SWEEP_JOURNAL_VERSION: u32 = 4;
 pub const SPROUT_EXPIRY_DELTA: u32 = 40;
@@ -813,7 +818,8 @@ impl SproutJournalSnapshot {
             } => {
                 if source_fingerprint != fingerprint
                     || !self.checkpoint_manifests.contains_key(&generation)
-                    || reorg_window != u32::try_from(SPROUT_REORG_WINDOW).unwrap_or(u32::MAX)
+                    || reorg_window
+                        != u32::try_from(SPROUT_CLEANUP_CONFIRMATION_DEPTH).unwrap_or(u32::MAX)
                 {
                     return Err(journal_error("checkpoint discard marker has no manifest"));
                 }
@@ -844,7 +850,7 @@ impl SproutJournalSnapshot {
                 last_submission,
                 observations,
             } => {
-                let window = u32::try_from(SPROUT_REORG_WINDOW)
+                let window = u32::try_from(SPROUT_CLEANUP_CONFIRMATION_DEPTH)
                     .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?;
                 if source_fingerprint != fingerprint
                     || reorg_window != window
@@ -923,7 +929,7 @@ fn mature_mined_signature(observation: &TxObservation) -> Option<(u32, Vec<u8>)>
         return None;
     }
     let height = observation.mined_height?;
-    let mature_tip = height.checked_add(u32::try_from(SPROUT_REORG_WINDOW).ok()?)?;
+    let mature_tip = height.checked_add(u32::try_from(SPROUT_CLEANUP_CONFIRMATION_DEPTH).ok()?)?;
     let claims = observation
         .evidence
         .iter()
@@ -1588,7 +1594,7 @@ impl SweepJournal {
             .checkpoint_manifests
             .get(generation)
             .ok_or_else(|| journal_error("checkpoint has no manifest during compaction"))?;
-        let reorg_window = u32::try_from(SPROUT_REORG_WINDOW)
+        let reorg_window = u32::try_from(SPROUT_CLEANUP_CONFIRMATION_DEPTH)
             .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?;
         for note_id in &manifest.note_ids {
             let entry = snapshot
@@ -1659,7 +1665,7 @@ impl SweepJournal {
                 let marker = SproutJournalRecord::CheckpointDiscardStarted {
                     source_fingerprint: self.source_fingerprint.clone(),
                     generation: generation.clone(),
-                    reorg_window: u32::try_from(SPROUT_REORG_WINDOW)
+                    reorg_window: u32::try_from(SPROUT_CLEANUP_CONFIRMATION_DEPTH)
                         .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?,
                 };
                 snapshot.apply(marker.clone(), &self.source_fingerprint)?;
@@ -2300,7 +2306,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         journal
             .append_transition(
                 &mut snapshot,
@@ -2335,7 +2341,7 @@ mod tests {
             ),
             CheckpointCleanupEligibility::Eligible { .. }
         ));
-        let shallow_fork = mined_observation(2, SPROUT_REORG_WINDOW as u32 - 1, 0x22);
+        let shallow_fork = mined_observation(2, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32 - 1, 0x22);
         journal
             .append_transition(
                 &mut snapshot,
@@ -2370,7 +2376,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let shallow = mined_observation(1, SPROUT_REORG_WINDOW as u32 - 1, 0x11);
+        let shallow = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32 - 1, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(
@@ -2430,7 +2436,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(
@@ -2550,7 +2556,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(
@@ -2647,7 +2653,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(
@@ -2702,7 +2708,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(
@@ -2756,7 +2762,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(
@@ -2820,7 +2826,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&transaction)
             .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        let mature = mined_observation(1, SPROUT_CLEANUP_CONFIRMATION_DEPTH as u32, 0x11);
         for _ in 0..2 {
             journal
                 .append_transition(

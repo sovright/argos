@@ -66,40 +66,43 @@ const ACTIONS_PER_SWEEP: u64 = 2 + 2;
 /// The fee for a one-JoinSplit Sprout sweep.
 pub const SPROUT_SWEEP_FEE: u64 = ACTIONS_PER_SWEEP * ZAT_PER_ACTION;
 
-/// Where the NU7 deadline stands on mainnet, as text.
-///
-/// The date is the ecosystem's announced target, not a consensus constant:
-/// the height is proposed in zcash/zips#1405 and is not yet in ZIP 259.
-/// Do not state a height here until that PR merges.
-const MAINNET_NU7_SCHEDULE: &str = "Mainnet activation is targeted for about November 5, \
-     2026; the final height is not yet assigned (proposed in zcash/zips#1405).";
-
-/// Kept last in a message, with no punctuation after it, so a copied link
-/// does not pick up a trailing full stop.
+/// Assigned network activation heights from ZIP 259. Spending eligibility is
+/// checked against the next inclusion height, never a wall-clock target date.
+const MAINNET_NU7_SCHEDULE: &str = "The mainnet NU7 activation height is 3,543,405.";
 const MAINNET_NU7_TIMELINE: &str =
     "NU7 timeline: https://forum.zcashcommunity.com/t/nu7-timeline/57655";
-
 const TESTNET_NU7_SCHEDULE: &str = "The testnet NU7 activation height is 4,465,026.";
 
-/// Testnet NU7 activation height (ZIP 259). The pinned `zcash_protocol`
-/// carries it only behind `zcash_unstable = "nu7"`, so it is stated here.
-const TESTNET_NU7_ACTIVATION_HEIGHT: u32 = 4_465_026;
-
-/// The height at which NU7 activates on `network`, when one is assigned.
-///
-/// Mainnet has no assigned height yet (see [`MAINNET_NU7_SCHEDULE`]), so it
-/// has no hard guard: the warnings carry the deadline instead. A local
-/// regtest chain under the dev-only `argos-network` feature never activates
-/// NU7.
+/// The canonical consensus schedule also honors an installed regtest schedule.
 pub fn nu7_activation_height(network: crate::ZeckNetwork) -> Option<u32> {
-    #[cfg(feature = "argos-network")]
-    if crate::workspace::regtest_consensus_params_installed() {
-        return None;
+    crate::nu7::activation_height(network)
+}
+
+fn nu7_deadline_reached(network: crate::ZeckNetwork, tip: u32) -> bool {
+    tip_from_height(u64::from(tip)).is_ok()
+        && nu7_activation_height(network)
+            .is_some_and(|activation| tip.saturating_add(1) >= activation)
+}
+
+/// Refuse inclusion from the activation block onward, including the case
+/// where the latest mined block is the last pre-upgrade block.
+fn require_sprout_inclusion(network: crate::ZeckNetwork, tip: u32) -> Result<(), String> {
+    tip_from_height(u64::from(tip))?;
+    if let Some(activation) = nu7_activation_height(network) {
+        if tip.saturating_add(1) >= activation {
+            return Err(format!(
+                "the next block ({}) is at or past NU7 activation at height {} on {}. \
+                 Version 4 Sprout transactions cannot be mined under NU7. Nothing further \
+                 will be proved or sent. Earlier transactions can still be checked for \
+                 mining before activation. Keep the original wallet or Sprout key, \
+                 journal and scan checkpoint.",
+                group_thousands(tip.saturating_add(1)),
+                group_thousands(activation),
+                network.label(),
+            ));
+        }
     }
-    match network {
-        crate::ZeckNetwork::Mainnet => None,
-        crate::ZeckNetwork::Testnet => Some(TESTNET_NU7_ACTIVATION_HEIGHT),
-    }
+    Ok(())
 }
 
 /// `1234567` as `1,234,567`.
@@ -127,7 +130,7 @@ pub fn nu7_recovery_warning(network: crate::ZeckNetwork) -> String {
             "URGENT: {rules} {MAINNET_NU7_SCHEDULE} Start recovery promptly: recovery \
              transactions must be mined before activation; broadcast alone is not enough. \
              Full-block scans and proving can take substantial time. Check \
-             https://zips.z.cash/zip-0259 for the assigned mainnet activation height and \
+             https://zips.z.cash/zip-0259 for the assigned activation heights and \
              upgrade status. {MAINNET_NU7_TIMELINE}"
         ),
         crate::ZeckNetwork::Testnet => format!(
@@ -150,7 +153,7 @@ pub fn nu7_broadcast_warning(network: crate::ZeckNetwork) -> String {
     format!(
         "Your Sprout recovery transaction was broadcast, but it must be mined before NU7 \
          activation; confirm it is mined by checking its txid in a block explorer. A \
-         version 4 transaction still unmined at activation can never be mined. {schedule}"
+         version 4 transaction still unmined at activation cannot be mined under NU7 rules. {schedule}"
     )
 }
 
@@ -233,7 +236,7 @@ pub struct BuiltSproutSweep {
 }
 
 /// Load and verify the Sprout proving parameters.
-pub fn load_params(path: &Path) -> ZeckResult<bellman::groth16::Parameters<bls12_381::Bls12>> {
+pub fn load_params(path: &Path) -> ZeckResult<groth16::Parameters<bls12_381::Bls12>> {
     if !path.exists() {
         return Err(ZeckError::TransactionBuild(format!(
             "the Sprout proving parameters are not at {}. Download them with:\n  \
@@ -257,11 +260,12 @@ pub fn build_sweep_for_note(
     destination: sapling_crypto::PaymentAddress,
     branch_id: BranchId,
     expiry_height: BlockHeight,
-    proving_key: &bellman::groth16::Parameters<bls12_381::Bls12>,
+    proving_key: &groth16::Parameters<bls12_381::Bls12>,
     sapling_prover: &zcash_proofs::prover::LocalTxProver,
     memo: [u8; 512],
-    mut rng: impl rand_core::RngCore + rand_core::CryptoRng + Clone,
+    mut rng: impl rand::CryptoRng + Clone,
 ) -> ZeckResult<BuiltSproutSweep> {
+    sprout_spend::require_sprout_branch(branch_id)?;
     if note.note.value <= SPROUT_SWEEP_FEE {
         return Err(ZeckError::TransactionBuild(format!(
             "this note holds {} zatoshi, which does not cover the {SPROUT_SWEEP_FEE} \
@@ -419,6 +423,10 @@ pub struct SproutSweepTransaction {
     /// An expired or rejected transaction a later plan for the same note
     /// replaced. Listed so its txid is not lost; it needs no action.
     pub superseded: bool,
+    /// Fresh chain-height evidence says no remaining inclusion block permits
+    /// this unmined transaction. This is not success, normal expiry, or a
+    /// reason to delete the retained source material.
+    pub unmineable_after_nu7: bool,
 }
 
 /// One note the network refused to let the sweep spend.
@@ -673,6 +681,9 @@ pub enum NoteSource {
 /// Everything about a sweep beyond what to sweep and where to send it.
 #[derive(Clone, Copy)]
 pub struct SweepOptions<'a> {
+    /// The caller authorized status inspection only. Never prove, prepare,
+    /// submit, or resubmit, even if fresh evidence later permits spending.
+    pub observation_only: bool,
     pub source: NoteSource,
     /// Mandatory durable lifecycle journal.
     pub journal: &'a SweepJournal,
@@ -832,16 +843,14 @@ struct Lightwalletd(
     zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<
         tonic::transport::Channel,
     >,
+    crate::ZeckNetwork,
 );
 
 impl SweepNode for Lightwalletd {
     async fn tip(&mut self) -> Result<u32, String> {
-        use zcash_client_backend::proto::service::ChainSpec;
-        self.0
-            .get_latest_block(ChainSpec {})
+        crate::nu7::validated_tip_from_client(&mut self.0, self.1)
             .await
             .map_err(|err| err.to_string())
-            .and_then(|r| tip_from_height(r.into_inner().height))
     }
 }
 
@@ -1140,11 +1149,13 @@ pub struct SproutReconciliation {
     /// `MIN_DISCARD_CONFIRMATIONS` deep. An observer error, a single
     /// operator, or a shallow block leaves a transaction out.
     pub fresh_safe_to_discard: HashSet<TxId>,
+    pub spending_disabled_by_nu7: bool,
 }
 
 fn transaction_summary(entry: &SproutJournalEntry, superseded: bool) -> SproutSweepTransaction {
     SproutSweepTransaction {
         superseded,
+        unmineable_after_nu7: false,
         txid: entry.txid().to_string(),
         value_zatoshis: entry.value_zatoshis,
         state: entry.state,
@@ -1159,7 +1170,10 @@ fn transaction_summary(entry: &SproutJournalEntry, superseded: bool) -> SproutSw
     }
 }
 
-fn transaction_summaries(snapshot: &SproutJournalSnapshot) -> Vec<SproutSweepTransaction> {
+fn transaction_summaries(
+    snapshot: &SproutJournalSnapshot,
+    spending_disabled_by_nu7: bool,
+) -> Vec<SproutSweepTransaction> {
     snapshot
         .superseded_entries()
         .map(|entry| transaction_summary(entry, true))
@@ -1168,6 +1182,17 @@ fn transaction_summaries(snapshot: &SproutJournalSnapshot) -> Vec<SproutSweepTra
                 .entries_in_journal_order()
                 .map(|entry| transaction_summary(entry, false)),
         )
+        .map(|mut transaction| {
+            transaction.unmineable_after_nu7 = spending_disabled_by_nu7
+                && !transaction.superseded
+                && matches!(
+                    transaction.state,
+                    TxLifecycleState::NotSubmitted
+                        | TxLifecycleState::SubmissionUnknown
+                        | TxLifecycleState::Pending
+                );
+            transaction
+        })
         .collect()
 }
 
@@ -1305,12 +1330,24 @@ fn repeats_record(
         && (state != TxLifecycleState::Mined || entry.mined_observation_is_redundant(observation))
 }
 
-pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
+#[cfg(test)]
+pub(crate) async fn reconcile_sprout_journal<S: SweepNode, O: TxObserver>(
+    journal: &SweepJournal,
+    snapshot: SproutJournalSnapshot,
+    submitter: &mut S,
+    observer: &mut O,
+    network: crate::ZeckNetwork,
+) -> ZeckResult<SproutReconciliation> {
+    reconcile_sprout_journal_with_mode(journal, snapshot, submitter, observer, network, false).await
+}
+
+async fn reconcile_sprout_journal_with_mode<S: SweepNode, O: TxObserver>(
     journal: &SweepJournal,
     mut snapshot: SproutJournalSnapshot,
     submitter: &mut S,
     observer: &mut O,
     network: crate::ZeckNetwork,
+    observation_only: bool,
 ) -> ZeckResult<SproutReconciliation> {
     let entries = snapshot
         .entries_in_journal_order()
@@ -1320,6 +1357,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
     let mut unresolved_unknown = false;
     let mut unknown_observation_errors = Vec::new();
     let mut fresh_safe_to_discard = HashSet::new();
+    let mut spending_disabled_by_nu7 = false;
 
     for entry in entries {
         if entry.state == TxLifecycleState::NotSubmitted {
@@ -1363,6 +1401,15 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                 continue;
             }
         };
+
+        // A configured source at the activation boundary is sufficient to
+        // stop spending even if another source still lags behind it. Retain
+        // normal mining observations and exact journal bytes below.
+        spending_disabled_by_nu7 |= observation
+            .evidence
+            .iter()
+            .filter_map(|item| item.tip_height)
+            .any(|tip| nu7_deadline_reached(network, tip));
 
         if observation.has_canonical_mined_evidence() {
             if !repeats_record(&entry, TxLifecycleState::Mined, &observation) {
@@ -1439,6 +1486,39 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             continue;
         }
 
+        // NU7 may invalidate a saved V4 before its encoded expiry. Do not
+        // mislabel that as normal expiry (which would advertise a new plan),
+        // or discard the exact bytes and latest absence/reorg evidence.
+        let retired_before_expiry = nu7_activation_height(network).is_some_and(|activation| {
+            expiry.is_none_or(|height| height >= activation)
+                && observation
+                    .evidence
+                    .iter()
+                    .filter_map(|item| item.tip_height)
+                    .any(|tip| nu7_deadline_reached(network, tip))
+        });
+        if retired_before_expiry
+            && matches!(
+                observation.state,
+                TxObservationState::Absent | TxObservationState::Reorged
+            )
+        {
+            let state = if entry.state.is_mined() {
+                TxLifecycleState::Pending
+            } else {
+                entry.state
+            };
+            if !repeats_record(&entry, state, &observation) {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    state,
+                    None,
+                    Some(&observation),
+                )?;
+            }
+            continue;
+        }
         let Some(transaction) = entry.transaction.clone() else {
             if entry.state.is_mined()
                 && matches!(
@@ -1544,13 +1624,39 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         None
     };
 
-    if stop_reason.is_none() {
+    if stop_reason.is_none() && !observation_only {
         for (outpoint, value_zatoshis, transaction) in retries {
             // Observation can take long enough for an older Argos process
             // that ignores the network operation guard to create a sibling
             // journal. Narrow that compatibility race immediately before
             // the exact saved bytes leave this process.
             journal.load_scoped_snapshot(&[outpoint])?;
+            // An observation can become stale while other transactions are
+            // queried. Every exact-byte retry gets its own fresh inclusion
+            // check, including a NotSubmitted entry with a future expiry.
+            let tip = match submitter.tip().await {
+                Ok(tip) => tip,
+                Err(err) => {
+                    stop_reason = Some(format!("cannot refresh chain tip before Sprout retry: {err}; saved bytes and recovery material were retained"));
+                    break;
+                }
+            };
+            if let Err(reason) = require_sprout_inclusion(network, tip) {
+                spending_disabled_by_nu7 |= nu7_deadline_reached(network, tip);
+                stop_reason = Some(reason);
+                break;
+            }
+            if spending_disabled_by_nu7 {
+                stop_reason = Some("configured chain evidence has reached NU7; Sprout reconciliation is observation-only and no saved transaction was resent".into());
+                break;
+            }
+            if transaction
+                .expiry_height
+                .is_some_and(|expiry| expiry != 0 && tip >= expiry)
+            {
+                stop_reason = Some(format!("the refreshed tip has reached the expiry of Sprout transaction {}; saved bytes were retained without resubmission. Refresh transaction status before reviewing a new plan.", transaction.txid));
+                break;
+            }
             let result = {
                 let mut store = journal.scoped_store(
                     JournalNoteContext {
@@ -1581,8 +1687,22 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         }
     }
 
+    if spending_disabled_by_nu7
+        && stop_reason.is_none()
+        && snapshot.entries().any(|entry| {
+            matches!(
+                entry.state,
+                TxLifecycleState::NotSubmitted
+                    | TxLifecycleState::SubmissionUnknown
+                    | TxLifecycleState::Pending
+            )
+        })
+    {
+        stop_reason = Some("NU7 prevents any remaining Sprout version 4 inclusion; reconciliation observed saved transactions without rebroadcast. Keep all recovery material.".into());
+    }
     Ok(SproutReconciliation {
-        transactions: transaction_summaries(&snapshot),
+        transactions: transaction_summaries(&snapshot, spending_disabled_by_nu7),
+        spending_disabled_by_nu7,
         snapshot,
         stop_reason,
         fresh_safe_to_discard,
@@ -1660,15 +1780,15 @@ async fn sweep_sprout_notes_guarded(
     let (client, _endpoint, _info) =
         crate::scan::probe_valid_lightwalletd_endpoints(lightwalletd_url, network).await?;
 
-    let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
+    let mut sapling_prover = None;
 
-    let mut node = Lightwalletd(client);
+    let mut node = Lightwalletd(client, network);
     let mut observer = crate::lightwalletd::LightwalletdTxObserver::new(
         lightwalletd_url,
         options.confirmation_sources,
     )?;
     let mut proving_key = None;
-    let outcome = run_sweep(
+    let outcome = run_sweep_with_mode(
         notes,
         &mut node,
         &mut observer,
@@ -1677,19 +1797,22 @@ async fn sweep_sprout_notes_guarded(
             if proving_key.is_none() {
                 proving_key = Some(load_params(params_path)?);
             }
+            let sapling_prover =
+                sapling_prover.get_or_insert_with(zcash_proofs::prover::LocalTxProver::bundled);
             build_sweep_for_note(
                 note,
                 sapling_dest,
                 branch_id,
                 expiry,
                 proving_key.as_ref().expect("proving key initialized"),
-                &sapling_prover,
+                sapling_prover,
                 [0u8; 512],
-                rand_core::OsRng,
+                rand::rand_core::UnwrapErr(rand::rngs::SysRng),
             )
         },
         options.source,
         options.journal,
+        options.observation_only,
         progress,
     )
     .await;
@@ -1716,7 +1839,25 @@ fn note_label(index: usize, total: usize, note: &SpendableSproutNote) -> String 
 
 /// The sweep's decisions, separated from lightwalletd and the prover.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn run_sweep(
+    notes: &[SpendableSproutNote],
+    node: &mut (impl SweepNode + Send),
+    observer: &mut impl TxObserver,
+    network: crate::ZeckNetwork,
+    build: impl FnMut(&SpendableSproutNote, BlockHeight, BranchId) -> ZeckResult<BuiltSproutSweep>,
+    source: NoteSource,
+    journal: &SweepJournal,
+    progress: impl FnMut(String),
+) -> SproutSweepOutcome {
+    run_sweep_with_mode(
+        notes, node, observer, network, build, source, journal, false, progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sweep_with_mode(
     notes: &[SpendableSproutNote],
     node: &mut (impl SweepNode + Send),
     observer: &mut impl TxObserver,
@@ -1724,6 +1865,7 @@ pub(crate) async fn run_sweep(
     mut build: impl FnMut(&SpendableSproutNote, BlockHeight, BranchId) -> ZeckResult<BuiltSproutSweep>,
     source: NoteSource,
     journal: &SweepJournal,
+    observation_only: bool,
     mut progress: impl FnMut(String),
 ) -> SproutSweepOutcome {
     let mut outcome = SproutSweepOutcome::default();
@@ -1739,19 +1881,28 @@ pub(crate) async fn run_sweep(
         }
     };
 
-    let reconciliation =
-        match reconcile_sprout_journal(journal, snapshot, node, observer, network).await {
-            Ok(reconciliation) => reconciliation,
-            Err(err) => {
-                outcome.error = Some(format!(
-                    "Sprout reconciliation failed before any new proof or broadcast: {err}"
-                ));
-                if let Ok(snapshot) = journal.load_scoped_snapshot(&outpoints) {
-                    refresh_outcome(&mut outcome, &snapshot, notes, &HashSet::new());
-                }
-                return outcome;
+    let reconciliation = match reconcile_sprout_journal_with_mode(
+        journal,
+        snapshot,
+        node,
+        observer,
+        network,
+        observation_only,
+    )
+    .await
+    {
+        Ok(reconciliation) => reconciliation,
+        Err(err) => {
+            outcome.error = Some(format!(
+                "Sprout reconciliation failed before any new proof or broadcast: {err}"
+            ));
+            if let Ok(snapshot) = journal.load_scoped_snapshot(&outpoints) {
+                refresh_outcome(&mut outcome, &snapshot, notes, &HashSet::new(), false);
             }
-        };
+            return outcome;
+        }
+    };
+    let mut spending_disabled_by_nu7 = reconciliation.spending_disabled_by_nu7;
     let mut snapshot = reconciliation.snapshot;
     if let Some(reason) = reconciliation.stop_reason {
         outcome.error = Some(reason);
@@ -1760,11 +1911,22 @@ pub(crate) async fn run_sweep(
             &snapshot,
             notes,
             &reconciliation.fresh_safe_to_discard,
+            spending_disabled_by_nu7,
         );
         return outcome;
     }
 
     let fresh_safe_to_discard = reconciliation.fresh_safe_to_discard;
+    if observation_only {
+        refresh_outcome(
+            &mut outcome,
+            &snapshot,
+            notes,
+            &fresh_safe_to_discard,
+            spending_disabled_by_nu7,
+        );
+        return outcome;
+    }
     let ready_ids = classify_sprout_notes(notes, &snapshot)
         .ready
         .into_iter()
@@ -1777,6 +1939,14 @@ pub(crate) async fn run_sweep(
         let label = note_label(index, total, note);
         if !ready_ids.contains(&note_id(&note.outpoint)) {
             continue;
+        }
+        // A fresh observer can be ahead of the submission server. Once any
+        // configured observation reaches the deadline, a lagging primary
+        // must not authorize another proof or send. Previously mined rows
+        // still reconciled above, with their original evidence intact.
+        if spending_disabled_by_nu7 {
+            outcome.error = Some("configured chain evidence has reached NU7; no new Sprout note can be proved or sent. Historical transaction status and recovery material are retained.".into());
+            break;
         }
         if note.note.value <= SPROUT_SWEEP_FEE {
             outcome.skipped.push(format!(
@@ -1818,22 +1988,10 @@ pub(crate) async fn run_sweep(
             ));
             break;
         };
-        // A Sprout spend is a version 4 transaction, and NU7 disables
-        // version 4 outright. A transaction built for a block at or past
-        // activation can never be mined, so refuse before a proving run.
-        if let Some(activation) = nu7_activation_height(network) {
-            if tip.saturating_add(1) >= activation {
-                outcome.error = Some(format!(
-                    "the next block ({}) is at or past NU7 activation at height {} on {}. NU7 \
-                     disables version 4 transactions, the only format that can spend Sprout, \
-                     so Sprout funds cannot move after activation. Nothing was built or sent \
-                     for {label}.",
-                    group_thousands(tip.saturating_add(1)),
-                    group_thousands(activation),
-                    network.label(),
-                ));
-                break;
-            }
+        if let Err(reason) = require_sprout_inclusion(network, tip) {
+            spending_disabled_by_nu7 |= nu7_deadline_reached(network, tip);
+            outcome.error = Some(format!("{reason} Nothing was built or sent for {label}."));
+            break;
         }
         let branch_id = branch_id_for_height(network, tip);
         let expiry = BlockHeight::from_u32(tip + EXPIRY_DELTA);
@@ -1884,6 +2042,27 @@ pub(crate) async fn run_sweep(
             outcome.error = Some(format!(
                 "Sprout journal scope changed before {label} could be broadcast: {err}. Nothing was sent for it."
             ));
+            break;
+        }
+        // Proving can cross activation or exhaust the encoded expiry. A
+        // fresh, network-validated tip is required immediately before the
+        // first durable prepare/send; an unknown or stale tip fails closed.
+        let current_tip = match node.tip().await {
+            Ok(tip) => tip,
+            Err(err) => {
+                outcome.error = Some(format!("could not refresh chain tip after proving {label}: {err}. Nothing was prepared or sent for it."));
+                break;
+            }
+        };
+        if let Err(reason) = require_sprout_inclusion(network, current_tip) {
+            spending_disabled_by_nu7 |= nu7_deadline_reached(network, current_tip);
+            outcome.error = Some(format!(
+                "{reason} Nothing was prepared or sent for {label}."
+            ));
+            break;
+        }
+        if current_tip >= u32::from(expiry) {
+            outcome.error = Some(format!("the chain passed the expiry of {label} while proving; nothing was prepared or sent. Review a new plan."));
             break;
         }
         let mut recorder = RecordingSubmitter {
@@ -1986,7 +2165,13 @@ pub(crate) async fn run_sweep(
         }
     }
 
-    refresh_outcome(&mut outcome, &snapshot, notes, &fresh_safe_to_discard);
+    refresh_outcome(
+        &mut outcome,
+        &snapshot,
+        notes,
+        &fresh_safe_to_discard,
+        spending_disabled_by_nu7,
+    );
     outcome
 }
 
@@ -1995,12 +2180,18 @@ fn refresh_outcome(
     snapshot: &SproutJournalSnapshot,
     notes: &[SpendableSproutNote],
     fresh_safe_to_discard: &HashSet<TxId>,
+    spending_disabled_by_nu7: bool,
 ) {
-    outcome.transactions = transaction_summaries(snapshot);
+    outcome.transactions = transaction_summaries(snapshot, spending_disabled_by_nu7);
     outcome.mined_zatoshis = 0;
     outcome.pending_zatoshis = 0;
     outcome.unknown_zatoshis = 0;
     for transaction in &outcome.transactions {
+        // Retired bytes remain visible with their recorded amount and
+        // lifecycle, but their value is no longer an in-flight recovery.
+        if transaction.unmineable_after_nu7 {
+            continue;
+        }
         let Some(value) = transaction.value_zatoshis else {
             continue;
         };
@@ -2037,7 +2228,7 @@ fn refresh_outcome(
         && outcome.rejected.is_empty();
 }
 
-fn random_bytes(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> Zeroizing<[u8; 32]> {
+fn random_bytes(rng: &mut impl rand::CryptoRng) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     rng.fill_bytes(&mut *out);
     out
@@ -2064,34 +2255,13 @@ mod tests {
     use crate::sprout::SproutPaymentAddress;
     use argos_wallet_import::keys::JsOutPoint;
 
-    /// PR #263 review item 1: the mainnet warning must give the targeted
-    /// date and say the height is not yet assigned, or a user facing a
-    /// days-long scan cannot judge how urgent this is.
     #[test]
-    fn mainnet_nu7_warning_gives_the_target_date_and_unassigned_height() {
+    fn mainnet_nu7_warning_states_the_assigned_deadline() {
         let text = nu7_recovery_warning(crate::ZeckNetwork::Mainnet);
-        assert!(text.starts_with("URGENT:"), "{text}");
-        assert!(text.contains("all version 4 transactions"), "{text}");
-        assert!(
-            text.contains(
-                "Mainnet activation is targeted for about November 5, 2026; the final \
-                 height is not yet assigned (proposed in zcash/zips#1405)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("https://forum.zcashcommunity.com/t/nu7-timeline/57655"),
-            "{text}"
-        );
+        assert!(text.contains("3,543,405"), "{text}");
         assert!(text.contains("mined before activation"), "{text}");
         assert!(text.contains("broadcast alone is not enough"), "{text}");
-        assert!(text.contains("Start recovery promptly"), "{text}");
-        assert!(text.contains("https://zips.z.cash/zip-0259"), "{text}");
-        // No height may be stated as fact until zcash/zips#1405 merges.
-        assert!(!text.contains("3,543,405") && !text.contains("3543405"));
-        // A copied link must not pick up trailing punctuation.
-        assert!(text.ends_with("/t/nu7-timeline/57655"), "{text}");
-        assert!(nu7_broadcast_warning(crate::ZeckNetwork::Mainnet).ends_with("/57655"));
+        assert!(!text.contains("not yet assigned"), "{text}");
     }
 
     #[test]
@@ -2115,7 +2285,7 @@ mod tests {
             assert!(!text.contains("URGENT"), "{text}");
             assert!(!text.contains("Start recovery promptly"), "{text}");
         }
-        assert!(nu7_broadcast_warning(crate::ZeckNetwork::Mainnet).contains("November 5, 2026"));
+        assert!(nu7_broadcast_warning(crate::ZeckNetwork::Mainnet).contains("3,543,405"));
         assert!(nu7_broadcast_warning(crate::ZeckNetwork::Testnet).contains("4,465,026"));
     }
 
@@ -2700,7 +2870,8 @@ mod tests {
     async fn the_server_is_checked_before_the_parameters_are_loaded() {
         let data_dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(data_dir.path());
-        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32])
+            .expect("valid fixture seed");
         let destination =
             crate::sapling_key::default_sapling_address(&extsk, crate::ZeckNetwork::Mainnet);
         let err = sweep_sprout_notes(
@@ -2710,6 +2881,7 @@ mod tests {
             &destination,
             Path::new("/nonexistent/sprout-groth16.params"),
             SweepOptions {
+                observation_only: false,
                 source: NoteSource::WalletFile,
                 journal: &journal,
                 confirmation_sources: &[],
@@ -2734,7 +2906,8 @@ mod tests {
             crate::ZeckNetwork::Mainnet,
         )
         .unwrap();
-        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32])
+            .expect("valid fixture seed");
         let destination =
             crate::sapling_key::default_sapling_address(&extsk, crate::ZeckNetwork::Mainnet);
 
@@ -2745,6 +2918,7 @@ mod tests {
             &destination,
             Path::new("/nonexistent/sprout-groth16.params"),
             SweepOptions {
+                observation_only: false,
                 source: NoteSource::WalletFile,
                 journal: &journal,
                 confirmation_sources: &[],
@@ -2995,6 +3169,30 @@ mod tests {
         }
     }
 
+    fn fixture_v4_transaction(seed: u32, expiry: u32) -> crate::broadcast::PreparedTransaction {
+        use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V4,
+            BranchId::Nu6_3,
+            seed,
+            BlockHeight::from_u32(expiry),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw_tx = Vec::new();
+        tx.write(&mut raw_tx).unwrap();
+        crate::broadcast::PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx,
+            fee_zatoshis: SPROUT_SWEEP_FEE,
+            expiry_height: Some(expiry),
+        }
+    }
+
     fn endpoint(
         operator: &str,
         tip: u32,
@@ -3185,7 +3383,7 @@ mod tests {
 
     fn run_lifecycle(
         notes: &[SpendableSproutNote],
-        node: &mut LifecycleNode,
+        node: &mut (impl SweepNode + Send),
         observer: &mut LifecycleObserver,
         journal: &crate::sprout_sweep_journal::SweepJournal,
         build_seed: u32,
@@ -3700,10 +3898,20 @@ mod tests {
         );
         let mut node = LifecycleNode::accepted(140, 1);
         let mut observer = LifecycleObserver::new([(tx.txid, absent(Some(140), 140))]);
-        let (_, builds, raw) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 61);
+        let (outcome, builds, raw) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 61);
         assert_eq!(builds, 0);
         assert!(raw.is_empty());
-        assert_eq!(node.sent, vec![tx.raw_tx]);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.as_deref().unwrap().contains("expiry"));
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::Pending
+        );
     }
 
     #[test]
@@ -4491,7 +4699,7 @@ mod tests {
         assert_eq!(outcome.pending_zatoshis, 1_000_000 - SPROUT_SWEEP_FEE);
         // And it survives a reload.
         let reloaded = journal.load_or_migrate().unwrap();
-        assert_eq!(transaction_summaries(&reloaded).len(), 2);
+        assert_eq!(transaction_summaries(&reloaded, false).len(), 2);
     }
 
     #[test]
@@ -4540,14 +4748,15 @@ mod tests {
         );
     }
 
-    fn run_on_testnet_at(tip: u32, id: u8) -> (SproutSweepOutcome, usize, usize) {
+    fn run_on_network_at(
+        network: crate::ZeckNetwork,
+        tip: u32,
+        id: u8,
+    ) -> (SproutSweepOutcome, usize, usize) {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("argos-data");
-        let journal = crate::sprout_sweep_journal::SweepJournal::for_keys(
-            &data_dir,
-            &[[0x42; 32]],
-            crate::ZeckNetwork::Testnet,
-        );
+        let journal =
+            crate::sprout_sweep_journal::SweepJournal::for_keys(&data_dir, &[[0x42; 32]], network);
         let notes = [lifecycle_note(1_000_000, id)];
         let mut node = LifecycleNode::accepted(tip, 1);
         let mut observer = LifecycleObserver::default();
@@ -4560,7 +4769,7 @@ mod tests {
             &notes,
             &mut node,
             &mut observer,
-            crate::ZeckNetwork::Testnet,
+            network,
             |note: &SpendableSproutNote, expiry: BlockHeight, _| {
                 builds += 1;
                 let tx = fixture_transaction(1200 + id as u32, expiry.into());
@@ -4578,15 +4787,365 @@ mod tests {
         (outcome, builds, sent)
     }
 
+    /// A real durable journal and sweep coordinator, with only network I/O scripted.
+    struct ScriptedTipNode {
+        node: LifecycleNode,
+        tips: std::collections::VecDeque<Result<u32, String>>,
+    }
+
+    impl SweepNode for ScriptedTipNode {
+        async fn tip(&mut self) -> Result<u32, String> {
+            self.tips.pop_front().expect("unexpected tip request")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TxSubmitter for ScriptedTipNode {
+        async fn send_raw(
+            &mut self,
+            raw: Vec<u8>,
+        ) -> Result<zcash_client_backend::proto::service::SendResponse, tonic::Status> {
+            self.node.send_raw(raw).await
+        }
+    }
+
+    #[test]
+    fn observation_only_authority_never_proves_or_retries_when_chain_becomes_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let saved_note = lifecycle_note(1_000_000, 181);
+        let ready_note = lifecycle_note(1_000_000, 182);
+        let tx = fixture_v4_transaction(1810, 140);
+        seed_entry(&journal, &saved_note, &tx, TxLifecycleState::Pending);
+        let mut observer = LifecycleObserver::new([(tx.txid, absent(tx.expiry_height, 100))]);
+        let mut node = LifecycleNode::accepted(100, 0);
+        let mut builds = 0;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(run_sweep_with_mode(
+            &[saved_note, ready_note],
+            &mut node,
+            &mut observer,
+            crate::ZeckNetwork::Mainnet,
+            |_, _, _| {
+                builds += 1;
+                panic!("status-only request cannot authorize a proof")
+            },
+            NoteSource::WalletFile,
+            &journal,
+            true,
+            |_| {},
+        ));
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(node.tip_calls, 0);
+        assert_eq!(observer.observed, vec![tx.txid]);
+        assert_eq!(outcome.transactions[0].state, TxLifecycleState::Pending);
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .transaction
+                .as_ref()
+                .unwrap()
+                .raw_tx,
+            tx.raw_tx
+        );
+    }
+
+    #[test]
+    fn exact_retry_at_encoded_expiry_never_sends_or_forges_expiration() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 183);
+        let tx = fixture_v4_transaction(1830, 140);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::NotSubmitted);
+        let mut node = LifecycleNode::accepted(140, 0);
+        let (outcome, builds, _) = run_lifecycle(
+            &[note],
+            &mut node,
+            &mut LifecycleObserver::default(),
+            &journal,
+            1831,
+        );
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.as_deref().unwrap().contains("expiry"));
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::NotSubmitted
+        );
+    }
+
+    #[test]
+    fn nu7_mainnet_boundary_retires_fresh_sprout_spending() {
+        for (tip, want_built) in [(3_543_403, 1), (3_543_404, 0), (3_543_405, 0)] {
+            let (outcome, built, sent) = run_on_network_at(crate::ZeckNetwork::Mainnet, tip, 170);
+            assert_eq!((built, sent), (want_built, want_built), "tip {tip}");
+            if want_built == 0 {
+                assert!(outcome.error.as_deref().unwrap().contains("NU7"));
+            }
+        }
+    }
+
+    #[test]
+    fn nu7_activation_during_proving_never_prepares_or_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 171);
+        let mut node = ScriptedTipNode {
+            node: LifecycleNode::accepted(3_543_403, 1),
+            tips: [Ok(3_543_403), Ok(3_543_404)].into(),
+        };
+        let (outcome, builds, _) = run_lifecycle(
+            &[note],
+            &mut node,
+            &mut LifecycleObserver::default(),
+            &journal,
+            1710,
+        );
+        assert_eq!(builds, 1);
+        assert!(node.node.sent.is_empty());
+        assert!(journal
+            .load_or_migrate()
+            .unwrap()
+            .entries_in_journal_order()
+            .next()
+            .is_none());
+        assert!(outcome.error.as_deref().unwrap().contains("NU7"));
+    }
+
+    #[test]
+    fn nu7_saved_pending_is_observed_without_rebroadcast_or_evidence_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (checkpoint, journal, _) = checkpoint_fixture(dir.path());
+        let checkpoint_bytes = std::fs::read(&checkpoint).unwrap();
+        let note = lifecycle_note(1_000_000, 172);
+        let tx = fixture_v4_transaction(1720, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::Pending);
+        let mut observer = LifecycleObserver::new([(tx.txid, absent(tx.expiry_height, 3_543_405))]);
+        let mut node = LifecycleNode::accepted(3_543_405, 1);
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1721);
+        assert_eq!(builds, 0);
+        assert_eq!(observer.observed, vec![tx.txid]);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.as_deref().unwrap().contains("NU7"));
+        let saved = journal.load_or_migrate().unwrap();
+        let entry = saved.entry_for_txid(tx.txid).unwrap();
+        assert_eq!(entry.state, TxLifecycleState::Pending);
+        assert_eq!(entry.transaction.as_ref().unwrap().raw_tx, tx.raw_tx);
+        assert!(entry.observation.is_some());
+        assert!(!outcome.fresh_all_mined);
+        assert_eq!(outcome.pending_zatoshis, 0);
+        assert_eq!(outcome.unknown_zatoshis, 0);
+        assert_eq!(outcome.transactions[0].value_zatoshis, Some(980_000));
+        assert!(outcome.transactions[0].unmineable_after_nu7);
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), checkpoint_bytes);
+    }
+
+    #[test]
+    fn nu7_invalidates_pending_before_later_encoded_expiry_without_normal_expiry_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 178);
+        let tx = fixture_v4_transaction(1780, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::Pending);
+        let mut observer = LifecycleObserver::new([(tx.txid, absent(tx.expiry_height, 3_543_410))]);
+        let mut node = LifecycleNode::accepted(3_543_410, 0);
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1781);
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(outcome.transactions[0].state, TxLifecycleState::Pending);
+        assert!(outcome.transactions[0].unmineable_after_nu7);
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::Pending
+        );
+    }
+
+    #[test]
+    fn nu7_preserves_genuine_expiry_evidence_after_the_encoded_expiry_margin() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 184);
+        let tx = fixture_v4_transaction(1840, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::Pending);
+        let mut observer = LifecycleObserver::new([(tx.txid, absent(tx.expiry_height, 3_543_500))]);
+        let mut node = LifecycleNode::accepted(3_543_500, 0);
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1841);
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(outcome.transactions[0].state, TxLifecycleState::Expired);
+        assert!(!outcome.transactions[0].unmineable_after_nu7);
+        assert!(!outcome.fresh_all_mined);
+        let saved = journal.load_or_migrate().unwrap();
+        let entry = saved.entry_for_txid(tx.txid).unwrap();
+        assert_eq!(entry.state, TxLifecycleState::Expired);
+        assert!(entry.observation.as_ref().unwrap().is_expired());
+        assert_eq!(entry.transaction.as_ref().unwrap().raw_tx, tx.raw_tx);
+    }
+
+    #[test]
+    fn nu7_never_submits_a_prepared_transaction_even_before_encoded_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 173);
+        let tx = fixture_v4_transaction(1730, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::NotSubmitted);
+        let mut node = LifecycleNode::accepted(3_543_404, 1);
+        let (outcome, builds, _) = run_lifecycle(
+            &[note],
+            &mut node,
+            &mut LifecycleObserver::default(),
+            &journal,
+            1731,
+        );
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.as_deref().unwrap().contains("NU7"));
+        let saved = journal.load_or_migrate().unwrap();
+        let entry = saved.entry_for_txid(tx.txid).unwrap();
+        assert_eq!(entry.state, TxLifecycleState::NotSubmitted);
+        assert_eq!(entry.transaction.as_ref().unwrap().raw_tx, tx.raw_tx);
+    }
+
+    #[test]
+    fn nu7_exact_retry_refreshes_tip_after_pre_activation_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 174);
+        let tx = fixture_v4_transaction(1740, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::Pending);
+        let mut observer = LifecycleObserver::new([(tx.txid, absent(tx.expiry_height, 3_543_403))]);
+        let mut node = LifecycleNode::accepted(3_543_404, 1);
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1741);
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.as_deref().unwrap().contains("NU7"));
+    }
+
+    #[test]
+    fn nu7_observer_at_activation_stops_fresh_note_despite_lagging_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let mined_note = lifecycle_note(1_000_000, 179);
+        let new_note = lifecycle_note(1_000_000, 180);
+        let tx = fixture_v4_transaction(1790, 3_543_445);
+        seed_entry(&journal, &mined_note, &tx, TxLifecycleState::Pending);
+        let mut observer =
+            LifecycleObserver::new([(tx.txid, mined(tx.expiry_height, 3_543_404, 3_543_505))]);
+        let mut node = LifecycleNode::accepted(3_543_395, 1);
+        let (outcome, builds, _) = run_lifecycle(
+            &[mined_note, new_note],
+            &mut node,
+            &mut observer,
+            &journal,
+            1791,
+        );
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(outcome.transactions[0].state, TxLifecycleState::Mined);
+        assert!(!outcome.fresh_all_mined);
+        assert!(outcome.error.as_deref().unwrap().contains("NU7"));
+    }
+
+    #[test]
+    fn nu7_mined_before_activation_still_reconciles_after_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 176);
+        let tx = fixture_v4_transaction(1760, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::Pending);
+        let mut observer =
+            LifecycleObserver::new([(tx.txid, mined(tx.expiry_height, 3_543_404, 3_543_505))]);
+        let mut node = LifecycleNode::accepted(3_543_505, 0);
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1761);
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(outcome.transactions[0].state, TxLifecycleState::Mined);
+        assert!(!outcome.transactions[0].unmineable_after_nu7);
+        assert!(outcome.fresh_all_mined);
+        assert_eq!(outcome.mined_zatoshis, 980_000);
+        assert!(journal.path().exists());
+    }
+
+    #[test]
+    fn nu7_unknown_tip_after_proving_never_prepares_or_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 177);
+        let mut node = ScriptedTipNode {
+            node: LifecycleNode::accepted(3_543_403, 1),
+            tips: [Ok(3_543_403), Err("latest block is stale".into())].into(),
+        };
+        let (outcome, builds, _) = run_lifecycle(
+            &[note],
+            &mut node,
+            &mut LifecycleObserver::default(),
+            &journal,
+            1770,
+        );
+        assert_eq!(builds, 1);
+        assert!(node.node.sent.is_empty());
+        assert!(journal
+            .load_or_migrate()
+            .unwrap()
+            .entries_in_journal_order()
+            .next()
+            .is_none());
+        assert!(outcome.error.as_deref().unwrap().contains("stale"));
+    }
+
+    #[test]
+    fn nu7_unknown_tip_never_resubmits_saved_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 175);
+        let tx = fixture_v4_transaction(1750, 3_543_445);
+        seed_entry(&journal, &note, &tx, TxLifecycleState::NotSubmitted);
+        let mut node = ScriptedTipNode {
+            node: LifecycleNode::accepted(3_543_403, 1),
+            tips: [Err("tip unavailable".into())].into(),
+        };
+        let (outcome, builds, _) = run_lifecycle(
+            &[note],
+            &mut node,
+            &mut LifecycleObserver::default(),
+            &journal,
+            1751,
+        );
+        assert_eq!(builds, 0);
+        assert!(node.node.sent.is_empty());
+        assert!(outcome.error.as_deref().unwrap().contains("tip"));
+    }
+
     #[test]
     fn no_sprout_transaction_is_built_for_a_block_at_or_past_nu7() {
         let activation = nu7_activation_height(crate::ZeckNetwork::Testnet).unwrap();
         assert_eq!(activation, 4_465_026);
         assert!(TESTNET_NU7_SCHEDULE.contains(&group_thousands(activation)));
-        assert_eq!(nu7_activation_height(crate::ZeckNetwork::Mainnet), None);
+        assert_eq!(
+            nu7_activation_height(crate::ZeckNetwork::Mainnet),
+            Some(3_543_405)
+        );
 
         // The next block is the last before activation: still buildable.
-        let (outcome, builds, sent) = run_on_testnet_at(activation - 2, 111);
+        let (outcome, builds, sent) =
+            run_on_network_at(crate::ZeckNetwork::Testnet, activation - 2, 111);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!((builds, sent), (1, 1));
 
@@ -4595,7 +5154,8 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let (outcome, builds, sent) = run_on_testnet_at(tip, 112 + offset as u8);
+            let (outcome, builds, sent) =
+                run_on_network_at(crate::ZeckNetwork::Testnet, tip, 112 + offset as u8);
             assert_eq!((builds, sent), (0, 0), "tip {tip}");
             let error = outcome.error.expect("NU7 refusal");
             assert!(error.contains("NU7"), "{error}");

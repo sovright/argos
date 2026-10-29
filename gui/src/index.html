@@ -182,8 +182,8 @@
             <div class="guide-section">
               <h3>Sprout Recovery</h3>
               <p>Sprout support is included in Argos. A ZecWallet Lite seed alone cannot recreate these independently generated keys; use a zcashd <code>wallet.dat</code> or standalone <code>SK…</code>/<code>ST…</code> key. With no wallet file, choose <em>I have a wallet file</em> on the welcome screen, then open <em>I only have a Sprout spending key</em>, pick the network and paste the keys.</p>
-              <p>If the wallet file contains cached note data and a witness, Argos can sweep it immediately. Otherwise recovery needs a resumable full-block scan from genesis to the chain tip — Sprout notes are still created and spent after Canopy, so it cannot stop there. On mainnet that is about 3.5 million blocks, roughly 280 GB transferred, under 500 MB retained, and likely days of work.</p>
-              <p>Sprout funds land in a Sapling receiver, even when you provide a Unified Address. They cannot reach Orchard in the same transaction; move them from Sapling to Orchard afterward from your own wallet if desired. Keep the original file, private scan checkpoint, and journal while any transaction is prepared, unknown, pending, contested, rejected, expired but recoverable, or not fully reconciled. Argos removes a checkpoint only when the current checkpoint notes exactly equal the durable manifest for that exact generation, every manifest entry is currently canonical mined, and the two newest separate reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators.</p>
+              <p>Before NU7, a wallet file with cached note data and a witness can be swept without a full scan. NU7 activates at mainnet block 3,543,405 and testnet block 4,465,026; every Sprout recovery must be mined before activation. After the last valid block is mined, Argos permits historical inspection and saved mined-status checks only. Missing or stale network height also disables new proofs and rebroadcast. Otherwise recovery needs a resumable full-block scan from genesis to the chain tip — Sprout notes were created and spent after Canopy and before NU7, so historical scanning cannot stop at Canopy. On mainnet that is about 3.5 million blocks, roughly 280 GB transferred, under 500 MB retained, and likely days of work.</p>
+              <p>Sprout funds land in a Sapling receiver, even when you provide a Unified Address. They cannot reach Orchard in the same transaction; move them from Sapling to Orchard afterward from your own wallet if desired. Keep the original file, private scan checkpoint, and journal while any transaction is prepared, unknown, pending, contested, rejected, expired, invalidated by NU7, or not fully reconciled. Argos removes a checkpoint only when the current checkpoint notes exactly equal the durable manifest for that exact generation, every manifest entry is currently canonical mined, and the two newest separate reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators.</p>
             </div>
 
             <div class="guide-section">
@@ -224,7 +224,7 @@
                 <li><strong>Are my recovery secrets transmitted?</strong> No. Seeds, wallet passphrases, and spending keys stay local. Ordinary scans download compact blocks from lightwalletd; Sprout scans download public full blocks from Zcash P2P peers.</li>
                 <li><strong>Can I use a transparent or Sapling address as my destination?</strong> Ordinary recovery requires a Unified Address with an Orchard or Sapling receiver. The separate Sprout sweep also accepts a bare Sapling address because Sprout can only land in Sapling.</li>
                 <li><strong>What if I had more than one ZecWallet Lite account?</strong> Argos scans up to 500 accounts automatically. If you enabled the gap-limit scan mode, it stops after 20 consecutive empty accounts by default — enough for almost all wallets.</li>
-                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume or a non-final transaction can be recovered. A sweep does not remove it automatically, even after completion. Delete it and any remaining recovery state yourself only after Argos reports fresh canonical mined evidence for every Sprout transaction. Argos's guarded cleanup path remains ineligible unless the current checkpoint notes equal the durable manifest for that exact generation and the two newest reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators. Private directories and files use <code>0700</code>/<code>0600</code> on Unix and a protected owner+LocalSystem Windows DACL. Keep the original wallet or key, checkpoint, and journal until then; a broadcast, visible arrival, node acceptance, or one confirmation is insufficient.</li>
+                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume or a non-final transaction can be recovered. A completed sweep alone does not authorize deleting it. Argos may automatically remove only the exact scan checkpoint through guarded cleanup when the current checkpoint notes equal the durable manifest for that exact generation and the two newest reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators. Argos retains the original wallet, keys, and journal. Private directories and files use <code>0700</code>/<code>0600</code> on Unix and a protected owner+LocalSystem Windows DACL. Keep the original wallet or key, checkpoint, and journal until then; a broadcast, visible arrival, node acceptance, or one confirmation is insufficient.</li>
                 <li><strong>Can I run Argos offline?</strong> Source validation and key derivation are offline, but scanning requires a network connection: lightwalletd for ordinary recovery or Zcash P2P peers for Sprout.</li>
               </ul>
             </div>
@@ -347,7 +347,7 @@
                    consumed by a Sapling output in the same transaction. -->
               <div id="wallet-sprout-sweep" hidden>
                 <hr />
-                <p><strong>Move these funds now</strong></p>
+                <p><strong id="sprout-sweep-heading">Sprout recovery and saved status</strong></p>
                 <p class="muted">
                   Argos checks any saved transaction before creating a new one. Keep the
                   original wallet file and private scan checkpoint until every transaction
@@ -368,7 +368,7 @@
                 <p id="sprout-sweep-spent-status" class="muted"></p>
                 <label class="checkbox-row">
                   <input type="checkbox" id="sprout-sweep-confirm" disabled />
-                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
+                  <span id="sprout-sweep-confirm-label">I understand this may rebroadcast a saved transaction or move funds and cannot be undone.</span>
                 </label>
                 <button id="sprout-sweep-run" type="button" disabled>
                   Sweep Sprout funds
@@ -512,7 +512,7 @@
                 <p id="sprout-scan-sweep-plan" class="muted"></p>
                 <label class="checkbox-row">
                   <input type="checkbox" id="sprout-scan-confirm" disabled />
-                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
+                  <span id="sprout-scan-confirm-label">I understand this may rebroadcast a saved transaction or move funds and cannot be undone.</span>
                 </label>
                 <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
                 <ul id="sprout-scan-sweep-results" class="session-list"></ul>

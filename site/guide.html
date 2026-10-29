@@ -94,12 +94,9 @@
               <span>
                 NU7 disables version 4 transactions, including all Sprout spends. Your recovery
                 transaction must be <strong>mined before activation</strong>; broadcasting is not
-                enough. Start promptly: a full Sprout scan can take days. Mainnet activation
-                is targeted for about November 5, 2026; the final height is not yet assigned
-                (proposed in <a href="https://github.com/zcash/zips/pull/1405">zcash/zips#1405</a>;
-                see the <a href="https://forum.zcashcommunity.com/t/nu7-timeline/57655">NU7
-                timeline</a>). Check <a href="https://zips.z.cash/zip-0259">ZIP 259</a> for the
-                assigned height. Funds remaining in Sprout after activation will be
+                enough. Start promptly: a full Sprout scan can take days. NU7 activates at mainnet block <strong>3,543,405</strong> and
+                testnet block <strong>4,465,026</strong>
+                (<a href="https://zips.z.cash/zip-0259">ZIP 259</a>). Funds remaining in Sprout after activation will be
                 unspendable under the current NU7 rules.
               </span>
             </div>
@@ -217,15 +214,19 @@
               <strong>Sprout recovery deadline: the sweep must be mined before NU7 activation.</strong>
               <span>
                 NU7 disables version 4 transactions and therefore Sprout spends. A broadcast or
-                completed scan alone does not meet this deadline. Mainnet activation is
-                targeted for about November 5, 2026; the final height is not yet assigned
-                (proposed in <a href="https://github.com/zcash/zips/pull/1405">zcash/zips#1405</a>;
-                see the <a href="https://forum.zcashcommunity.com/t/nu7-timeline/57655">NU7
-                timeline</a>). Start promptly and check
-                <a href="https://zips.z.cash/zip-0259">ZIP 259</a> for the assigned height. After a
+                completed scan alone does not meet this deadline. NU7 activates at mainnet block
+                <strong>3,543,405</strong> and testnet block <strong>4,465,026</strong>
+                (<a href="https://zips.z.cash/zip-0259">ZIP 259</a>). Start promptly;
+                recovery must be included in a block below activation. After a
                 sweep broadcasts, confirm the transaction is mined before activation.
                 Remaining Sprout funds will be unspendable under the current NU7 rules.
                 Historical scanning and reporting can still identify funds after activation.
+                Argos permits new recovery only with a fresh, validated network height.
+                Once the last valid block is mined, or if that height is unavailable or stale,
+                new proofs and rebroadcast are disabled. Saved transaction status remains
+                available as an observation-only check. An unmined transaction invalidated by
+                NU7 is not confirmed recovery. Keep your wallet, keys, backups, checkpoint,
+                and journal; activation does not delete them.
               </span>
             </div>
             <p>

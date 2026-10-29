@@ -31,7 +31,7 @@ services:
     # Pinned, not `latest`: the harness's activation heights and the Ironwood
     # consensus rules it exercises are version-sensitive, and a silently
     # updated node would change what the tests mean.
-    image: zfnd/zebra:6.2.3
+    image: zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
     container_name: argos-zebrad-regtest
     restart: "no"
     # Only bound to loopback — never publish regtest RPC to a non-loopback
@@ -59,11 +59,12 @@ services:
       - "start"
 
   lightwalletd-regtest:
-    # v0.5.1 is the first release carrying the Ironwood compact-block fields:
+    # v0.6.0 preserves the Ironwood compact-block fields:
     # `ChainMetadata.ironwoodCommitmentTreeSize`, and `CompactBlock` field 1
     # (`protoVersion`) reserved after removal. Both match what
-    # zcash_client_backend 0.24 expects to decode.
-    image: electriccoinco/lightwalletd:v0.5.1
+    # zcash_client_backend 0.25 expects to decode. Official release and image
+    # digests verified 2026-10-26; see README.md for provenance.
+    image: electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613
     # Published for linux/amd64 only — there is no arm64 manifest — so Apple
     # Silicon runs it under emulation. Acceptable because lightwalletd is a
     # thin gRPC proxy; the consensus work happens in zebrad, which does have a
@@ -91,6 +92,81 @@ services:
       - "--no-tls-very-insecure"
       - "--grpc-bind-addr=0.0.0.0:9067"
       - "--rpchost=zebrad-regtest"
+      - "--rpcport=18232"
+      - "--rpcuser=argos-regtest"
+      - "--rpcpassword=argos-regtest"
+      - "--data-dir=/var/lib/lightwalletd"
+      - "--log-file=/dev/stdout"
+
+  # Independent NU7 qualification chain. Its state and ports never overlap
+  # the ordinary recovery or historical Sprout fixtures.
+  zebrad-nu7:
+    profiles: ["nu7"]
+    image: zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+    container_name: argos-zebrad-nu7
+    restart: "no"
+    ports:
+      - "127.0.0.1:18252:18232"
+    volumes:
+      - ./zebrad-nu7.toml:/etc/zebrad/zebrad.toml:ro
+      - zebrad-nu7-data:/var/lib/zebrad
+    environment:
+      CONFIG_FILE_PATH: /etc/zebrad/zebrad.toml
+      ZEBRA_STATE__CACHE_DIR: /var/lib/zebrad
+    command: ["zebrad", "start"]
+
+  lightwalletd-nu7:
+    profiles: ["nu7"]
+    image: electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613
+    platform: linux/amd64
+    container_name: argos-lightwalletd-nu7
+    restart: "no"
+    depends_on: [zebrad-nu7]
+    ports:
+      - "127.0.0.1:9077:9067"
+    volumes:
+      - lwd-nu7-data:/var/lib/lightwalletd
+    command:
+      - "--no-tls-very-insecure"
+      - "--grpc-bind-addr=0.0.0.0:9067"
+      - "--rpchost=zebrad-nu7"
+      - "--rpcport=18232"
+      - "--rpcuser=argos-regtest"
+      - "--rpcpassword=argos-regtest"
+      - "--data-dir=/var/lib/lightwalletd"
+      - "--log-file=/dev/stdout"
+
+  # Fast boundary-only profile; no ZIP 212 / funded-PCZT claim.
+  zebrad-nu7-fast:
+    profiles: ["nu7-fast"]
+    image: zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+    container_name: argos-zebrad-nu7-fast
+    restart: "no"
+    ports:
+      - "127.0.0.1:18262:18232"
+    volumes:
+      - ./zebrad-nu7-fast.toml:/etc/zebrad/zebrad.toml:ro
+      - zebrad-nu7-fast-data:/var/lib/zebrad
+    environment:
+      CONFIG_FILE_PATH: /etc/zebrad/zebrad.toml
+      ZEBRA_STATE__CACHE_DIR: /var/lib/zebrad
+    command: ["zebrad", "start"]
+
+  lightwalletd-nu7-fast:
+    profiles: ["nu7-fast"]
+    image: electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613
+    platform: linux/amd64
+    container_name: argos-lightwalletd-nu7-fast
+    restart: "no"
+    depends_on: [zebrad-nu7-fast]
+    ports:
+      - "127.0.0.1:9087:9067"
+    volumes:
+      - lwd-nu7-fast-data:/var/lib/lightwalletd
+    command:
+      - "--no-tls-very-insecure"
+      - "--grpc-bind-addr=0.0.0.0:9067"
+      - "--rpchost=zebrad-nu7-fast"
       - "--rpcport=18232"
       - "--rpcuser=argos-regtest"
       - "--rpcpassword=argos-regtest"
@@ -154,4 +230,8 @@ services:
 volumes:
   zebrad-data:
   lwd-data:
+  zebrad-nu7-data:
+  lwd-nu7-data:
+  zebrad-nu7-fast-data:
+  lwd-nu7-fast-data:
   zcashd-sprout-data:
