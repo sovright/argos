@@ -114,16 +114,50 @@ re-reads every chunk and prints the same summary.
      covers the ciphertexts, ephemeral key, `random_seed` and JoinSplit
      pubkey, which otherwise show only as found notes.
 5. Add the printed entry to `PINNED_PACKS` in
-   `crates/zeck-core/src/sprout_pack.rs` and ship it in the release.
-6. Upload `manifest.bin` and every chunk as release assets. Each chunk is
-   far under GitHub's 2 GiB per-asset limit. Mirrors (CDN, torrent) are
-   fine: the pinned hash makes the download source irrelevant.
+   `crates/zeck-core/src/sprout_pack.rs`, fill in its `mirrors` (step 6),
+   and ship it in the release.
+6. Upload `manifest.bin` and every chunk to the public bucket
+   `gs://sovright-argos-sprout-packs/sprout-pack/<network>-<end height>-<first
+   8 hex of the manifest hash>/` and as release assets. Each chunk is far
+   under GitHub's 2 GiB per-asset limit. List both folders in the entry's
+   `mirrors`, the bucket first; each must be `https` and end in `/`. Other
+   mirrors (CDN, torrent) are fine: the pinned hash makes the download
+   source irrelevant. Then run
+   `ARGOS_PACK_DIR=<empty dir> cargo test -p argos-core --test
+   sprout_pack_fetch_client -- --ignored`, which downloads the pack from
+   the live mirrors and verifies it. The GitHub mirror works only once the
+   release is published.
+
+## Automatic download
+
+A mainnet Sprout scan with no pack folder downloads the pinned pack itself
+(`sprout_pack_fetch`), into `<data dir>/sprout-packs/<network>-<end
+height>-<manifest hash>/`, then scans from it:
+
+- The mirrors are not trusted. `manifest.bin` must hash to the pinned value
+  before any chunk is requested, and each chunk is written to
+  `chunk-NNNN.bin.partial`, capped at the manifest's length, and kept only
+  if its length and SHA-256 match. A mirror that fails or serves anything
+  else is skipped for the next.
+- Finished chunks are re-hashed and reused, so an interrupted download, or a
+  later scan, fetches only what is missing.
+- It runs only after every check that can stop the scan, and not at all for
+  a resumed scan already past the pack's end.
+- If every mirror fails, the scan says why and downloads every block over
+  p2p, as without a pack.
+- Turn it off with `--no-sprout-pack-download` in the CLI or the "Download
+  the Sprout pack automatically" setting in the app, or point at a copy you
+  downloaded with `--sprout-pack` or the pack folder field.
+- Privacy: a mirror sees the IP address of whoever downloads the pack, and a
+  download suggests the user holds Sprout funds. Our bucket keeps no access
+  logs; the GitHub release is GitHub's. Users who mind can turn the download
+  off, or fetch the files another way.
 
 ## Pinned packs
 
 - **Mainnet, blocks 1 to 3,500,000** (manifest
   `805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d`,
-  first shipped in 1.6.0). Built twice on 2026-10-28, from two Zebra 7.0.0
+  first shipped in 1.6.1). Built twice on 2026-10-28, from two Zebra 7.0.0
   nodes in different regions; both builds produced the same hash. Both
   halves of step 4 passed. The regtest pack test passes (CI runs it on
   every push). The mainnet comparison passed on 2026-10-29: run with
@@ -138,9 +172,6 @@ re-reads every chunk and prints the same summary.
 
 - **`compare` does not resume.** Both scans start from an empty
   directory, so an interrupted p2p scan starts again from height 1.
-- **No in-app download.** Users download the release assets themselves.
-  Fetching them from the app needs an HTTP client dependency, which is a
-  separate dependency-review decision.
 - **P2P only.** The builder reads blocks over p2p. A `getblock` RPC source
   would be faster but needs RPC credentials and a new client.
 - **Size.** The mainnet pack to height 3,500,000 is 1.28 GB in 35

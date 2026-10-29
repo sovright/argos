@@ -1775,6 +1775,23 @@ async function describeSproutPack() {
 }
 
 $("sprout-scan-pack")?.addEventListener("change", describeSproutPack);
+
+// Whether a scan with no pack folder downloads the pinned pack. A
+// per-viewer setting, on unless turned off; storage may be unavailable, in
+// which case the default holds.
+const SPROUT_PACK_AUTO_STORAGE_KEY = "argos-sprout-pack-auto-download-v1";
+if ($("sprout-pack-auto")) {
+  try {
+    $("sprout-pack-auto").checked = localStorage.getItem(SPROUT_PACK_AUTO_STORAGE_KEY) !== "false";
+  } catch (_) {
+    $("sprout-pack-auto").checked = true;
+  }
+  $("sprout-pack-auto").addEventListener("change", () => {
+    try {
+      localStorage.setItem(SPROUT_PACK_AUTO_STORAGE_KEY, String($("sprout-pack-auto").checked));
+    } catch (_) {}
+  });
+}
 $("sprout-scan-pack-browse")?.addEventListener("click", async () => {
   try {
     const path = await invoke("pick_sprout_pack_folder");
@@ -1959,8 +1976,9 @@ async function runSproutScan() {
     // Like the peers, the pack only changes where blocks are read from, so a
     // retry takes the folder the panel names now.
     const sproutPack = $("sprout-scan-pack").value.trim() || null;
+    const downloadSproutPack = $("sprout-pack-auto").checked;
     const handle = retryHandle
-      ? await invoke("retry_sprout_scan", { handle: retryHandle, peers, sproutPack })
+      ? await invoke("retry_sprout_scan", { handle: retryHandle, peers, sproutPack, downloadSproutPack })
       : await invoke("start_sprout_scan", {
         keys: sproutScanKeyLines(),
         // The wallet file's own Sprout keys are merged in by the backend, so
@@ -1977,6 +1995,7 @@ async function runSproutScan() {
         birthdayFloor: decrypt.birthdayFloor,
         decryptEveryBlock: decrypt.decryptEveryBlock,
         sproutPack,
+        downloadSproutPack,
       });
     if (generation !== sproutScanGeneration) {
       // A peer edit may land while a retry rotates its opaque handle. Keep
@@ -2188,6 +2207,30 @@ const sproutScanListenersReady = (async () => {
       }),
       listen("sprout-scan-complete", (event) => {
         publishSproutScanSnapshot(event.payload);
+      }),
+      // The worker downloads the pinned pack before it scans.
+      listen("sprout-pack-download", (event) => {
+        const p = event.payload;
+        if (!sproutScanHandle || p.handle !== sproutScanHandle) return;
+        if (p.error) {
+          setStatus(
+            "sprout-scan-status",
+            `Could not get the Sprout pack (${p.error}). Scanning without it: every block ` +
+              "is downloaded from the network. Files already downloaded are kept for next time.",
+            "",
+          );
+          return;
+        }
+        const gb = (n) => (n / 1e9).toFixed(2);
+        const pct = p.bytesTotal ? (p.bytesDone / p.bytesTotal) * 100 : 0;
+        $("sprout-scan-bar").value = pct;
+        setStatus(
+          "sprout-scan-status",
+          `Downloading the Sprout pack: ${gb(p.bytesDone)} / ${gb(p.bytesTotal)} GB ` +
+            `(${p.chunksDone}/${p.chunksTotal} files). Every file is checked against the ` +
+            "hash this version pins. Safe to stop; finished files are kept.",
+          "",
+        );
       }),
     ]);
     return true;

@@ -33,6 +33,7 @@ rand_core.workspace = true
 rusqlite.workspace = true
 sapling-crypto.workspace = true
 rustls.workspace = true
+reqwest.workspace = true
 secp256k1.workspace = true
 bellman.workspace = true
 blake2b_simd.workspace = true

@@ -87,7 +87,7 @@ const CHUNK_MAGIC: &[u8; 8] = b"ARGOSSPC";
 
 /// A manifest larger than this is not one: even a pack to height 100 million
 /// has a thousand chunks at 92 bytes each.
-const MAX_MANIFEST_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 
 /// Size of one JoinSplit's note ciphertext (`ZC_NOTECIPHERTEXT_SIZE`).
 const CIPHERTEXT_LEN: usize = 601;
@@ -107,6 +107,9 @@ pub struct PinnedPack {
     /// SHA-256 of the manifest file, lowercase hex.
     pub manifest_sha256: &'static str,
     pub end_height: u32,
+    /// Base URLs the pack can be downloaded from, each ending in `/`, tried
+    /// in order. They are not trusted: the manifest hash above is.
+    pub mirrors: &'static [&'static str],
 }
 
 /// The packs this release vouches for.
@@ -125,6 +128,10 @@ pub const PINNED_PACKS: &[PinnedPack] = &[PinnedPack {
     network: P2pNetwork::Mainnet,
     manifest_sha256: "805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d",
     end_height: 3500000,
+    mirrors: &[
+        "https://storage.googleapis.com/sovright-argos-sprout-packs/sprout-pack/mainnet-3500000-805435e6/",
+        "https://github.com/sovright/argos/releases/download/v1.6.1/",
+    ],
 }];
 
 /// One chunk, as the manifest describes it.
@@ -160,7 +167,7 @@ pub struct PackBlock {
     pub joinsplits: Vec<SproutJoinSplit>,
 }
 
-fn pack_error(message: impl Into<String>) -> ZeckError {
+pub(crate) fn pack_error(message: impl Into<String>) -> ZeckError {
     ZeckError::InvalidConfig(format!("Sprout pack: {}", message.into()))
 }
 
@@ -223,7 +230,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn from_hex32(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn from_hex32(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
     }
@@ -741,8 +748,11 @@ pub fn pack_available_line(network: P2pNetwork) -> Option<String> {
     let pin = PINNED_PACKS.iter().find(|pin| pin.network == network)?;
     Some(format!(
         "A Sprout pack covering blocks 1 to {} is published with this release. Scanning \
-         with it (--sprout-pack in the CLI, or the pack folder in the app) replaces most of \
-         this download with a few gigabytes of files, with the same result.",
+         with it replaces most of this download with about 1.3 GB of files, with the same \
+         result. Argos downloads it automatically unless that is turned off \
+         (--no-sprout-pack-download in the CLI, or the setting in the app), or the download \
+         failed; you can also point at a copy you downloaded (--sprout-pack, or the pack \
+         folder in the app).",
         pin.end_height
     ))
 }
@@ -987,7 +997,8 @@ pub fn pinned_entry_source(manifest: &PackManifest, manifest_sha256: &[u8; 32]) 
     };
     format!(
         "PinnedPack {{\n    network: P2pNetwork::{network},\n    manifest_sha256: \"{}\",\n    \
-         end_height: {},\n}},",
+         end_height: {},\n    mirrors: &[\n        // The release folder the pack is uploaded to (step 6), then any\n        \
+         // other mirror. Each must be https and end in `/`.\n    ],\n}},",
         to_hex(manifest_sha256),
         manifest.end_height
     )
