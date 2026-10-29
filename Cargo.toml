@@ -12,7 +12,7 @@ phf_generator = { path = "vendor/phf_generator" }
 
 [workspace.package]
 edition = "2021"
-version = "1.6.0"
+version = "1.6.1"
 license = "MIT OR Apache-2.0"
 authors = ["The Bootstrap Org Inc"]
 rust-version = "1.88"
