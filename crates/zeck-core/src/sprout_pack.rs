@@ -748,8 +748,11 @@ pub fn pack_available_line(network: P2pNetwork) -> Option<String> {
     let pin = PINNED_PACKS.iter().find(|pin| pin.network == network)?;
     Some(format!(
         "A Sprout pack covering blocks 1 to {} is published with this release. Scanning \
-         with it (--sprout-pack in the CLI, or the pack folder in the app) replaces most of \
-         this download with a few gigabytes of files, with the same result.",
+         with it replaces most of this download with about 1.3 GB of files, with the same \
+         result. Argos downloads it automatically unless that is turned off \
+         (--no-sprout-pack-download in the CLI, or the setting in the app), or the download \
+         failed; you can also point at a copy you downloaded (--sprout-pack, or the pack \
+         folder in the app).",
         pin.end_height
     ))
 }

@@ -68,6 +68,17 @@ fn network_slug(network: P2pNetwork) -> &'static str {
     }
 }
 
+/// The pack worth downloading for a scan on `network` that has already
+/// reached `scanned_to`, if any: the pinned pack, unless the scan is already
+/// at or past its end and would read nothing from it.
+pub fn pack_to_download(network: P2pNetwork, scanned_to: Option<u32>) -> Option<PackSource> {
+    let source = PackSource::pinned(network)?;
+    match scanned_to {
+        Some(height) if height >= source.end_height => None,
+        _ => Some(source),
+    }
+}
+
 /// How the download talks to mirrors.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
@@ -793,6 +804,19 @@ mod tests {
         assert!(err.to_string().contains("cancel"), "{err}");
         assert!(out.path().join(chunk_file_name(0)).exists());
         assert!(!out.path().join(chunk_file_name(2)).exists());
+    }
+
+    #[test]
+    fn a_pack_is_downloaded_only_when_a_scan_would_read_it() {
+        let end = PackSource::pinned(P2pNetwork::Mainnet).unwrap().end_height;
+        // A fresh scan, or one resumed below the pack's end.
+        assert!(pack_to_download(P2pNetwork::Mainnet, None).is_some());
+        assert!(pack_to_download(P2pNetwork::Mainnet, Some(end - 1)).is_some());
+        // A scan already at or past the end reads nothing from it.
+        assert!(pack_to_download(P2pNetwork::Mainnet, Some(end)).is_none());
+        // No pin, no download.
+        assert!(pack_to_download(P2pNetwork::Testnet, None).is_none());
+        assert!(pack_to_download(P2pNetwork::Regtest, None).is_none());
     }
 
     #[test]

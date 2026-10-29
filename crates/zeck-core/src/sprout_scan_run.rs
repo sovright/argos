@@ -938,6 +938,19 @@ pub fn saved_decrypt_from(
         .map(|scanner| scanner.decrypt_from_height()))
 }
 
+/// The height the saved scan for `spending_keys` reached, or `None` when
+/// there is no checkpoint or it has not read a block yet. Checked as a resume
+/// checks it: wrong keys or network is an error.
+pub fn saved_scan_height(
+    checkpoint_file: &Path,
+    network: P2pNetwork,
+    spending_keys: &[[u8; 32]],
+) -> ZeckResult<Option<u32>> {
+    Ok(load_checkpoint(checkpoint_file, network, spending_keys)?
+        .and_then(|scanner| scanner.cursor())
+        .map(|cursor| cursor.last_height))
+}
+
 /// Read a checkpoint file. `Ok(None)` only when there is no file: any other
 /// failure — permissions, I/O, a directory in its place — is an error, so a
 /// scan that ran for hours never reads as one that never ran.
@@ -6725,6 +6738,30 @@ mod tests {
             assert!(saved_decrypt_from(&path, P2pNetwork::Regtest, &[[0x14; 32]]).is_err());
             discard_checkpoint(&path).unwrap();
         }
+    }
+
+    /// A resumed scan past a pack's end has no use for the pack, so the
+    /// height it reached is readable before scanning.
+    #[test]
+    fn the_saved_scan_height_is_read_back_for_the_same_keys_only() {
+        let keys = [[0x15; 32]];
+        let dir = fresh_dir("saved-scan-height");
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        assert_eq!(
+            saved_scan_height(&path, P2pNetwork::Regtest, &keys).unwrap(),
+            None
+        );
+        let mut scanner = SproutScanner::with_decrypt_from(&keys, None);
+        scanner
+            .scan_block_at(&[], [0xD1; 32], 400)
+            .expect("an empty block");
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        assert_eq!(
+            saved_scan_height(&path, P2pNetwork::Regtest, &keys).unwrap(),
+            Some(400)
+        );
+        assert!(saved_scan_height(&path, P2pNetwork::Regtest, &[[0x16; 32]]).is_err());
+        discard_checkpoint(&path).unwrap();
     }
 
     #[tokio::test]

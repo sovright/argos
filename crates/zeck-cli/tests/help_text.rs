@@ -170,3 +170,10 @@ fn inspect_wallet_help_names_both_inputs() {
     let h = help(&["inspect-wallet"]);
     assert!(h.contains("--sapling-key-file"), "{h}");
 }
+
+#[test]
+fn scan_sprout_help_describes_the_automatic_pack_download() {
+    let h = help(&["scan-sprout"]);
+    assert!(h.contains("--no-sprout-pack-download"), "{h}");
+    assert!(h.contains("downloaded automatically"), "{h}");
+}

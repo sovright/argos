@@ -401,9 +401,18 @@ enum Commands {
         /// the pack's end are read from it instead of downloaded, and the
         /// scan continues over the network from there, so the result is the
         /// same as a full walk. On mainnet only the pack whose hash this
-        /// release pins is accepted.
+        /// release pins is accepted. Without this flag, a mainnet scan uses
+        /// the pinned pack, downloaded automatically into the data directory.
         #[arg(long)]
         sprout_pack: Option<PathBuf>,
+
+        /// Do not download the Sprout pack. By default a mainnet scan with no
+        /// --sprout-pack folder downloads the pack pinned by this release
+        /// (about 1.3 GB, from Sovright's storage bucket or the GitHub
+        /// release) and checks every file against the pinned hash. With this
+        /// flag the scan downloads every block over the network instead.
+        #[arg(long, conflicts_with = "sprout_pack")]
+        no_sprout_pack_download: bool,
 
         /// Path to sprout-groth16.params (~725 MB). Only needed when sweeping.
         /// Defaults to the file named by $ARGOS_SPROUT_PARAMS, then
@@ -1368,6 +1377,73 @@ fn apply_checkpoint_cleanup_error(
 struct SproutScanSources<'a> {
     peers: &'a [String],
     pack: Option<&'a Path>,
+    /// `--no-sprout-pack-download`.
+    no_pack_download: bool,
+}
+
+/// The pack to download for this scan, if any: only when no folder was
+/// given, the download is not turned off, and the scan would read the pack.
+fn auto_pack_source(
+    folder: Option<&Path>,
+    no_download: bool,
+    network: P2pNetwork,
+    scanned_to: Option<u32>,
+) -> Option<argos_core::sprout_pack_fetch::PackSource> {
+    if folder.is_some() || no_download {
+        return None;
+    }
+    argos_core::sprout_pack_fetch::pack_to_download(network, scanned_to)
+}
+
+/// Download the pinned pack into `data_dir`, printing progress. `None` when
+/// it cannot be had, after saying so: the scan then walks the chain instead.
+async fn download_sprout_pack(
+    source: &argos_core::sprout_pack_fetch::PackSource,
+    data_dir: &Path,
+) -> Option<argos_core::sprout_pack::SproutPack> {
+    let dir = source.cache_dir(data_dir);
+    eprintln!(
+        "Getting the Sprout pack for blocks 1 to {} into {}. Every file is checked against \
+         the hash this release pins. Pass --no-sprout-pack-download to skip this and \
+         download every block over the network instead.",
+        source.end_height,
+        dir.display()
+    );
+    let mut last_report = std::time::Instant::now();
+    let mut reported_start = false;
+    let result = argos_core::sprout_pack_fetch::fetch_pack(
+        source,
+        &dir,
+        &argos_core::sprout_pack_fetch::FetchOptions::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+        |p| {
+            let finished = p.chunks_done == p.chunks_total;
+            if !reported_start || finished || last_report.elapsed().as_secs() >= 5 {
+                reported_start = true;
+                last_report = std::time::Instant::now();
+                eprintln!(
+                    "  pack {:.2}/{:.2} GB ({}/{} files)",
+                    p.bytes_done as f64 / 1e9,
+                    p.bytes_total as f64 / 1e9,
+                    p.chunks_done,
+                    p.chunks_total
+                );
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(pack) => Some(pack),
+        Err(err) => {
+            eprintln!(
+                "Could not get the Sprout pack ({err}). Continuing without it: every block \
+                 will be downloaded over the network. Files already downloaded are kept, so \
+                 the next run picks up where this one stopped."
+            );
+            eprintln!();
+            None
+        }
+    }
 }
 
 /// Scan the chain for a set of Sprout keys, then optionally sweep what it finds.
@@ -1390,11 +1466,10 @@ async fn scan_sprout(
 
     // Opened first, so a wrong folder or an unpinned pack fails in a second
     // rather than after the tip lookup and checkpoint checks.
-    let pack = sources
+    let mut pack = sources
         .pack
         .map(|dir| argos_core::sprout_pack::SproutPack::open(dir, p2p_network))
         .transpose()?;
-
     // The destination is validated before the scan, not after. Discovering
     // that an address has no Sapling receiver at the end of a six-hour scan
     // would be the worst possible time to find out.
@@ -1424,27 +1499,6 @@ async fn scan_sprout(
         println!("  scanning for {addr}");
     }
     println!();
-    match &pack {
-        Some(pack) => {
-            let manifest = pack.manifest();
-            eprintln!(
-                "Using the Sprout pack in {}: blocks 1 to {} ({} JoinSplits, {:.1} GB) are \
-                 read from it, and the rest of the chain is downloaded as usual.",
-                pack.dir().display(),
-                manifest.end_height,
-                manifest.total_joinsplits,
-                manifest.total_bytes() as f64 / 1e9
-            );
-            if pack.trust() == argos_core::sprout_pack::PackTrust::Unpinned {
-                eprintln!(
-                    "  This pack is not pinned by this release. That is accepted only off \
-                     mainnet; its contents decide which notes are found."
-                );
-            }
-            eprintln!();
-        }
-        None => print_sprout_scan_cost_warning(network),
-    }
 
     let (tip_anchor, tip_warning) = sprout_tip_anchor(network, lightwalletd_url).await;
     let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
@@ -1470,6 +1524,48 @@ async fn scan_sprout(
             }
         }
     }
+    // Downloaded only now, after every check that can stop the run, so a
+    // typo in an argument never costs a 1.3 GB download first.
+    // A resume already past the pack's end reads nothing from it. A
+    // checkpoint that cannot be read is reported by the scan itself.
+    let scanned_to = argos_core::sprout_scan_run::saved_scan_height(
+        &argos_core::sprout_scan_run::checkpoint_path_for_network(data_dir, keys, p2p_network),
+        p2p_network,
+        keys,
+    )
+    .ok()
+    .flatten();
+    if let Some(source) = auto_pack_source(
+        sources.pack,
+        sources.no_pack_download,
+        p2p_network,
+        scanned_to,
+    ) {
+        pack = download_sprout_pack(&source, data_dir).await;
+    }
+
+    match &pack {
+        Some(pack) => {
+            let manifest = pack.manifest();
+            eprintln!(
+                "Using the Sprout pack in {}: blocks 1 to {} ({} JoinSplits, {:.1} GB) are \
+                 read from it, and the rest of the chain is downloaded as usual.",
+                pack.dir().display(),
+                manifest.end_height,
+                manifest.total_joinsplits,
+                manifest.total_bytes() as f64 / 1e9
+            );
+            if pack.trust() == argos_core::sprout_pack::PackTrust::Unpinned {
+                eprintln!(
+                    "  This pack is not pinned by this release. That is accepted only off \
+                     mainnet; its contents decide which notes are found."
+                );
+            }
+            eprintln!();
+        }
+        None => print_sprout_scan_cost_warning(network),
+    }
+
     // Worded for what exists: nothing is written until the first
     // checkpoint, and a scan that has not started must not look saved.
     if pack.is_some() {
@@ -2758,6 +2854,7 @@ async fn main() -> Result<()> {
         destination,
         peer,
         sprout_pack,
+        no_sprout_pack_download,
         sprout_params,
         confirm_sweep,
     } = &cli.command
@@ -2801,6 +2898,7 @@ async fn main() -> Result<()> {
             SproutScanSources {
                 peers: peer,
                 pack: sprout_pack.as_deref(),
+                no_pack_download: *no_sprout_pack_download,
             },
             destination.as_deref(),
             sprout_params.clone(),
@@ -4554,6 +4652,46 @@ mod tests {
         };
         assert_eq!(transparent_sweep_fee_cap(None, &plan), 15_000);
         assert_eq!(transparent_sweep_fee_cap(Some(12_000), &plan), 12_000);
+    }
+
+    #[test]
+    fn scan_sprout_downloads_the_pack_unless_told_not_to() {
+        let cli =
+            Cli::try_parse_from(["argos", "scan-sprout", "--no-sprout-pack-download"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::ScanSprout {
+                no_sprout_pack_download: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["argos", "scan-sprout"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::ScanSprout {
+                no_sprout_pack_download: false,
+                ..
+            }
+        ));
+        // A folder you chose already says where the pack is.
+        assert!(Cli::try_parse_from([
+            "argos",
+            "scan-sprout",
+            "--sprout-pack",
+            "/packs",
+            "--no-sprout-pack-download",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_pack_is_downloaded_only_without_a_folder_or_an_opt_out() {
+        use argos_core::p2p::wire::P2pNetwork::{Mainnet, Regtest};
+        assert!(auto_pack_source(None, false, Mainnet, None).is_some());
+        assert!(auto_pack_source(Some(Path::new("/packs")), false, Mainnet, None).is_none());
+        assert!(auto_pack_source(None, true, Mainnet, None).is_none());
+        assert!(auto_pack_source(None, false, Regtest, None).is_none());
+        assert!(auto_pack_source(None, false, Mainnet, Some(u32::MAX)).is_none());
     }
 
     #[test]
