@@ -56,6 +56,7 @@ pub mod sprout_scan_cost;
 // need not download the whole chain over p2p.
 pub mod sprout_pack;
 pub mod sprout_pack_build;
+pub mod sprout_pack_fetch;
 // Drives a scan: connects, walks the chain, checkpoints. SproutScanner
 // itself is a passive consumer and knows nothing about the network.
 pub mod sprout_scan_run;

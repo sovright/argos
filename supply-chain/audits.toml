@@ -361,6 +361,12 @@ user-id = 6289 # Jack Grigg (str4d)
 start = "2022-01-20"
 end = "2027-06-26"
 
+[[trusted.hyper-rustls]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-03-16"
+end = "2027-06-26"
+
 [[trusted.incrementalmerkletree]]
 criteria = "safe-to-deploy"
 user-id = 6289 # Jack Grigg (str4d)
@@ -434,6 +440,12 @@ start = "2025-10-04"
 end = "2025-10-05"
 notes = "PR #248 publisher trust for objc2-user-notifications 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
 
+[[trusted.openssl-probe]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2025-12-29"
+end = "2027-06-26"
+
 [[trusted.orchard]]
 criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
@@ -475,6 +487,24 @@ criteria = "safe-to-deploy"
 user-id = 209038 # Daniel McCarney (cpu)
 start = "2023-07-05"
 end = "2027-06-23"
+
+[[trusted.rustls-native-certs]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2023-06-14"
+end = "2027-06-26"
+
+[[trusted.rustls-platform-verifier]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2024-12-18"
+end = "2027-06-26"
+
+[[trusted.rustls-platform-verifier-android]]
+criteria = "safe-to-deploy"
+user-id = 209038 # Daniel McCarney (cpu)
+start = "2024-07-29"
+end = "2027-06-26"
 
 [[trusted.sapling-crypto]]
 criteria = "safe-to-deploy"
@@ -536,6 +566,12 @@ criteria = "safe-to-deploy"
 user-id = 3959 # Lucio Franco (LucioFranco)
 start = "2019-10-02"
 end = "2027-06-23"
+
+[[trusted.webpki-root-certs]]
+criteria = "safe-to-deploy"
+user-id = 209038 # Daniel McCarney (cpu)
+start = "2024-08-07"
+end = "2027-06-26"
 
 [[trusted.zcash_address]]
 criteria = "safe-to-deploy"

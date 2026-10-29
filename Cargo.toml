@@ -63,6 +63,9 @@ prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = { version = "0.37.0", features = ["backup"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# HTTPS for the Sprout pack download. `rustls-no-provider` uses the ring
+# provider Argos installs; the `rustls` feature would add aws-lc-rs.
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
 secp256k1 = "0.29.1"
 secrecy = "0.8.0"
 # Wipes recovered spending material and intermediate derivation state on drop.
