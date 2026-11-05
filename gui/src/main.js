@@ -2595,7 +2595,10 @@ function birthdayDetectHint(result, approxMonth) {
     }
     return text;
   }
-  return `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}).`;
+  // Seed-path results carry the core's late-birthday caution: detection
+  // trusts the server and samples history, so the height may be too late.
+  const base = `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}).`;
+  return result.message ? `${base} ${result.message}` : base;
 }
 
 async function runBirthdayAutodetect() {

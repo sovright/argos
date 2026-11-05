@@ -32,8 +32,8 @@ Long syncs against public lightwalletd endpoints will regularly receive HTTP/2 G
 
 ### Birthday auto-detection
 `detect_birthday` in `crates/zeck-core/src/birthday.rs` (exported from `lib.rs`):
-- **Phase 1**: `GetAddressUtxos` for the first 5 accounts (10 addresses). Returns earliest UTXO height in O(1).
-- **Phase 2**: if no transparent history, steps through ~1-year shielded windows from Sapling activation. Each window creates a temp workspace, imports account-0, runs sync under a 45-second `tokio::time::timeout`, then queries the DB for any notes. Reconnects the client after a timeout.
+- **Phase 1**: `GetAddressUtxos` for the first 5 accounts (10 addresses). The earliest UTXO is only an upper bound — it is the oldest *unspent* transparent output, and shielded funds can be older — so it never ends detection; it only limits Phase 2 to windows starting before it.
+- **Phase 2**: steps through ~1-year shielded windows from Sapling activation. Each window creates a temp workspace, imports account-0, runs sync under a 45-second `tokio::time::timeout`, then queries the DB for any notes. Reconnects the client after a timeout.
 - `ShieldedProbeKeys` struct bundles seed-related params to keep `probe_shielded_window` under the clippy 7-arg limit.
 
 ### OS notifications
