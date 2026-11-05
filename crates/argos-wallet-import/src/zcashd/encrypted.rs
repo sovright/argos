@@ -202,6 +202,22 @@ pub fn collect_encrypted(
                     });
                     continue;
                 };
+                // An uncompressed public key means `importprivkey` of an
+                // uncompressed WIF: its coins sit at the P2PKH address of the
+                // 65-byte key. A `TransparentKey` carries no compression flag,
+                // and argos-core scans and spends compressed P2PKH only, so
+                // keeping the secret would scan an address that never held
+                // these coins. Refuse it loudly, as `secret_from_key_der`
+                // already refuses an uncompressed plaintext `key`.
+                if pubkey.len() == 65 {
+                    out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                        record_type: "ckey".to_owned(),
+                        reason: "uncompressed public key; only compressed transparent keys are \
+                                 recovered"
+                            .to_owned(),
+                    });
+                    continue;
+                }
                 let iv = sha256d_iv(pubkey);
                 match read_length_prefixed(value)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
