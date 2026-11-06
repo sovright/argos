@@ -96,7 +96,6 @@ jobs:
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_relative_reuse_refuses_permissive_child_with_security_only_handle
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_authority_reads_and_retains_reject_permissive_sensitive_children
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_authority_reads_refuse_preheld_data_handles
-          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_checkpoint_generation_refuses_a_permissive_dacl
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_private_directory_authority_retains_no_delete_share
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_sqlite_preflight_refuses_a_preheld_data_handle
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_existing_private_root_reserves_pending_before_a_second_leaf
@@ -104,14 +103,10 @@ jobs:
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_reused_read_append_keeps_exclusive_handle_through_write
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_recursive_cleanup_refuses_permissive_nested_child
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_reuse_refuses_permissive_directory_with_security_only_handle
-          & $collect -Failures $failures -Package argos-core -TestName sprout_scan_run::tests::checkpoint_lease_serializes_replacement_and_cleanup_authority
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_namespace_append_create_and_reuse_keep_retained_identity
           & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_relative_primitives_never_touch_a_recreated_ancestor_tree
-          & $collect -Failures $failures -Package argos-core -TestName private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse
-          & $collect -Failures $failures -Package argos-core -TestName sprout_sweep_journal::tests::windows_journal_authority_denies_sidecar_replacement_and_second_writer
           & $collect -Failures $failures -Package argos-core -TestName service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement
-          & $collect -Failures $failures -Package argos-core -TestName sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle
           & $collect -Failures $failures -Package argos-core -TestName workspace::tests::append_private_file_writes_whole_terminated_lines
           & $collect -Failures $failures -Package argos-core -TestName workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader
           & $collect -Failures $failures -Package argos-core -TestName workspace::tests::runtime_read_only_connection_preserves_private_wal_sidecars
@@ -123,24 +118,19 @@ jobs:
           & $collect -Failures $failures -Package argos-core -TestName service::propose_workspace_guard_tests::restart_restores_tombstone_and_a_new_scan_may_delete_it
           & $collect -Failures $failures -Package argos-core -TestName service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing
           & $collect -Failures $failures -Package argos-core -TestName service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation
-          & $collect -Failures $failures -Package argos-core -TestName sprout_sweep_journal::tests::separate_connection_lock_blocks_load_and_append
           & $collect -Failures $failures -Package argos-core -TestName birthday::tests::probe_guard_retires_active_authority_before_removing_container
           & $collect -Failures $failures -Package argos-core -TestName birthday::tests::probe_guard_cleans_active_authority_during_unwind
           & $collect -Failures $failures -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret
           & $collect -Failures $failures -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_secret_write
           & $collect -Failures $failures -Package argos-core -TestName birthday::tests::stale_probe_scan_skips_registered_live_probe
           & $collect -Failures $failures -Package argos-gui -TestName commands::tests::windows_write_private_report_creates_private_and_refuses_untrusted_reuse
-          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::fresh_gui_workspace_is_authenticated_before_sprout_work_starts
           & $collect -Failures $failures -Package argos-gui -TestName commands::tests::legacy_gui_default_selects_versioned_directory_and_keeps_legacy_rows_visible
-          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent
-          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::the_sweep_step_runs_only_after_verification_passes
-          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::windows_gui_sprout_review_supports_internal_staging_beyond_max_path
 
           if ($failures.Count -gt 0) {
             throw ("{0} Cargo test invocation(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
           }
 
-      - name: private artifact authority and sweep safety tests (x64)
+      - name: private container authority and workspace safety tests (x64)
         # Completed test failures must not hide the other diagnostic stage.
         # Compile/tool failures or empty module runs still stop immediately.
         if: ${{ matrix.label == 'x64' && !cancelled() && steps.windows_private_fs.outputs.exact_tests_started == 'true' }}
@@ -150,41 +140,11 @@ jobs:
           $failures = [System.Collections.Generic.List[string]]::new()
           $tests = @(
             'private_fs::tests::fresh_absent_artifact_data_dir_is_published_as_authenticated_container'
-            'private_fs::tests::windows_authenticated_container_and_root_reopen_and_enumerate'
+            'private_fs::tests::windows_authenticated_container_reopens_and_enumerates'
+            'private_fs::tests::windows_private_container_publication_supports_paths_beyond_max_path'
             'private_fs::tests::windows_artifact_container_recovers_pending_before_publish'
             'private_fs::tests::windows_artifact_container_registry_prevents_rollback_or_remint'
             'private_fs::tests::preexisting_unmarked_artifact_data_dir_is_refused_unchanged'
-            'private_fs::tests::fresh_private_artifact_root_binds_every_precreated_authority_object'
-            'private_fs::tests::unmarked_private_artifact_root_is_refused_without_mutation'
-            'private_fs::tests::private_artifact_root_context_replay_is_refused'
-            'private_fs::tests::artifact_authority_is_durable_before_the_first_secret_byte'
-            'private_fs::tests::existing_unbound_artifact_is_refused_without_read_or_mutation'
-            'private_fs::tests::artifact_replacement_records_exact_generation_before_publication'
-            'private_fs::tests::checkpoint_interrupted_save_restores_previous_generation_on_restart'
-            'private_fs::tests::checkpoint_save_error_rolls_back_before_returning'
-            'private_fs::tests::checkpoint_interrupted_rollback_resumes_after_candidate_unlink'
-            'private_fs::tests::checkpoint_interrupted_legacy_save_without_generation_fails_closed'
-            'private_fs::tests::direct_legacy_diagnostic_is_bounded_and_leaves_evidence_unchanged'
-            'private_fs::tests::direct_legacy_diagnostic_does_not_create_a_missing_data_directory'
-            'private_fs::tests::direct_legacy_diagnostic_refuses_hardlinked_file'
-            'private_fs::tests::windows_artifact_domains_cold_verify_before_retaining_their_bound_locks'
-            'private_fs::tests::windows_artifact_registry_prevents_root_rollback_or_remint'
-            'private_fs::tests::torn_newest_authority_slot_falls_back_to_previous_durable_state'
-            'private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse'
-            'private_fs::tests::retained_root_allows_checkpoint_and_journal_domains_to_coexist'
-            'sprout_sweep_journal::tests::scoped_load_strictly_validates_sibling_header_and_raw_transaction'
-            'sprout_sweep_journal::tests::scoped_load_ignores_only_a_fully_valid_other_network_sibling'
-            'sprout_sweep_journal::tests::scoped_load_rejects_an_overlapping_authorized_key_set_root'
-            'sprout_sweep_journal::tests::scoped_load_accepts_a_nonoverlapping_authorized_key_set_root'
-            'sprout_sweep_journal::tests::scoped_load_rejects_a_tampered_private_root_before_reading_its_journal'
-            'sprout_sweep_journal::tests::every_direct_legacy_journal_blocks_even_for_another_fingerprint'
-            'sprout_sweep_journal::tests::cleanup_restart_never_deletes_a_surviving_generation_from_stale_observations'
-            'sprout_sweep_journal::tests::cleanup_restart_after_unlink_commits_an_idempotent_tombstone'
-            'sprout_sweep_journal::tests::cleanup_restart_completes_old_generation_without_deleting_replacement'
-            'sprout_sweep::tests::first_run_with_no_artifact_root_has_no_interrupted_cleanup'
-            'sprout_sweep::tests::production_restart_completes_a_crash_after_unlink_before_completion'
-            'sprout_sweep::tests::production_reconcile_preserves_two_mature_rounds_before_checkpoint_cleanup'
-            'sprout_sweep::tests::production_cleanup_requires_two_mature_rounds_after_weaker_evidence_or_errors'
             'service::propose_workspace_guard_tests::start_scan_preserves_unmarked_v153_directory_with_actionable_refusal'
             'service::propose_workspace_guard_tests::legacy_default_selects_fresh_versioned_directory_for_start_scan'
             'service::network_namespace_tests::network_guard_creates_and_reopens_only_an_authenticated_absent_data_dir'
@@ -219,25 +179,11 @@ jobs:
         run: |
           bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::first_append_after_parent_swap_never_writes_the_replacement_namespace
           bash scripts/run-exact-cargo-test.sh argos-core private_fs::unix_private::race_tests::cleanup_enumerates_the_pinned_parent_after_a_path_swap
-          bash scripts/run-exact-cargo-test.sh argos-core sprout_scan_run::tests::replaced_sidecar_cannot_start_a_writer_or_delete_its_staging
-          bash scripts/run-exact-cargo-test.sh argos-core sprout_scan_run::tests::replaced_parent_namespace_cannot_redirect_old_cleanup
           bash scripts/run-exact-cargo-test.sh argos-core private_fs::unix_private::race_tests::final_cleanup_never_unlinks_an_object_swapped_after_identity_check
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse
           bash scripts/run-exact-cargo-test.sh argos-core service::network_namespace_tests::registry_log_refuses_replaced_parent_without_touching_replacement
           bash scripts/run-exact-cargo-test.sh argos-core service::network_namespace_tests::registry_log_refuses_replaced_sidecar_without_touching_registry
-          bash scripts/run-exact-cargo-test.sh argos-core sprout_sweep_journal::tests::separate_connection_lock_blocks_load_and_append
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_save_restores_previous_generation_on_restart
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_save_error_rolls_back_before_returning
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_save_refuses_replaced_old_or_candidate
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_rollback_resumes_after_candidate_unlink
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_legacy_save_without_generation_fails_closed
           bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::macos_publication_parent_accepts_deny_only_acl_without_modifying_it
           bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::macos_publication_parent_rejects_extended_acl_before_staging
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::direct_legacy_diagnostic_is_bounded_and_leaves_evidence_unchanged
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::direct_legacy_diagnostic_does_not_create_a_missing_data_directory
-          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::direct_legacy_diagnostic_refuses_hardlinked_file
-          bash scripts/run-exact-cargo-test.sh argos-core sprout_sweep::tests::production_reconcile_preserves_two_mature_rounds_before_checkpoint_cleanup
-          bash scripts/run-exact-cargo-test.sh argos-core sprout_sweep::tests::production_cleanup_requires_two_mature_rounds_after_weaker_evidence_or_errors
 
   test:
     name: Cargo test
@@ -291,157 +237,6 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
           npm run test:layout
-
-  sprout-node-tests:
-    name: Sprout scan against a real node
-    runs-on: ubuntu-latest
-    # The end-to-end scan mines 110 blocks for coinbase maturity, plants a
-    # note, then walks the chain; the two spend tests each prove a JoinSplit
-    # against the real 725 MB parameters. With dependencies optimised in the
-    # dev profile (see the root Cargo.toml) the four tests run in a couple of
-    # minutes; the headroom here is for the cold dependency build behind a
-    # cache miss, not for the tests.
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
-        with:
-          toolchain: "1.88"
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      # The spend tests build `--features argos-network`, which compiles
-      # vendored lightwalletd protos and needs `protoc`. The normal test job
-      # installs it too for its local argos-network integration tests.
-      - name: Install protoc
-        timeout-minutes: 10
-        run: bash scripts/install-ci-apt-deps.sh protobuf-compiler
-
-      # The only regtest chain that can hold Sprout notes: ZIP 211 forbids
-      # funding the pool from Canopy onward, and this profile holds Canopy
-      # inactive (nuparams e9ff75a6:9999999).
-      - name: Start the regtest Sprout node
-        working-directory: tests/regtest
-        run: docker compose --profile sprout up -d zcashd-sprout
-
-      - name: Wait for the node to accept RPC
-        run: |
-          for i in $(seq 1 60); do
-            if curl -sf --user argos-regtest:argos-regtest \
-                 --data '{"jsonrpc":"1.0","id":"ci","method":"getblockchaininfo","params":[]}' \
-                 -H 'content-type: text/plain;' http://127.0.0.1:18242/ >/dev/null; then
-              echo "node is up after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "node did not accept RPC within 60s"
-          docker compose --profile sprout -f tests/regtest/docker-compose.yml logs --tail=50 zcashd-sprout || true
-          exit 1
-
-      # `sprout_scan_finds_a_real_note` PLANTS a note, which means building a
-      # JoinSplit, which needs the Sprout proving key -- an earlier version of
-      # this job asserted these two tests needed no parameters. That was wrong,
-      # and CI is where it surfaced. Cached, so the 725 MB download happens
-      # once rather than per run.
-      - name: Cache Sprout proving parameters
-        id: sprout-params
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
-        with:
-          path: ~/.zcash-params/sprout-groth16.params
-          key: sprout-groth16-params-v1
-
-      - name: Fetch Sprout proving parameters
-        if: steps.sprout-params.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.zcash-params
-          curl -fsSL --retry 3 -o ~/.zcash-params/sprout-groth16.params \
-            https://download.z.cash/downloads/sprout-groth16.params
-          # The params are verified by digest before use (see sprout_sweep.rs),
-          # but check the size here so a truncated download fails loudly rather
-          # than as a confusing proving error.
-          test "$(stat -c%s ~/.zcash-params/sprout-groth16.params)" = "725523612"
-
-      # `--ignored` is required. These are the only tests that exercise the
-      # Sprout scan end to end, and they are the reason
-      # this job exists: `argos scan-sprout` once shipped unable to scan
-      # anything from a cold start -- every fresh walk aborted on its first
-      # page -- while the docs described it as proven on regtest. Nothing in
-      # CI ran them, so nothing caught it.
-      - name: Sprout scan tests
-        run: |
-          cargo test -p argos-core \
-            --test sprout_scan_matches_the_node \
-            --test sprout_scan_finds_a_real_note \
-            -- --ignored --nocapture
-
-      - name: Sprout checkpoint reorg test
-        run: |
-          set -o pipefail
-          cargo test -p argos-core --test sprout_scan_reorg \
-            -- --ignored --nocapture 2>&1 | tee reorg-test.log
-          passed=$(grep -cE '^test .* \.\.\. ok$' reorg-test.log || true)
-          echo "reorg tests passed: $passed"
-          test "$passed" -ge 1
-
-      # The pack builder against a real node: a pack built from the chain
-      # must scan exactly like the chain (same notes, anchor and JoinSplit
-      # count), and a second build must reproduce the manifest. Two builders
-      # agreeing on a hash cannot catch a builder bug; this can. Release
-      # step 4 in docs/sprout-pack.md requires it before shipping a pin.
-      - name: Sprout pack test
-        run: |
-          set -o pipefail
-          cargo test -p argos-core --test sprout_pack_regtest \
-            -- --ignored --nocapture 2>&1 | tee pack-test.log
-          passed=$(grep -cE '^test .* \.\.\. ok$' pack-test.log || true)
-          echo "pack tests passed: $passed"
-          test "$passed" -ge 1
-
-      # The spend half, and the reason it is no longer optional: `rcm` is now
-      # sampled per §4.7.1 rather than derived, which changes *every*
-      # commitment Argos produces. A commitment the circuit and the chain
-      # disagree about is exactly what these catch, and a local proof check
-      # cannot -- only a node decides whether a spend is valid.
-      #
-      # These were previously excluded for being proving-heavy. That was the
-      # right trade only while the commitment derivation was frozen.
-      #
-      # `--features argos-network` is not optional: `sprout_consensus_roundtrip`
-      # is `#![cfg(feature = "argos-network")]`, so without it the binary
-      # compiles to zero tests and cargo still reports "ok". A green step that
-      # ran nothing is worse than a red one. The count is asserted below rather
-      # than trusted.
-      - name: Sprout spend tests against consensus
-        run: |
-          set -o pipefail
-          cargo test -p argos-core --features argos-network \
-            --test sprout_consensus_roundtrip \
-            --test sprout_stale_anchor \
-            -- --ignored --nocapture 2>&1 | tee spend-tests.log
-
-      - name: Check the spend tests actually ran
-        run: |
-          passed=$(grep -cE '^test .* \.\.\. ok$' spend-tests.log || true)
-          echo "spend tests passed: $passed"
-          # Two: one per file. Asserted as an exact floor so that a file
-          # silently emptying itself -- a cfg gate, a rename -- turns this
-          # job red instead of green.
-          if [ "$passed" -lt 2 ]; then
-            echo "::error::expected 2 passing spend tests, saw $passed -- a cfg gate or a rename has silently emptied this job"
-            exit 1
-          fi
-
-      - name: Node logs on failure
-        if: failure()
-        working-directory: tests/regtest
-        run: docker compose --profile sprout logs --tail=200 zcashd-sprout
 
   cargo-deny:
     name: Cargo deny (advisories + bans + licenses + sources)

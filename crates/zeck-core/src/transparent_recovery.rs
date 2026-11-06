@@ -544,8 +544,7 @@ pub fn sapling_receiver(
     destination: &str,
     network: ZeckNetwork,
 ) -> ZeckResult<sapling::PaymentAddress> {
-    // The receiver walk is shared with `sprout_sweep`; the error vocabulary
-    // is not. This path returns typed variants and its tests match on them,
+    // This path returns typed variants and its tests match on them,
     // precisely so rewording a message cannot silently change behaviour.
     use crate::address::{find_sapling_receiver, ReceiverLookupError, SaplingReceiver};
 

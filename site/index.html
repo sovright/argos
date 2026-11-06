@@ -16,7 +16,7 @@
     <meta property="og:title" content="Argos Rescue Wallet | Sovright" />
     <meta
       property="og:description"
-      content="Recover ZecWallet Lite seeds, zcashd wallet.dat files, and standalone Sapling or Sprout keys with a local-first desktop flow."
+      content="Recover ZecWallet Lite seeds, zcashd wallet.dat files, and standalone Sapling keys with a local-first desktop flow."
     />
     <meta property="og:url" content="https://argos.sovright.com/" />
     <meta property="og:image" content="https://argos.sovright.com/assets/zeck-og.png" />
@@ -83,7 +83,7 @@
           <h1>Argos Rescue Wallet</h1>
           <p class="hero-lede">
             A careful desktop recovery workspace for ZecWallet Lite seeds, legacy wallet files,
-            and standalone Sapling or Sprout spending keys. Inspect everything locally, scan the
+            and standalone Sapling spending keys. Inspect everything locally, scan the
             historical chain, then sweep recoverable funds to a modern Zcash address.
           </p>
           <div class="hero-actions" aria-label="Primary actions">
@@ -230,7 +230,7 @@
           </div>
           <p>
             Argos reads ZecWallet Lite seeds and wallet files, zcashd <code>wallet.dat</code>, and
-            standalone Sapling or Sprout spending keys. It shows what each source contains and
+            standalone Sapling spending keys. It shows what each source contains and
             walks you through moving recoverable funds with every step visible.
           </p>
         </div>
@@ -249,7 +249,7 @@
           <article class="info-card">
             <span class="step-number">03</span>
             <h3>Find your funds across all addresses</h3>
-            <p>Ordinary recovery covers transparent, Sapling, and Orchard funds. Sprout uses its own complete scan-and-sweep path when those older keys are present.</p>
+            <p>Recovery covers transparent, Sapling, and Orchard funds. Wallet imports identify unsupported Sprout records and explain the NU7 spending restriction.</p>
           </article>
           <article class="info-card">
             <span class="step-number">04</span>
@@ -266,7 +266,7 @@
           <p>
             A seed phrase is enough for ordinary ZecWallet Lite recovery. If you still have a
             ZecWallet Lite or zcashd wallet file, Argos can read it directly, including encrypted
-            files. Standalone Sapling and Sprout spending keys are supported too.
+            files. Standalone Sapling spending keys are supported too.
           </p>
         </div>
         <div class="check-panel">
@@ -276,7 +276,7 @@
             <li>A modern Zcash wallet to receive your recovered funds — we recommend
               <a href="https://zodl.com">ZODL</a> (iOS / Android, by Electric Coin Co.), which
               generates a Unified Address out of the box</li>
-            <li>Time for the scan to finish — ordinary scans can take hours; a bare-key Sprout scan also transfers roughly 26 GB on mainnet</li>
+            <li>Time for the scan to finish — scans can take hours</li>
           </ul>
         </div>
       </section>
@@ -345,8 +345,7 @@
             <h3>Internet required</h3>
             <p>
               Argos reads Zcash blocks from public servers, so an air-gapped machine won't work.
-              Ordinary scans use lightwalletd; Sprout scans read historical full blocks from Zcash
-              P2P peers. Your seed and spending keys never leave your computer — only public block
+              Scans use lightwalletd. Your seed and spending keys never leave your computer — only public block
               data comes in, and only final sweep transactions go out.
             </p>
           </article>
@@ -468,21 +467,8 @@
             <summary>Which kinds of Zcash funds can Argos recover?</summary>
             <p>
               Argos recovers transparent, Sapling, and Orchard funds from ZecWallet Lite seeds and
-              supported wallet files. It also recovers Sprout end to end from a zcashd
-              <code>wallet.dat</code> or a standalone <code>SK…</code>/<code>ST…</code> spending
-              key. A ZecWallet Lite seed alone cannot reconstruct Sprout keys because the wallet
-              generated them independently.
-            </p>
-          </details>
-          <details>
-            <summary>Why is a Sprout scan so much slower?</summary>
-            <p>
-              Lightwalletd compact blocks omit the encrypted data needed to find Sprout notes.
-              When a wallet file has no cached note witness, Argos must trial-decrypt every
-              historical JoinSplit by reading full blocks from genesis to the chain tip. It cannot
-              stop at Canopy, because Sprout notes are still created and spent after it. On mainnet
-              that means about 3.5 million blocks and roughly 280 GB of transfer. Progress is saved,
-              blocks are discarded after processing, and the scan can resume later.
+              supported wallet files. Sprout funds are unspendable under NU7. Argos recognizes
+              Sprout records in a wallet file and continues recovery of supported funds.
             </p>
           </details>
           <details>

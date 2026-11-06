@@ -16,7 +16,6 @@ crypto_secretbox.workspace = true
 secrecy.workspace = true
 secp256k1.workspace = true
 sapling-crypto.workspace = true
-x25519-dalek.workspace = true
 zcash_address.workspace = true
 zcash_transparent.workspace = true
 zcash_protocol.workspace = true

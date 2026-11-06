@@ -328,17 +328,6 @@ function flowHarness() {
     },
     forgetWalletCaveats() {},
     cancelWalletReviewExpiry() {},
-    // This harness loads only the ordinary-flow slice; Sprout review state is
-    // exercised by the dedicated wallet and scan VM suites.
-    invalidateWalletSproutReview() {},
-    invalidateSproutScanSource() {},
-    // Main's raw-key Sprout panel (#273) and scan banner: owned by their own
-    // suites, stubbed here so the ordinary-flow slices load.
-    hasTypedSproutScanText() { return false; },
-    renderSproutScanPanel() {},
-    forgetSproutScanInputs() {
-      for (const id of ["sprout-scan-keys", "sprout-scan-destination"]) $(id).value = "";
-    },
     showScanWarning() {},
     scanWarningVariant() { return "shielded"; },
     birthdayTouched: false,
@@ -357,10 +346,9 @@ function flowHarness() {
     clearTransientSecrets() {}, abandonRecoveryFlow() {},
   });
   context.walletOpenGeneration = 0;
-  context.sproutPreviewWallet = { path: "/old/wallet.dat" };
   context.walletFile = { path: "/old/wallet.dat" };
   const forgetStart = source.indexOf("function forgetLoadedWalletFile(");
-  const forgetEnd = source.indexOf("function renderSproutUncoveredBanners(", forgetStart);
+  const forgetEnd = source.indexOf("function renderWalletCaveatBanners(", forgetStart);
   vm.runInContext(source.slice(forgetStart, forgetEnd), context);
   return { $, state, context, events, documentEvents, calls, chips };
 }
@@ -433,7 +421,7 @@ test("source setting edits invalidate completed scan authority", () => {
   for (const id of [
     "seed-input", "wallet-path", "sapling-scan-keys", "network-select",
     "birthday-height", "accounts-range", "gap-limit", "transparent-index-start",
-    "lightwalletd-url", "data-dir", "sprout-scan-peers",
+    "lightwalletd-url", "data-dir",
   ]) {
     const h = flowHarness();
     loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
@@ -504,7 +492,7 @@ test("wallet drop invalidates the previous scan before opening the new file", as
   } };
   h.context.document.querySelector = () => ({ classList: { contains: () => true } });
   h.context.openWalletFile = () => { opened++; };
-  loadFlow(h, "// Drag-and-drop, using Tauri", '$("sprout-sweep-run").addEventListener');
+  loadFlow(h, "// Drag-and-drop, using Tauri", "// ─── Typed Sapling keys");
   await new Promise((resolve) => setImmediate(resolve));
   nativeEvents.get("tauri://drag-drop")({ payload: { paths: ["/new/wallet.dat"] } });
   assert.equal(h.state.scanHandle, null);
@@ -774,23 +762,7 @@ test("start over still drops the loaded wallet", () => {
   assert.equal(h.$("sweep-skipped").innerHTML, "");
 });
 
-test("start over clears the wallet Sprout sweep destination", () => {
-  const h = flowHarness();
-  h.$("sprout-destination").value = "zs-old-wallet-destination";
-  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
-  loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
-  h.$("restart-flow").fire("click");
-  assert.equal(h.$("sprout-destination").value, "");
-});
 
-test("start over clears the scanned Sprout sweep destination", () => {
-  const h = flowHarness();
-  h.$("sprout-scan-destination").value = "zs-old-scan-destination";
-  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
-  loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
-  h.$("restart-flow").fire("click");
-  assert.equal(h.$("sprout-scan-destination").value, "");
-});
 
 test("start over restores every scan source setting to its documented default", () => {
   const h = flowHarness();
@@ -805,7 +777,6 @@ test("start over restores every scan source setting to its documented default", 
   Object.assign(h.$("server-preset"), { value: "custom" });
   Object.assign(h.$("lightwalletd-url"), { value: "old.example" });
   Object.assign(h.$("data-dir"), { value: "/old" });
-  Object.assign(h.$("sprout-scan-peers"), { value: "old.example:8233" });
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
   loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
   h.$("restart-flow").fire("click");
@@ -821,7 +792,6 @@ test("start over restores every scan source setting to its documented default", 
   assert.equal(h.$("server-preset").value, "recommended");
   assert.equal(h.$("lightwalletd-url").value, "main.example");
   assert.equal(h.$("data-dir").value, "/platform/default");
-  assert.equal(h.$("sprout-scan-peers").value, "");
 });
 
 test("sweep review shows the single-operator confirmation notice", async () => {
@@ -834,7 +804,7 @@ test("sweep review shows the single-operator confirmation notice", async () => {
 
 function resumeHarness() {
   const h = flowHarness();
-  h.context.noteUncoveredSproutKeys = summary => h.calls.push({ command: "noteSproutCaveat", summary });
+  h.context.noteWalletSproutRecords = summary => h.calls.push({ command: "noteSproutCaveat", summary });
   h.context.notePartialImport = summary => h.calls.push({ command: "noteImportCaveat", summary });
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
   loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
@@ -854,7 +824,7 @@ test("wallet-file resume reviews the original file and submits its authority wit
     if (command === "inspect_wallet_file") {
       h.calls.push({ command, args });
       return { review_id: "resume-wallet-review", needs_passphrase: false, transparent_only: false,
-        sprout_keys: 2, coverage_may_hide_funds: true, coverage_notice: "Partial import" };
+        sprout_records: 2, coverage_may_hide_funds: true, coverage_notice: "Partial import" };
     }
     return original(command, args);
   };
@@ -872,7 +842,7 @@ test("wallet-file resume reviews the original file and submits its authority wit
   assert.equal(resumed.args.input.seed, null);
   assert.equal(resumed.args.input.wallet_review_id, "resume-wallet-review");
   assert.equal(resumed.args.input.wallet_passphrase, "wallet password");
-  assert.equal(h.calls.find(c => c.command === "noteSproutCaveat")?.summary.sprout_keys, 2);
+  assert.equal(h.calls.find(c => c.command === "noteSproutCaveat")?.summary.sprout_records, 2);
   assert.equal(h.calls.find(c => c.command === "noteImportCaveat")?.summary.coverage_notice, "Partial import");
   assert.equal(h.state.scanHandle.id, "scan-new");
 });

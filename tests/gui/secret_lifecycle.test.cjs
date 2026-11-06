@@ -34,7 +34,7 @@ function element(value = "secret") {
 function lifecycleHarness() {
   const ids = [
     "seed-input", "seed-visibility", "wallet-passphrase", "sapling-scan-keys",
-    "sprout-scan-keys", "resume-seed-input", "resume-seed-visibility",
+    "resume-seed-input", "resume-seed-visibility",
     "resume-bip39-passphrase", "resume-wallet-passphrase", "resume-sapling-keys",
   ];
   const elements = new Map(ids.map((id) => [id, element()]));
@@ -47,14 +47,10 @@ function lifecycleHarness() {
     CustomEvent: class { constructor(type) { this.type = type; } },
     walletFile: { path: "/wallet.dat", review_id: "review-secret", passphrase: "wallet-secret" },
     walletOpenGeneration: 7,
-    sproutPreviewWallet: { path: "/wallet.dat" },
-    sproutSweepSource: { path: "/wallet.dat" },
     pendingResumeRow: { workspace_path: "/secret" },
     resumeGeneration: 4,
     state,
     cancelWalletReviewExpiry() { calls.push("wallet-expiry"); },
-    invalidateWalletSproutReview() { calls.push("wallet-review"); },
-    invalidateSproutScanSource() { calls.push("sprout-source"); },
     invalidateSweepReview() { calls.push("sweep-review"); },
     invalidateScanAuthority() { calls.push("scan-authority"); state.scanHandle = null; },
     invoke(command, args) { calls.push([command, args]); return Promise.resolve(); },
@@ -71,7 +67,7 @@ for (const exit of [
     const h = lifecycleHarness();
     vm.runInContext("clearTransientSecrets()", h.context);
     for (const id of [
-      "seed-input", "wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys",
+      "seed-input", "wallet-passphrase", "sapling-scan-keys",
       "resume-seed-input", "resume-bip39-passphrase", "resume-wallet-passphrase", "resume-sapling-keys",
     ]) assert.equal(h.elements.get(id).value, "", `${exit}: ${id}`);
     assert.equal(h.context.walletFile.passphrase, null);
@@ -87,14 +83,10 @@ test("abandoning a flow revokes every reviewed source and clears address-search 
   const h = lifecycleHarness();
   vm.runInContext("abandonRecoveryFlow()", h.context);
   assert.equal(h.context.walletFile, null);
-  assert.equal(h.context.sproutPreviewWallet, null);
-  assert.equal(h.context.sproutSweepSource, null);
   assert.equal(h.context.pendingResumeRow, null);
   assert.equal(h.context.walletOpenGeneration, 8);
   assert.equal(h.context.resumeGeneration, 5);
   assert.deepEqual(h.events, ["argos:clear-transient-secrets"]);
-  assert.ok(h.calls.includes("wallet-review"));
-  assert.ok(h.calls.includes("sprout-source"));
   assert.ok(h.calls.includes("scan-authority"));
 });
 
@@ -192,7 +184,6 @@ test("failed wallet scan start preserves passphrase, pasted keys and original ex
   assert.equal(h.context.walletFile.passphrase, "wallet-secret");
   assert.equal(h.elements.get("wallet-passphrase").value, "secret");
   assert.equal(h.elements.get("sapling-scan-keys").value, "secret");
-  assert.equal(h.elements.get("sprout-scan-keys").value, "secret");
   assert.equal(h.calls.includes("wallet-expiry"), false, "failed start must retain existing expiry");
   assert.equal(h.calls.includes("scheduled-expiry"), false, "retry must not extend wallet review");
   assert.equal(h.elements.get("seed-input").value, "");
@@ -213,7 +204,7 @@ test("accepted wallet scan start clears passphrase and pasted keys", async () =>
   await h.run();
   assert.equal(h.context.state.scanHandle.id, "accepted");
   assert.equal(h.context.walletFile.passphrase, null);
-  for (const id of ["wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys"])
+  for (const id of ["wallet-passphrase", "sapling-scan-keys"])
     assert.equal(h.elements.get(id).value, "", id);
   assert.equal(h.calls.includes("wallet-expiry"), true);
 });

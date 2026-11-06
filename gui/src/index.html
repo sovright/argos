@@ -124,7 +124,7 @@
 
             <div class="guide-section">
               <h3>What is Argos?</h3>
-              <p>Argos recovers Zcash from ZecWallet Lite seeds and wallet files, zcashd <code>wallet.dat</code>, and standalone Sapling or Sprout spending keys. It scans the applicable pools and sweeps recoverable funds to a modern wallet like ZODL (formerly Zashi) or YWallet.</p>
+              <p>Argos recovers Zcash from ZecWallet Lite seeds and wallet files, zcashd <code>wallet.dat</code>, and standalone Sapling spending keys. It scans the applicable pools and sweeps recoverable funds to a modern wallet like ZODL (formerly Zashi) or YWallet.</p>
             </div>
 
             <div class="guide-section">
@@ -151,7 +151,6 @@
               <h3>Step 2 — Wallet File or Spending Key</h3>
               <p>Choose, drag, or type the path to a ZecWallet Lite wallet or zcashd <code>wallet.dat</code>. Argos opens it read-only. If encrypted, enter the passphrase in the app; it is used in memory and never written to disk. Review the key counts and any unread-record diagnostics before continuing. The backend binds later actions to an opaque review ID for that exact file object and content; if the file is edited or replaced, Argos reports that the wallet changed since review and asks you to inspect it again.</p>
               <p>If you have no wallet file, paste one or more <code>secret-extended-key-main1…</code> or <code>secret-extended-key-test1…</code> Sapling spending keys and click <em>Check keys</em>. Viewing keys cannot authorize a sweep and are rejected.</p>
-              <p>If you only have a Sprout spending key (<code>SK…</code> or <code>ST…</code>), open <em>I only have a Sprout spending key</em> on the same screen. No wallet file is needed.</p>
             </div>
 
             <div class="guide-section">
@@ -168,7 +167,7 @@
 
             <div class="guide-section">
               <h3>Step 4 — Scan</h3>
-              <p>Argos first probes transparent UTXOs (results appear within seconds), then syncs all shielded compact blocks. Seed recovery covers transparent, Sapling, and Orchard; a seedless imported wallet covers its transparent and Sapling keys. Sprout is recovered separately so an ordinary total is never presented as the whole wallet.</p>
+              <p>Argos first probes transparent UTXOs (results appear within seconds), then syncs all shielded compact blocks. Seed recovery covers transparent, Sapling, and Orchard; a seedless imported wallet covers its transparent and Sapling keys. Sprout funds are unspendable under NU7 and are excluded from recovery totals.</p>
               <p class="guide-tip">Scans can take anywhere from a few minutes (recent birthday) to several hours (birthday near Sapling activation in 2018). The ETA warms up after about 15 seconds.</p>
               <p>You can cancel and resume at any time. Re-run Argos with the same recovery source, network, birthday, and account settings to pick up from the last saved block. Older workspaces without the current storage protections are preserved but require a fresh scan in a new data directory. Keep the old data and reconcile pending transactions before recovering those funds again.</p>
             </div>
@@ -180,10 +179,8 @@
             </div>
 
             <div class="guide-section">
-              <h3>Sprout Recovery</h3>
-              <p>Sprout support is included in Argos. A ZecWallet Lite seed alone cannot recreate these independently generated keys; use a zcashd <code>wallet.dat</code> or standalone <code>SK…</code>/<code>ST…</code> key. With no wallet file, choose <em>I have a wallet file</em> on the welcome screen, then open <em>I only have a Sprout spending key</em>, pick the network and paste the keys.</p>
-              <p>If the wallet file contains cached note data and a witness, Argos can sweep it immediately. Otherwise recovery needs a resumable full-block scan from genesis to the chain tip — Sprout notes are still created and spent after Canopy, so it cannot stop there. On mainnet that is about 3.5 million blocks, roughly 280 GB transferred, under 500 MB retained, and likely days of work.</p>
-              <p>Sprout funds land in a Sapling receiver, even when you provide a Unified Address. They cannot reach Orchard in the same transaction; move them from Sapling to Orchard afterward from your own wallet if desired. Keep the original file, private scan checkpoint, and journal while any transaction is prepared, unknown, pending, contested, rejected, expired but recoverable, or not fully reconciled. Argos removes a checkpoint only when the current checkpoint notes exactly equal the durable manifest for that exact generation, every manifest entry is currently canonical mined, and the two newest separate reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators.</p>
+              <h3>Sprout funds</h3>
+              <p>Sprout funds are unspendable under NU7. Argos recognizes Sprout key records in wallet files to explain this limitation, and recovers supported transparent and Sapling funds from the same file.</p>
             </div>
 
             <div class="guide-section">
@@ -211,9 +208,9 @@
                 <li><strong>No frontend framework.</strong> No React, Vue, Svelte, router, state library, UI kit, or analytics.</li>
                 <li><strong>Rescue-only workflow.</strong> The GUI is not an everyday wallet — it does one thing (validate, scan, sweep) and exits. There is no persistent session or background process.</li>
                 <li><strong>Key operations happen in Rust.</strong> Derivation, wallet parsing, scanning, and transaction building run in Rust behind explicit Tauri commands. JavaScript drives the UI and transiently holds values the user enters.</li>
-                <li><strong>Secrets are cleared at lifecycle boundaries.</strong> Argos clears seed, passphrase, and pasted-key fields once a scan accepts them; when a scan finishes, fails, or is cancelled; after Sprout execution; and on <em>Forget this file</em>, return to the welcome screen, <em>Start over</em>, or window close. Ordinary step navigation keeps active recovery state, and a wallet-open error keeps the passphrase so you can retry. A wallet review ID is refused on its first use after 30 minutes; finished scan secrets expire after 30 minutes, and reviewed Sprout proposals expire 15 minutes after creation. A running scan retains keys until its worker stops.</li>
+                <li><strong>Secrets are cleared at lifecycle boundaries.</strong> Argos clears seed, passphrase, and pasted-key fields once a scan accepts them; when a scan finishes, fails, or is cancelled; and on <em>Forget this file</em>, return to the welcome screen, <em>Start over</em>, or window close. Ordinary step navigation keeps active recovery state, and a wallet-open error keeps the passphrase so you can retry. A wallet review ID is refused on its first use after 30 minutes; finished scan secrets expire after 30 minutes. A running scan retains keys until its worker stops.</li>
                 <li><strong>Zeroization has limits.</strong> Rust secret owners use best-effort zeroization on drop, but browser strings, compiler or allocator copies, swap, crash/core dumps, kernel caches, DMA, forensic capture, and a compromised process may retain or observe bytes.</li>
-                <li><strong>Protect local secret state.</strong> Use an encrypted disk and encrypted swap (or disable swap), avoid suspend/hibernate during recovery, and treat a Sprout checkpoint like the original spending key.</li>
+                <li><strong>Protect local secret state.</strong> Use an encrypted disk and encrypted swap (or disable swap), avoid suspend/hibernate during recovery, and protect the recovery workspace like the original wallet.</li>
               </ul>
               <p>Independently audited by <a href="https://leastauthority.com" target="_blank" rel="noopener">Least Authority</a>.</p>
             </div>
@@ -221,11 +218,11 @@
             <div class="guide-section">
               <h3>Frequently asked questions</h3>
               <ul>
-                <li><strong>Are my recovery secrets transmitted?</strong> No. Seeds, wallet passphrases, and spending keys stay local. Ordinary scans download compact blocks from lightwalletd; Sprout scans download public full blocks from Zcash P2P peers.</li>
-                <li><strong>Can I use a transparent or Sapling address as my destination?</strong> Ordinary recovery requires a Unified Address with an Orchard or Sapling receiver. The separate Sprout sweep also accepts a bare Sapling address because Sprout can only land in Sapling.</li>
+                <li><strong>Are my recovery secrets transmitted?</strong> No. Seeds, wallet passphrases, and spending keys stay local. Scans download compact blocks from lightwalletd.</li>
+                <li><strong>Can I use a transparent or Sapling address as my destination?</strong> Ordinary recovery requires a Unified Address with an Orchard or Sapling receiver.</li>
                 <li><strong>What if I had more than one ZecWallet Lite account?</strong> Argos scans up to 500 accounts automatically. If you enabled the gap-limit scan mode, it stops after 20 consecutive empty accounts by default — enough for almost all wallets.</li>
-                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume or a non-final transaction can be recovered. A sweep does not remove it automatically, even after completion. Delete it and any remaining recovery state yourself only after Argos reports fresh canonical mined evidence for every Sprout transaction. Argos's guarded cleanup path remains ineligible unless the current checkpoint notes equal the durable manifest for that exact generation and the two newest reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators. Private directories and files use <code>0700</code>/<code>0600</code> on Unix and a protected owner+LocalSystem Windows DACL. Keep the original wallet or key, checkpoint, and journal until then; a broadcast, visible arrival, node acceptance, or one confirmation is insufficient.</li>
-                <li><strong>Can I run Argos offline?</strong> Source validation and key derivation are offline, but scanning requires a network connection: lightwalletd for ordinary recovery or Zcash P2P peers for Sprout.</li>
+                <li><strong>What happens to my data after Argos finishes?</strong> The workspace stays in the chosen data directory. Keep the original wallet and recovery state until every recovery transaction is confirmed mined. Private directories and files use <code>0700</code>/<code>0600</code> on Unix and a protected owner+LocalSystem Windows DACL.</li>
+                <li><strong>Can I run Argos offline?</strong> Source validation and key derivation are offline, but scanning requires a network connection: lightwalletd for recovery.</li>
               </ul>
             </div>
 
@@ -243,7 +240,7 @@
           <div class="card-grid">
             <article class="info-card">
               <h3>Use the backup you have</h3>
-              <p>Recover from a seed phrase, a wallet file, or a standalone Sapling or Sprout spending key.</p>
+              <p>Recover from a seed phrase, a wallet file, or a standalone Sapling spending key.</p>
             </article>
             <article class="info-card">
               <h3>Privacy first</h3>
@@ -283,7 +280,7 @@
           <p class="lead">
             A zcashd <code>wallet.dat</code> or a ZecWallet Lite wallet. Argos only reads it — the
             file is never modified, and nothing is sent anywhere. No file? Paste a standalone
-            Sapling or Sprout spending key below instead.
+            Sapling spending key below instead.
           </p>
 
           <div id="wallet-drop" class="drop-zone">
@@ -334,49 +331,7 @@
           <div id="wallet-summary" class="report-card" hidden>
             <h3>What Argos found</h3>
             <ul id="wallet-summary-list" class="session-list"></ul>
-            <div id="wallet-sprout-warning" class="guide-warning" hidden>
-              <p id="wallet-sprout-nu7-warning" role="alert" hidden></p>
-              <strong id="wallet-sprout-headline"></strong>
-              <span id="wallet-sprout-detail"></span>
-              <div id="wallet-sprout-accounting" hidden></div>
-              <div id="wallet-sprout-scan-cost" hidden></div>
-
-              <!-- Only shown when the wallet file itself yielded spendable
-                   notes. Sprout value must land on a Sapling receiver: it
-                   leaves the pool through the transparent pool and has to be
-                   consumed by a Sapling output in the same transaction. -->
-              <div id="wallet-sprout-sweep" hidden>
-                <hr />
-                <p><strong>Move these funds now</strong></p>
-                <p class="muted">
-                  Argos checks any saved transaction before creating a new one. Keep the
-                  original wallet file and private scan checkpoint until every transaction
-                  is freshly confirmed mined. New transactions require recovered note data,
-                  and the destination must have a Sapling receiver.
-                </p>
-                <label for="sprout-destination">Destination address</label>
-                <input
-                  id="sprout-destination"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                  placeholder="zs1… or a Unified Address with a Sapling receiver"
-                />
-                <p id="sprout-sweep-plan" class="muted"></p>
-                <p id="sprout-sweep-pool" class="muted"></p>
-                <p id="sprout-sweep-params" class="muted"></p>
-                <p id="sprout-sweep-spent-status" class="muted"></p>
-                <label class="checkbox-row">
-                  <input type="checkbox" id="sprout-sweep-confirm" disabled />
-                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
-                </label>
-                <button id="sprout-sweep-run" type="button" disabled>
-                  Sweep Sprout funds
-                </button>
-                <p id="sprout-sweep-status" class="status-line"></p>
-                <ul id="sprout-sweep-results" class="session-list"></ul>
-              </div>
-            </div>
+            <p id="wallet-sprout-warning" class="guide-warning" role="alert" hidden></p>
             <div id="wallet-seed-diagnostics" class="guide-warning" hidden>
               <strong>About this wallet's seed.</strong>
               <ul id="wallet-seed-diagnostics-list"></ul>
@@ -389,147 +344,6 @@
             </div>
           </div>
 
-          <!-- The Sprout full-block scan. Its own block, outside #wallet-summary,
-               because the user who needs it most has no wallet file at all:
-               only a raw SK…/ST… key backup (the CLI's `scan-sprout
-               --sprout-key-file`). A wallet file whose Sprout keys came with
-               no spendable note data opens it automatically and its keys are
-               used when the box is left blank. -->
-          <details id="sprout-scan-entry" class="report-card">
-            <summary id="sprout-scan-entry-label">I only have a Sprout spending key (<code>SK…</code> or <code>ST…</code>)</summary>
-            <!-- Revealed only once its NU7 alert has text: the panel is never
-                 usable without the deadline on screen above it. The alert is
-                 the panel's own, so it is there with or without a wallet
-                 file. -->
-            <div id="sprout-scan-panel" hidden>
-              <p id="sprout-scan-nu7-warning" class="guide-warning" role="alert" hidden></p>
-              <p class="muted">
-                Sprout notes can only be found by reading every block from genesis to today. On
-                mainnet that is about 3.5 million blocks, roughly 280 GB downloaded, and likely
-                days of work. Progress is saved, so the scan can be stopped and resumed. The
-                saved checkpoint holds your spending keys: protect it like the key itself.
-              </p>
-              <!-- The same control as the Network picker on the settings
-                   step, which a user with no wallet file cannot reach from
-                   here. Changing it changes that picker. -->
-              <label for="sprout-scan-network">Network</label>
-              <select id="sprout-scan-network">
-                <option value="mainnet" selected>Mainnet (SK… keys)</option>
-                <option value="testnet">Testnet (ST… keys)</option>
-              </select>
-              <label for="sprout-scan-keys">
-                Sprout spending keys (one per line, <code>SK…</code> or <code>ST…</code>)
-              </label>
-              <textarea id="sprout-scan-keys" rows="3" spellcheck="false"
-                placeholder="SK… (mainnet) or ST… (testnet), one key per line"></textarea>
-              <button id="sprout-scan-check" type="button">Check keys</button>
-              <ul id="sprout-scan-addresses" class="session-list"></ul>
-
-              <!-- Mirrors `scan-sprout --sprout-pack`. A pack replaces the
-                   download of every block up to its end height; the scan
-                   continues over the network from there. -->
-              <details id="sprout-scan-pack-details">
-                <summary>Sprout pack: about 1.3 GB instead of the whole chain</summary>
-                <p class="muted">
-                  A Sprout pack is a set of files published with Argos releases that holds
-                  every Sprout transaction up to a fixed block. With it, the scan reads those
-                  blocks from disk and downloads only the rest of the chain, which cuts the
-                  download from hundreds of gigabytes to a few. The result is the same as a
-                  full scan. On mainnet only the pack this version of Argos was released
-                  with is accepted.
-                </p>
-                <label class="checkbox-row">
-                  <input type="checkbox" id="sprout-pack-auto" checked />
-                  Download the Sprout pack automatically
-                </label>
-                <p class="muted">
-                  When no folder is named below, a mainnet scan downloads the pack this
-                  version of Argos pins from Sovright's storage or the GitHub release, and
-                  checks every file against the pinned hash before using it. Files are kept,
-                  so later scans reuse them. Turn this off to download every block from the
-                  network instead; the pack download tells the server your IP address.
-                </p>
-                <label for="sprout-scan-pack">Pack folder you downloaded yourself (holds <code>manifest.bin</code>)</label>
-                <input id="sprout-scan-pack" type="text" spellcheck="false" autocomplete="off"
-                  placeholder="Leave blank to download every block" />
-                <button class="ghost" id="sprout-scan-pack-browse" type="button">Choose folder…</button>
-                <p id="sprout-scan-pack-status" class="muted" role="status"></p>
-              </details>
-
-              <!-- The escape hatch for when every public peer is full.
-                   Collapsed, because almost nobody needs it; the CLI's
-                   equivalent is `scan-sprout --peer`. -->
-              <details id="sprout-scan-advanced">
-                <summary>Advanced: use your own Zcash node</summary>
-                <label for="sprout-scan-peers">
-                  Custom peers (<code>host:port</code>, one per line or comma-separated, up to 8)
-                </label>
-                <textarea id="sprout-scan-peers" rows="2" spellcheck="false"
-                  autocomplete="off" placeholder="Leave blank to use public peers"></textarea>
-                <p class="muted">
-                  Leave this empty normally. Use it if Argos reports that all peers are busy
-                  and you run or trust a Zcash node (zebrad or zcashd, port 8233). These peers
-                  are tried first, before the public ones. A peer can see which blocks Argos
-                  requests. On mainnet it cannot forge history, because every block header is
-                  checked for proof of work and the chain is pinned to known block hashes;
-                  testnet has no pinned hashes, so only use a testnet node you trust. Your
-                  keys are never sent to any peer.
-                </p>
-              </details>
-
-              <!-- Mirrors `scan-sprout --no-birthday-skip` / `--birthday`.
-                   A wallet.dat whose Sprout keys are all dated skips
-                   trial decryption before them; the file's times are its
-                   own claim, so the user can always undo the skip. -->
-              <details id="sprout-scan-skip">
-                <summary>Where decryption starts</summary>
-                <p class="muted">
-                  If every Sprout key in your wallet file records when it was created, the
-                  scan still reads every block but does not try to decrypt notes in blocks
-                  made before then, which saves hours. Keys pasted above have no creation time,
-                  so with any of them every block is decrypted.
-                </p>
-                <label class="checkbox-row">
-                  <input type="checkbox" id="sprout-scan-every-block" />
-                  Decrypt every block (ignore the wallet file's key creation times)
-                </label>
-                <label for="sprout-scan-birthday">
-                  Birthday for this scan (optional; can only move the start earlier)
-                </label>
-                <input id="sprout-scan-birthday" type="number" min="0" inputmode="numeric"
-                  placeholder="Block height" />
-              </details>
-
-              <button id="sprout-scan-run" type="button">Start scan</button>
-              <p id="sprout-scan-status" class="status-line"></p>
-              <p id="sprout-scan-plan" class="muted"></p>
-              <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
-
-              <!-- Revealed only once a scan has actually found notes. A
-                   scan that finds money and offers nothing to click is
-                   six hours spent to be shown funds you still cannot
-                   reach. -->
-              <div id="sprout-scan-sweep" hidden>
-                <hr />
-                <p><strong>Move the funds this scan found</strong></p>
-                <label for="sprout-scan-destination">Destination address</label>
-                <input
-                  id="sprout-scan-destination"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                  placeholder="zs1… or a Unified Address with a Sapling receiver"
-                />
-                <p id="sprout-scan-sweep-plan" class="muted"></p>
-                <label class="checkbox-row">
-                  <input type="checkbox" id="sprout-scan-confirm" disabled />
-                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
-                </label>
-                <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
-                <ul id="sprout-scan-sweep-results" class="session-list"></ul>
-              </div>
-            </div>
-          </details>
 
           <div class="actions split">
             <button class="secondary" data-prev="welcome">Back</button>
@@ -774,12 +588,8 @@
           <p id="scan-message" class="status-line"></p>
           <div class="report-card scan-summary-card">
             <p id="scan-totals" class="status-line">Balance: 0.00000000 ZEC · 0 accounts loaded.</p>
-            <!-- The total above counts only the pools this scan covers. A
-                 wallet file's Sprout keys are not among them, and the CLI
-                 says so loudly at this exact moment; the GUI used to stay
-                 silent, so a user could read a Sprout-excluding total as
-                 their whole balance. -->
-            <div id="scan-sprout-uncovered" class="guide-warning" hidden></div>
+
+            <div id="scan-wallet-caveat" class="guide-warning" hidden></div>
             <p id="scan-workspace" class="status-line">Workspace: not initialized</p>
           </div>
           <div class="table-card">
@@ -886,10 +696,8 @@
           <p class="eyebrow">Step 6</p>
           <h2 id="complete-heading">Sweep status</h2>
           <p class="lead" id="complete-summary"></p>
-          <!-- Repeated here deliberately: this screen is where the "Delete
-               workspace" button lives, and the wallet file is the only copy
-               of any Sprout key it holds. -->
-          <div id="complete-sprout-uncovered" class="guide-warning" hidden></div>
+
+          <div id="complete-wallet-caveat" class="guide-warning" hidden></div>
           <div id="complete-txids" class="complete-txids"></div>
           <p id="complete-donation" hidden></p>
           <div class="report-card" id="complete-skipped"></div>
@@ -931,7 +739,7 @@
               until the cells are overwritten or TRIM'd. For high-value seeds, consider
               encrypting the volume Argos writes to.
             </p>
-            <div id="delete-sprout-uncovered" class="guide-warning" hidden></div>
+            <div id="delete-wallet-caveat" class="guide-warning" hidden></div>
             <div class="inline-actions">
               <button class="danger" id="delete-workspace">Delete workspace…</button>
               <p id="delete-workspace-status" class="status-line"></p>

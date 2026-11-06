@@ -504,7 +504,7 @@
         <h1>Recover your <em>Zcash</em> from a legacy wallet</h1>
         <p>
           Enter a ZecWallet Lite seed, open a legacy wallet file, or supply a
-          standalone Sapling or Sprout spending key. Argos scans the blockchain
+          standalone Sapling spending key. Argos scans the blockchain
           and sweeps recoverable funds without the recovery secret leaving your machine.
         </p>
         <div class="hero-actions">
@@ -567,17 +567,17 @@
         <div class="feature-card">
           <div class="feature-icon">🌱</div>
           <h3>Multiple recovery sources</h3>
-          <p>Use a ZecWallet Lite seed phrase, a ZecWallet Lite or zcashd wallet file, or standalone Sapling and Sprout spending keys.</p>
+          <p>Use a ZecWallet Lite seed phrase, a ZecWallet Lite or zcashd wallet file, or standalone Sapling spending keys.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">🔍</div>
           <h3>Finds every ZEC</h3>
-          <p>Scans Sapling, Orchard, and transparent funds, and includes a separate end-to-end Sprout scan and sweep path for wallets or keys that need it.</p>
+          <p>Scans Sapling, Orchard, and transparent funds. Sprout funds are unspendable under NU7; wallet imports show a notice when Sprout records are present.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">🛡</div>
           <h3>Privacy first</h3>
-          <p>Seeds, passphrases, and spending keys never leave your device. Ordinary scans use public lightwalletd nodes; Sprout scans read public full blocks from Zcash P2P peers.</p>
+          <p>Seeds, passphrases, and spending keys never leave your device. Scans use public lightwalletd nodes.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">⏸</div>
@@ -629,7 +629,7 @@
           <div class="step-number">4</div>
           <div class="step-body">
             <h4>Scan</h4>
-            <p>Argos syncs compact blocks and probes UTXOs. Sprout recovery uses cached wallet witnesses when possible, or a resumable full-block scan when necessary.</p>
+            <p>Argos syncs compact blocks and probes UTXOs for supported funds.</p>
           </div>
         </div>
         <div class="step-card">
@@ -657,7 +657,7 @@
           <h3>Your recovery secrets never leave your computer</h3>
           <p>
             Argos derives and validates keys locally and stores recovery state only on your machine.
-            It downloads public blockchain data from lightwalletd or, for Sprout, Zcash P2P peers.
+            It downloads public blockchain data from lightwalletd.
             No seed, wallet passphrase, spending key, or balance is transmitted.
             You can review every line of code on <a href="https://github.com/sovright/argos" target="_blank" style="color:var(--accent)">GitHub</a>.
           </p>

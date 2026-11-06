@@ -116,13 +116,7 @@ pub enum ReceiverLookupError {
 
 /// Walk a destination address for its Sapling receiver.
 ///
-/// The `TryFromAddress` machinery below existed twice — once in
-/// `sprout_sweep` and once in `transparent_recovery` — as ~85 near-identical
-/// lines each, and the same review finding had to be applied to both. Only
-/// the walk is shared: the two callers map the result onto deliberately
-/// different error vocabularies (one typed, one explanatory), each pinned by
-/// its own tests, so folding those together would silently change one
-/// surface's behaviour.
+/// Returns a typed lookup result for imported transparent recovery.
 pub fn find_sapling_receiver(
     destination: &str,
     network: crate::ZeckNetwork,

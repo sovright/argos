@@ -1,3 +1,8 @@
+> These Sprout-era wallets are retained as mixed-wallet import fixtures.
+> Current Argos recognizes Sprout spending-key records only to show that funds
+> are unspendable under NU7; it does not recover Sprout secrets or note data.
+> The historical generation details below explain the fixture provenance.
+
 # Golden wallet.dat fixtures
 
 Real `wallet.dat` files written by a pinned `zcashd`, used to test the

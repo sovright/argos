@@ -105,7 +105,7 @@ fn a_seedless_wallet_file_scans_through_the_cli() {
     // it covers transparent alone. This fixture has Sapling keys, so routing
     // it to the transparent-only path would silently skip a whole pool.
     assert!(
-        stderr.contains("SPROUT FUNDS ARE NOT COVERED"),
+        stderr.contains("unspendable"),
         "a seedless wallet with Sapling keys must take the imported-account \
          path\n--- stderr ---\n{stderr}"
     );

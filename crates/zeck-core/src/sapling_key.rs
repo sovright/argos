@@ -4,14 +4,11 @@
 //! string — from `z_exportkey`, from `zcashd-wallet-tool`, or from a paper
 //! backup — with no `wallet.dat` at all. That string is the whole of what
 //! they have, so decoding it correctly is the entire difference between a
-//! recovery and a dead end. This is the same situation `sprout_key` handles
-//! for Sprout.
+//! recovery and a dead end.
 //!
 //! # Why this needs no golden-constant caveat
 //!
-//! `sprout_key` pins zcashd's base58 version bytes by hand and documents that
-//! mainnet has no oracle in this repo. Sapling has no such problem: the
-//! human-readable parts come from `zcash_protocol::constants`, which is the
+//! The human-readable parts come from `zcash_protocol::constants`, which is the
 //! same source librustzcash, zcashd, and every other wallet encode against.
 //! The test below still pins the literal strings, so an upstream rename
 //! cannot silently move Argos off the prefix users actually hold.
@@ -56,7 +53,7 @@ fn other_network(network: ZeckNetwork) -> ZeckNetwork {
 /// Decode a bech32 Sapling extended spending key.
 ///
 /// Every rejection names what the user must do next: a correct key for the
-/// other network says so, a Sprout key is redirected to the Sprout route, and
+/// other network says so, a Sprout key explains the NU7 spending prohibition, and
 /// a viewing key is told why viewing is not spending. "Invalid key" sends a
 /// user hunting for a different backup when the one in their hand is fine.
 pub fn decode_sapling_spending_key(
@@ -84,8 +81,8 @@ pub fn decode_sapling_spending_key(
     // (testnet). Someone holding two paper backups will mix them up.
     if trimmed.starts_with("SK") || trimmed.starts_with("ST") {
         return Err(ZeckError::Import(
-            "that looks like a Sprout spending key, not a Sapling one. \
-             Pass it with --sprout-key-file instead (GUI: the Sprout scan panel)."
+            "that looks like a Sprout spending key. Sprout funds are unspendable \
+             under the NU7 consensus rules; Argos no longer supports Sprout recovery."
                 .to_owned(),
         ));
     }
@@ -320,18 +317,16 @@ mod tests {
         );
     }
 
-    /// The exact inverse of `sprout_key`'s
-    /// `a_sapling_key_is_not_accepted_as_sprout`. Someone with two paper
-    /// backups will mix them up eventually.
+    /// Retired Sprout keys must not point at a removed recovery route.
     #[test]
-    fn a_sprout_key_is_not_accepted_as_sapling_and_points_at_the_right_flag() {
+    fn a_sprout_key_is_rejected_with_the_nu7_unspendable_notice() {
         let sprout = "SKxt8pwrQipUL5KgZUcBAqyLj9R1YwMuRRR7rRRRRRRRRRRRRRRR";
         let err = decode_sapling_spending_key(sprout, ZeckNetwork::Mainnet)
             .expect_err("a Sprout key must not decode as Sapling")
             .to_string();
         assert!(
-            err.contains("Sprout") && err.contains("--sprout-key-file"),
-            "the message should redirect to the Sprout route, got: {err}"
+            err.contains("Sprout") && err.contains("NU7") && err.contains("unspendable"),
+            "the message should explain why Sprout recovery is unavailable, got: {err}"
         );
     }
 
@@ -410,7 +405,7 @@ mod tests {
 
         assert_eq!(keys.sapling.len(), 1);
         assert!(keys.transparent.is_empty());
-        assert!(keys.sprout.is_empty());
+        assert_eq!(keys.sprout_records, 0);
         assert!(keys.mnemonic.is_none(), "a pasted key carries no seed");
         assert!(!keys.is_empty());
 
@@ -428,8 +423,7 @@ mod tests {
     }
 
     /// Blank lines and `#` comments let a user annotate which key came from
-    /// which backup without the file being rejected. Same rule as
-    /// `--sprout-key-file`.
+    /// which backup without the file being rejected.
     #[test]
     fn blank_lines_and_comments_are_skipped() {
         let line = encoded_key([7u8; 32], ZeckNetwork::Mainnet);

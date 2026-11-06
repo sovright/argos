@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zeck-core", "crates/zeck-cli", "crates/argos-wallet-import", "crates/argos-sprout-pack", "gui/src-tauri"]
+members = ["crates/zeck-core", "crates/zeck-cli", "crates/argos-wallet-import", "gui/src-tauri"]
 resolver = "2"
 
 [patch.crates-io]
@@ -23,25 +23,7 @@ aes = { version = "0.8.4", features = ["zeroize"] }
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 bip0039 = "0.14.0"
-# Header proof-of-work verification for the Sprout scan. Already in the tree
-# via zcash_primitives; made direct so the scanner can call it.
-equihash = "0.3"
 blake2b_simd = "1.0.4"
-# Curve25519 scalar multiplication for Sprout note decryption (the key
-# agreement in protocol §5.5). No other crate in the tree provides it.
-x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
-chacha20poly1305 = "0.10.1"
-# JoinSplit signatures. ed25519-zebra rather than ed25519-dalek: Zcash
-# consensus requires ZIP 215 verification semantics, which this implements and
-# which the two libraries disagree about on edge-case signatures.
-ed25519-zebra = "4.0.3"
-# Named only to load the Sprout Groth16 proving key; both already arrive via
-# zcash_proofs, which exposes the verifying key but not the proving key.
-bellman = "0.14"
-bls12_381 = "0.8"
-# Named only for script::Code when hand-assembling a V4 transparent bundle;
-# already in the tree via zcash_transparent.
-zcash_script = "0.4.3"
 base64 = "0.22"
 cbc = { version = "0.1.2", features = ["alloc", "zeroize"] }
 clap = { version = "4.5.53", features = ["derive"] }
@@ -63,9 +45,6 @@ prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = { version = "0.37.0", features = ["backup"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-# HTTPS for the Sprout pack download. `rustls-no-provider` uses the ring
-# provider Argos installs; the `rustls` feature would add aws-lc-rs.
-reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
 secp256k1 = "0.29.1"
 secrecy = "0.8.0"
 # Wipes recovered spending material and intermediate derivation state on drop.
@@ -85,7 +64,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
 url = "2.5.8"
 keepawake = "0.6"
-sha2 = { version = "0.10", features = ["compress"] }
+sha2 = "0.10"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 # ─── Zcash protocol stack — Ironwood (NU6.3) ──────────────────────────────────
 #
@@ -110,12 +89,7 @@ zcash_transparent = { version = "0.10", default-features = false, features = ["s
 tempfile = "3.20.0"
 zip32 = "0.2.1"
 
-# Dependencies are optimised even in dev/test builds. Sprout proving is
-# Groth16 over BLS12-381, and at opt-level 0 the field arithmetic in
-# `bellman`/`bls12_381` is slow enough that the consensus spend tests take
-# tens of minutes and time out in CI. Workspace crates keep their own dev
-# profile, so debugging and assertions are unaffected -- only third-party
-# code is optimised, and only its compile time pays, once, behind the cache.
+# Optimize cryptographic dependencies in development and tests.
 [profile.dev.package."*"]
 opt-level = 3
 

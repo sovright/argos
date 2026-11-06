@@ -5,17 +5,20 @@
 **Purpose:** A cross-platform recovery tool (CLI + GUI) for discontinued and
 legacy Zcash wallets. Argos re-derives ZecWallet Lite's non-standard key
 hierarchy from a BIP-39 seed, imports ZecWallet Lite and zcashd wallet files,
-accepts standalone Sapling and Sprout spending keys, scans the applicable
+accepts standalone Sapling spending keys, scans the applicable
 value pools, and sweeps recoverable funds to an address controlled by the
-user. Ordinary scans use `lightwalletd`; Sprout discovery uses historical full
-blocks from the Zcash P2P network.
+user. Scans use `lightwalletd`. Wallet import recognizes unsupported Sprout
+records only to explain the NU7 spending restriction.
 
-**Implementation status (2026-08-26):** The seed, wallet-file, standalone
-Sapling, imported transparent/Sapling sweep, and Sprout scan/sweep paths are
-implemented on `main`. Sprout is generally available and is not an opt-in
-Cargo feature. The milestone and pseudocode sections below retain design
-context; where they differ from the status sections and current command
-reference, the current implementation wins.
+**Implementation scope (2026-11-06):** Seed, wallet-file, standalone Sapling,
+and imported transparent/Sapling recovery remain supported. Sprout recovery
+has been removed because NU7 disallows the v4 format required for Sprout
+spends. The parser counts recognized Sprout spending-key records without
+importing secrets or notes and surfaces an unspendable notice. Existing
+Sprout checkpoints, journals, and packs are left untouched. This removal is
+not a general qualification of the remaining transaction stack for NU7.
+Milestones and pseudocode retain design context; current implementation and
+CLI help take precedence where they differ.
 
 ---
 
@@ -38,14 +41,14 @@ When a user imports their seed into Zashi, only ZIP 32 account index 0 is scanne
 
 | Tool | Approach | Limitation |
 |---|---|---|
-| ZExCavator (Zingo Labs) | Parses `.dat` wallet files via ZeWIF | Separate legacy migration approach; does not provide Argos's integrated seed, imported-key, and Sprout scan/sweep workflow |
+| ZExCavator (Zingo Labs) | Parses `.dat` wallet files via ZeWIF | Separate legacy migration approach; does not provide Argos's integrated seed and imported-key recovery workflow |
 | uzw-parser (james_katz) | Converts ZWL seed to YWallet SQLite DB | Outputs YWallet-specific format; no direct sweep to Unified Address |
 | ZecWallet Lite fork (Nu6+ZIP 317) | Patched legacy client | Outdated dependencies; maintenance burden |
 
 **Argos fills the gap:** one standalone tool that can start from a ZecWallet
 Lite seed, a supported wallet file, or a standalone spending key. Seed-only
 recovery remains available and requires no `.dat` file; users who still have
-the file gain recovery of independently stored zcashd keys, including Sprout.
+the file gain recovery of independently stored supported zcashd keys.
 
 ---
 
@@ -88,12 +91,12 @@ from gaining network or filesystem-write capabilities.
 │  │  zcash_keys  │   │              │   │            │ │
 │  └─────────────┘   └──────────────┘   └───────────┘ │
 └──────────────────────────────────────────────────────┘
-          ▲                              ▲
-          │ ImportedKeys                 │ full historical blocks
-┌─────────┴─────────────┐       ┌────────┴───────────┐
-│ argos-wallet-import   │       │ Zcash P2P peers    │
-│ read-only BDB / ZWL   │       │ Sprout scan only   │
-└───────────────────────┘       └────────────────────┘
+          ▲
+          │ ImportedKeys
+┌─────────┴─────────────┐
+│ argos-wallet-import   │
+│ read-only BDB / ZWL   │
+└───────────────────────┘
 ```
 
 ### Workspace structure
@@ -127,11 +130,9 @@ argos/
 1. **Resolve the source** — derive the ZecWallet Lite hierarchy, parse a wallet
    file read-only, or decode standalone spending-key strings.
 2. **Scan** — use compact blocks and transparent UTXO queries for HD and
-   imported Sapling/transparent recovery. Sprout either reuses cached wallet
-   note witnesses or performs a separate resumable full-block P2P scan.
+   imported Sapling/transparent recovery.
 3. **Sweep** — use the ordinary builder for HD recovery, direct/PCZT paths for
-   imported transparent and Sapling keys, and the Sprout v4-to-Sapling path for
-   Sprout notes.
+   imported transparent and Sapling keys.
 
 ---
 
@@ -176,7 +177,7 @@ For each account index `i` in `0..num_accounts`:
 | **Sapling** | ZIP 32 extended spending key at `m_Sapling / 32' / 133' / i'` | `sapling-crypto`, `zip32` |
 | **Transparent** | BIP 44 path `m / 44' / 133' / i' / 0 / 0` (external chain, address 0). Also scan `/ 0 / 1..20` for additional receive addresses and `/ 1 / 0..20` for change addresses. | `zcash_transparent`, `hdwallet` |
 | **Orchard** | ZIP 32 Orchard spending key at `m_Orchard / 32' / 133' / i'` | `orchard` |
-| **Sprout** | Not HD-derived in ZecWallet Lite. Recover from zcashd `wallet.dat` or standalone `SK…` / `ST…` spending keys. Cached wallet witnesses avoid a scan; otherwise trial-decrypt historical JoinSplits from full blocks. A Sapling IVK cannot decrypt Sprout. | `argos-wallet-import`, `sprout_key`, `sprout_scan` |
+| **Sprout** | Unspendable under NU7. Wallet import recognizes spending-key records without decoding secrets or note data and displays a notice. | `argos-wallet-import` |
 
 ### 3.4 Configurable account scan depth
 
@@ -241,23 +242,12 @@ Multiple lightwalletd servers should be configurable for fallback. The tool shou
 - Trial-decrypt Orchard actions in compact blocks.
 - Note: ZecWallet Lite v1.8.x added experimental Orchard support. Earlier versions did not create Orchard keys, but funds may have been sent TO Orchard addresses derived from the seed by other wallets.
 
-#### Sprout (separate full recovery path)
-- Sprout notes and keys cannot be derived from the HD seed in ZecWallet Lite.
-- `argos-wallet-import` extracts and verifies plaintext `zkey` and encrypted
-  `czkey` records from zcashd `wallet.dat`, including cached note and witness
-  data when present. Standalone `SK…` / `ST…` strings are decoded directly.
-- When cached note data is spendable, Argos can sweep it without scanning.
-  The wallet-derived balance is the file's claim until consensus accepts the
-  transaction; a crafted file can contain a phantom record.
-- Otherwise `scan-sprout` reads every full block from genesis to Canopy
-  directly from Zcash P2P peers, verifies the header chain and mainnet
-  checkpoints, trial-decrypts every JoinSplit, tracks nullifiers and witnesses,
-  and checkpoints progress. On mainnet the fixed range is 1,046,400 blocks,
-  approximately 26 GB transferred, hours of work, and under 500 MB retained.
-- The checkpoint contains raw spending keys and note plaintexts. It is created
-  privately (`0600` on Unix) and removed after a successful sweep.
-- Ordinary scan results must name Sprout as a separate path rather than imply
-  that an imported wallet's total includes it.
+#### Sprout (unsupported after NU7)
+- NU7 disallows version 4 transactions, the only format supporting Sprout spends.
+- Wallet import counts recognized `zkey` and `czkey` records only to show an
+  unspendable notice. It does not decrypt Sprout keys or parse note data.
+- Supported transparent and Sapling recovery from a mixed wallet continues.
+- No standalone key, scan, sweep, P2P, or pack workflow remains.
 
 ### 4.4 Scanning implementation
 
@@ -332,14 +322,6 @@ Imported zcashd keys do not use that HD sequence:
 - Standalone Sapling strings enter this same imported-account route and can be
   combined with a seedless wallet file. Duplicate keys are removed.
 
-Sprout is separate again. A version 4 JoinSplit releases value through
-`vpub_new`, and a Sapling output in the same transaction consumes it. Orchard
-actions require version 5, so a Sprout sweep cannot reach Orchard directly.
-The destination may be a bare Sapling address or a Unified Address containing
-a Sapling receiver; Argos tells the user that the value lands in Sapling. The
-approximately 725 MB `sprout-groth16.params` file is loaded and digest-checked
-before proving.
-
 **Fee handling (ZIP 317):**
 - All transactions must comply with ZIP 317 fee rules.
 - Fees are deducted from the swept amount.
@@ -404,14 +386,11 @@ COMMANDS:
   inspect-wallet  Report imported keys and diagnostics (local)
   scan            Scan HD or imported transparent/Sapling keys
   sweep           Scan and sweep HD or imported transparent/Sapling funds
-  scan-sprout     Full-block scan for Sprout notes, optionally followed by sweep
-  sweep-sprout    Sweep Sprout notes and witnesses already present in wallet.dat
 
 GLOBAL OPTIONS:
   --seed-file <PATH>           Private file containing the 12–24 word mnemonic
   --wallet-file <PATH>         Read-only zcashd or ZecWallet Lite wallet file
   --sapling-key-file <PATH>    One extended Sapling spending key per line
-  --sprout-key-file <PATH>     One SK… / ST… Sprout spending key per line
   --lightwalletd-url <URLS>    Comma-separated HTTPS endpoints
   --num-accounts <N>           Exact HD account count (overrides gap limit)
   --gap-limit <N>              Stop after N consecutive empty HD accounts [20]
@@ -435,17 +414,12 @@ EXAMPLES:
   argos --sapling-key-file ./sapling-keys.txt scan
   argos --sapling-key-file ./sapling-keys.txt sweep --destination u1... --dry-run
 
-  # Wallet-backed Sprout notes need no chain scan
-  argos --wallet-file ./wallet.dat sweep-sprout --destination u1... --dry-run
-
-  # Bare Sprout keys need the resumable full-block scan
-  argos --sprout-key-file ./sprout-keys.txt scan-sprout
 ```
 
-Seed, Sapling, and Sprout secrets are accepted through a protected prompt,
+Seed and Sapling secrets are accepted through a protected prompt,
 GUI field, or file — never as an argv value. `--wallet-file` conflicts with
 `--seed-file`; `--sapling-key-file` can augment only a seedless wallet file.
-Sprout commands are present in ordinary builds with no feature selection.
+Removed Sprout commands and flags are rejected.
 
 ---
 
@@ -467,8 +441,8 @@ Sprout commands are present in ordinary builds with no feature selection.
 
 Welcome branches to either Seed Entry or Wallet File / Standalone Key. Both
 ordinary routes converge on Configure → Scan → Sweep → Complete. A wallet
-summary containing Sprout keys exposes the separate direct-sweep or full-block
-scan controls before the ordinary flow continues.
+summary containing recognized Sprout records shows an unspendable notice;
+supported-pool recovery can continue.
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -514,11 +488,9 @@ scan controls before the ordinary flow continues.
 - Native file picker, drag-and-drop, and typed path for zcashd `wallet.dat` or
   a ZecWallet Lite wallet; the backend reads the path and never modifies it
 - In-memory passphrase prompt for encrypted files
-- Local summary of transparent, Sapling, and Sprout keys, recovered mnemonic,
-  spendable Sprout note data, and unread-record diagnostics
+- Local summary of transparent and Sapling keys, recovered mnemonic,
+  recognized Sprout records with the NU7 notice, and unread-record diagnostics
 - Paste/check one or more standalone Sapling extended spending keys
-- If cached Sprout notes are present, preview and sweep them immediately; if
-  only keys are present, show the full-block cost and resumable scan controls
 - Keep the original wallet warning until every relevant pool is confirmed
 
 **Screen 3 — Configuration**
@@ -613,18 +585,6 @@ async fn start_scan_from_wallet_file(config: WalletFileScanConfig)
 
 #[tauri::command]
 async fn check_sapling_key(key: String, network: String) -> Result<String, String>;
-
-#[tauri::command]
-async fn check_sprout_key(key: String, network: String) -> Result<String, String>;
-
-#[tauri::command]
-async fn start_sprout_scan(config: SproutScanInput) -> Result<SproutScanReport, String>;
-
-#[tauri::command]
-async fn preview_sprout_sweep(config: SproutWalletInput) -> Result<SproutPlan, String>;
-
-#[tauri::command]
-async fn execute_sprout_sweep(config: SproutSweepInput) -> Result<SproutOutcome, String>;
 ```
 
 **Event-based progress updates:** Rather than polling, the scan emits Tauri events that the frontend listens to:
@@ -708,9 +668,7 @@ cargo tauri build --target <target>
 |---|---|
 | `sapling-crypto` | Sapling note decryption and spend proving |
 | `orchard` | Orchard note decryption and spend proving |
-| `bellman`, `bls12_381`, `zcash_proofs` | Sprout and Sapling proof generation |
-| `equihash` | Sprout-scan header proof-of-work verification |
-| `x25519-dalek` | Sprout note trial decryption |
+| `zcash_proofs` | Sapling proof generation |
 | `pczt` | Signing imported Sapling accounts with raw spend authority |
 
 ### Supporting (shared)
@@ -752,13 +710,11 @@ The shipped WebView frontend has no runtime npm dependencies. It uses
 - **CLI:** Seed phrase MUST be read from stdin or file, never from command-line arguments (which appear in process lists and shell history). If `--seed-file` is not provided, prompt interactively with terminal echo disabled. On Unix platforms, seed files SHOULD be rejected when group/other users can read them.
 - **GUI:** Seed phrase is entered in a masked input field. It is passed to the Tauri Rust backend via IPC command and immediately wrapped in `secrecy::Secret`. The frontend clears the input buffer after submission. The Tauri IPC channel is local (no network exposure).
 - **Wallet files and standalone keys:** Wallet files are opened read-only by the
-  Rust backend. Passphrases are prompt-only in the CLI. Sapling and Sprout key
+  Rust backend. Passphrases are prompt-only in the CLI. Sapling key
   values are accepted from private files rather than argv; GUI-pasted keys
   share the accepted local IPC exposure of the seed. Viewing keys are refused.
-- **Sprout checkpoints:** resumability requires persisting raw spending keys,
-  note plaintexts, and witnesses. Create atomically with private permissions,
-  clearly describe the file as spend-capable, and delete it after a successful
-  sweep.
+- **Legacy artifacts:** Existing Sprout wallets, checkpoints, journals, and packs
+  are preserved unchanged; this version does not resume or clean them up.
 - All seed and key material in memory MUST use `secrecy::Secret<>` or `zeroize::Zeroize` for automatic zeroing on drop.
 
 ### 9.2 Network privacy
@@ -766,11 +722,6 @@ The shipped WebView frontend has no runtime npm dependencies. It uses
 - The lightwalletd server learns which blocks the client is interested in (but not which specific notes are being decrypted).
 - Users concerned about metadata leakage should run their own lightwalletd instance or connect via Tor.
 - Custom lightwalletd endpoints MUST use HTTPS unless they target localhost/loopback for local testing, and the reported chain metadata MUST match the selected Argos network before scanning or sweeping.
-- Sprout scanning connects directly to Zcash P2P peers over plaintext TCP.
-  Requests cover the entire fixed historical range and reveal no selected
-  address, but expose the user's IP and Argos user agent. Validate framing,
-  hashes, linkage, proof of work, and mainnet checkpoints; allow a user-supplied
-  trusted peer.
 - Document this in the tool's help text and README.
 
 ### 9.3 Transaction safety
@@ -803,9 +754,8 @@ The shipped WebView frontend has no runtime npm dependencies. It uses
 - Test sweep transaction construction and broadcast in regtest mode.
 - Test imported transparent and Sapling scan/sweep against real wallet-file
   fixtures and a node, including several Sapling keys and partial failures.
-- Test Sprout note discovery, witness construction, proof generation, stale
-  anchors, checkpoint resume, and broadcast against the dedicated pre-Canopy
-  regtest chain.
+- Test mixed and Sprout-only wallets for recognized-record notices, without
+  importing unsupported spend authority or changing supported balances.
 
 ### 10.3 Edge cases to test
 
@@ -819,8 +769,7 @@ The shipped WebView frontend has no runtime npm dependencies. It uses
 - Invalid/unreachable lightwalletd server
 - Encrypted, truncated, malformed, and forged-key wallet files
 - Standalone Sapling key parsing, network mismatch, duplicate handling, and sweep
-- Sprout peer refusal, malformed blocks, checkpoint corruption, resume, spent
-  notes, wrong-network keys, parameter-file verification, and partial broadcast
+- Removed Sprout commands/flags and GUI IPC are unavailable.
 
 ---
 
@@ -829,8 +778,8 @@ The shipped WebView frontend has no runtime npm dependencies. It uses
 ### ZExCavator / ZeWIF
 Argos remains interoperable in purpose but no longer depends on another tool
 for ingestion. `argos-wallet-import` contains a read-only Berkeley DB 6.2
-walker and ZecWallet Lite parser, including encrypted zcashd Sprout `czkey`
-records that other migration paths drop or reject. Argos does not currently
+walker and ZecWallet Lite parser. Sprout spending-key records are recognized
+without decoding their secrets, so users see the NU7 limitation. Argos does not currently
 export ZeWIF.
 
 ### uzw-parser
@@ -907,16 +856,14 @@ the original task wording.
 - Direct transparent recovery for wallets with no unified account
 - Imported Sapling scan and PCZT sweep for every recovered key
 - Standalone Sapling extended spending-key files and GUI paste entry
-- Generally available Sprout wallet/key inspection, resumable full-block scan,
-  witness recovery, proof construction, and sweep into Sapling
+- Unsupported Sprout-record recognition and NU7 unspendable notice
 
 ---
 
 ## 13. Open Questions
 
-1. **Sprout key extraction:** *Resolved.* ZecWallet Lite seeds do not derive
-   Sprout keys. Argos recovers independently generated keys from zcashd
-   `wallet.dat` (`zkey` / encrypted `czkey`) or standalone `SK…` / `ST…` text.
+1. **Sprout recovery:** Removed after NU7. Recognized wallet records produce
+   a notice only; unsupported secrets and note data are not imported.
 
 2. **ZecWallet Lite versioning:** Did the key derivation scheme change between versions? (v1.7.x Sapling-only vs. v1.8.x with Orchard support.) Argos should handle both by always attempting all pools.
 

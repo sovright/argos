@@ -1,7 +1,7 @@
 //! Prove that a recovered transparent secret key really controls the
 //! public key it was stored under.
 //!
-//! This mirrors `tests/sprout_key_is_genuine.rs`. AES-CBC only XORs the IV
+//! AES-CBC only XORs the IV
 //! into ciphertext block 0, and a `ckey` ciphertext is 48 bytes (a 32-byte
 //! secret plus PKCS#7 padding), so a wrong IV corrupts the recovered secret
 //! but decryption still succeeds and still returns 32 non-zero bytes —
