@@ -55,6 +55,13 @@ must isolate `TMPDIR`, prepare its treasury near genesis, install the qualified
 NU7 schedule in post-activation funding/test processes, and observe actual
 mined supported-pool recoveries and imported Sapling PCZT transactions. Merely
 starting the full profile or migrating an empty database cannot satisfy it.
+
+**Gate waived for 2.0.0.** On 2026-11-06 a maintainer chose to release 2.0.0
+without executing this rehearsal. This is a waiver, not a pass: no funded
+NU7 sweep or imported-Sapling PCZT transaction has been observed mined for
+this release. The evidence behind 2.0.0 is the offline and fast-profile layers
+above, plus the unit and proposal tests listed below. The rehearsal stays the
+outstanding qualification item for supported recovery after NU7.
 No release, real-wallet funding or mainnet spending is authorized here.
 
 ## Local carry-forward results
