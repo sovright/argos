@@ -1074,7 +1074,7 @@ where
     }
 
     // ── Phase 2: stepped shielded probe ──────────────────────────────────────
-    let mut hit = None;
+    let mut outcome = ProbeOutcome::NoActivity;
     if !probe_heights.is_empty() {
         let seed = mnemonic_seed(seed_phrase)?;
         let transparent_account = legacy_transparent_account_key(seed_phrase, network)?;
@@ -1091,23 +1091,40 @@ where
                 "Probing ~{year_label} window (block {probe_height})…"
             ));
 
-            let found = probe_shielded_window(
+            let probed = probe_shielded_window(
                 &mut client,
                 lightwalletd_url,
                 &probe_keys,
                 network,
                 probe_height,
             )
-            .await?;
+            .await;
 
-            if found {
-                hit = Some(i);
-                break;
+            match probed {
+                Ok(true) => {
+                    outcome = ProbeOutcome::Hit(i);
+                    break;
+                }
+                Ok(false) => {}
+                // With a transparent birthday already in hand, a failed probe
+                // must not throw it away: keep it and say what went unchecked.
+                // Without one there is nothing to fall back on.
+                Err(err) if upper_bound.is_some() => {
+                    on_progress(&format!(
+                        "Shielded probe at block {probe_height} failed ({err}); keeping the transparent birthday."
+                    ));
+                    outcome = ProbeOutcome::Failed {
+                        at: i,
+                        error: err.to_string(),
+                    };
+                    break;
+                }
+                Err(err) => return Err(err),
             }
         }
     }
 
-    let result = finish_detection(network, sapling_floor, earliest, &probe_heights, hit);
+    let result = finish_detection(network, sapling_floor, earliest, &probe_heights, outcome);
     on_progress(&format!("Birthday → {}.", result.birthday));
     Ok(result)
 }
@@ -1131,9 +1148,21 @@ fn shielded_probe_heights(sapling_floor: u32, chain_tip: u32, below: Option<u32>
         .collect()
 }
 
+/// How the stepped shielded probe ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// Every window was probed and none showed activity (or none was probed).
+    NoActivity,
+    /// The window at this index was the first to show activity.
+    Hit(usize),
+    /// The probe of the window at `at` failed; it and every later window
+    /// went unchecked. Only reachable with a transparent birthday to keep.
+    Failed { at: usize, error: String },
+}
+
 /// Turn what the two phases saw into the detected birthday.
 ///
-/// `hit` is the index of the first probe window with shielded activity. The
+/// A `Hit(i)` is the first probe window with shielded activity. The
 /// birthday is then the *previous* window, so notes in the gap before the
 /// first detected activity are still scanned. Every window lies below the
 /// transparent-derived birthday, so a hit can only lower it.
@@ -1142,8 +1171,12 @@ fn finish_detection(
     sapling_floor: u32,
     earliest_transparent: Option<u32>,
     probe_heights: &[u32],
-    hit: Option<usize>,
+    outcome: ProbeOutcome,
 ) -> BirthdayDetectResult {
+    let hit = match &outcome {
+        ProbeOutcome::Hit(i) => Some(*i),
+        _ => None,
+    };
     let shielded = hit.and_then(|i| {
         let probe_height = *probe_heights.get(i)?;
         let birthday = match i {
@@ -1160,16 +1193,22 @@ fn finish_detection(
                 birthday,
                 method: "shielded_probe".to_owned(),
                 message: format!(
-                    "Transparent activity was found at block {earliest}, but shielded activity \
-                     was detected earlier, near year ~{year_label} (block {probe_height}). \
-                     Birthday set to {birthday}. {}",
+                    "Transparent activity was found at block {earliest}, and shielded activity \
+                     was found when scanning from the ~{year_label} window (block \
+                     {probe_height}), so the birthday was moved back to {birthday}. {}",
                     late_birthday_caution(birthday, network)
                 ),
             }
         }
         (Some(earliest), None) => {
             let birthday = transparent_birthday(earliest, sapling_floor);
-            let probed = if probe_heights.is_empty() {
+            let probed = if let ProbeOutcome::Failed { at, error } = &outcome {
+                let from = probe_heights.get(*at).copied().unwrap_or(sapling_floor);
+                format!(
+                    " Shielded history before block {birthday}, from block {from} on, could not \
+                     be probed ({error}), so the birthday may be too late."
+                )
+            } else if probe_heights.is_empty() {
                 String::new()
             } else {
                 format!(
@@ -1711,7 +1750,13 @@ mod tests {
         );
 
         // Shielded activity in the second window (~2019).
-        let result = finish_detection(ZeckNetwork::Mainnet, floor, Some(utxo), &heights, Some(1));
+        let result = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            Some(utxo),
+            &heights,
+            ProbeOutcome::Hit(1),
+        );
         assert_eq!(result.method, "shielded_probe");
         assert_eq!(result.birthday, floor);
         assert!(result.birthday < bound);
@@ -1727,7 +1772,13 @@ mod tests {
         );
 
         // Hit in a later window: birthday is the window before it.
-        let result = finish_detection(ZeckNetwork::Mainnet, floor, Some(utxo), &heights, Some(3));
+        let result = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            Some(utxo),
+            &heights,
+            ProbeOutcome::Hit(3),
+        );
         assert_eq!(result.birthday, heights[2]);
     }
 
@@ -1737,12 +1788,62 @@ mod tests {
         let utxo = 2_500_000;
         let heights =
             shielded_probe_heights(floor, 3_000_000, Some(transparent_birthday(utxo, floor)));
-        let result = finish_detection(ZeckNetwork::Mainnet, floor, Some(utxo), &heights, None);
+        let result = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            Some(utxo),
+            &heights,
+            ProbeOutcome::NoActivity,
+        );
         assert_eq!(result.method, "transparent");
         assert_eq!(result.birthday, utxo - BIRTHDAY_BUFFER_BLOCKS);
         assert!(result.message.contains("unspent"), "{}", result.message);
         assert!(
             result.message.contains("earlier birthday"),
+            "{}",
+            result.message
+        );
+    }
+
+    /// A failed shielded probe must not cost the user a transparent
+    /// birthday that Phase 1 already found.
+    #[test]
+    fn a_failed_probe_keeps_the_transparent_birthday_and_says_so() {
+        let floor = SAPLING_ACTIVATION_HEIGHT + 1;
+        let utxo = 2_500_000;
+        let heights =
+            shielded_probe_heights(floor, 3_000_000, Some(transparent_birthday(utxo, floor)));
+        let result = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            Some(utxo),
+            &heights,
+            ProbeOutcome::Failed {
+                at: 2,
+                error: "tree state unavailable".to_owned(),
+            },
+        );
+        assert_eq!(result.method, "transparent");
+        assert_eq!(result.birthday, utxo - BIRTHDAY_BUFFER_BLOCKS);
+        assert!(
+            result.message.contains("could not be probed"),
+            "{}",
+            result.message
+        );
+        assert!(
+            result.message.contains("tree state unavailable"),
+            "{}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains(&format!("from block {} on", heights[2])),
+            "{}",
+            result.message
+        );
+        assert!(
+            result.message.contains("may be too late"),
             "{}",
             result.message
         );
@@ -1756,7 +1857,13 @@ mod tests {
         assert_eq!(bound, floor);
         let heights = shielded_probe_heights(floor, 3_000_000, Some(bound));
         assert!(heights.is_empty());
-        let result = finish_detection(ZeckNetwork::Mainnet, floor, Some(utxo), &heights, None);
+        let result = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            Some(utxo),
+            &heights,
+            ProbeOutcome::NoActivity,
+        );
         assert_eq!(result.birthday, floor);
         assert!(
             !result.message.contains("probe window"),
@@ -1774,12 +1881,24 @@ mod tests {
         assert!(heights.iter().all(|&h| h + 5_000 < tip));
         assert!(heights.last().unwrap() + PROBE_YEAR_STEP + 5_000 >= tip);
 
-        let hit = finish_detection(ZeckNetwork::Mainnet, floor, None, &heights, Some(2));
+        let hit = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            None,
+            &heights,
+            ProbeOutcome::Hit(2),
+        );
         assert_eq!(
             (hit.method.as_str(), hit.birthday),
             ("shielded_probe", heights[1])
         );
-        let none = finish_detection(ZeckNetwork::Mainnet, floor, None, &heights, None);
+        let none = finish_detection(
+            ZeckNetwork::Mainnet,
+            floor,
+            None,
+            &heights,
+            ProbeOutcome::NoActivity,
+        );
         assert_eq!(
             (none.method.as_str(), none.birthday),
             ("no_activity", floor)
