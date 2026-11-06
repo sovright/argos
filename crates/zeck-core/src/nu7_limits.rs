@@ -167,10 +167,19 @@ pub(crate) fn bound_send_max<P: Parameters, N: Clone>(
         return Ok(proposal);
     }
     let original = proposal.steps().first();
+    // An exactly balanced donation split still carries a zero-valued change
+    // output (the SDK's change strategy emits one when change is zero). It
+    // holds no value, and the batches below are built without change, so it
+    // is dropped. Any real change would be value no batch accounts for.
+    let has_real_change = original
+        .balance()
+        .proposed_change()
+        .iter()
+        .any(|change| change.value() != Zatoshis::ZERO);
     if proposal.steps().len() != 1
         || !original.transparent_inputs().is_empty()
         || !original.prior_step_inputs().is_empty()
-        || !original.balance().proposed_change().is_empty()
+        || has_real_change
         || original.transaction_request().payments().is_empty()
         || original.transaction_request().payments().len() > 2
     {
@@ -765,8 +774,12 @@ mod tests {
         assert_eq!(accounted, values.iter().sum::<u64>());
     }
 
-    #[test]
-    fn bounded_batches_preserve_donation_and_recipient_memos() {
+    /// A two-payment donation split over 901 notes at NU7 activation. With
+    /// `change` set, the balance carries one Sapling change output of that
+    /// value, taken from the recipient's payment so the proposal balances.
+    fn donation_split_proposal(
+        change: Option<u64>,
+    ) -> (Proposal<StandardFeeRule, u32>, u64, zip321::Payment) {
         let params = zcash_protocol::consensus::MAIN_NETWORK;
         let height = params.activation_height(NetworkUpgrade::Nu7).unwrap();
         let template = sapling_proposal(901, height);
@@ -788,14 +801,26 @@ mod tests {
         let original = Proposal::single_step(
             zip321::TransactionRequest::new(vec![
                 make_payment(donation),
-                make_payment(net - donation),
+                make_payment(net - donation - change.unwrap_or(0)),
             ])
             .unwrap(),
             [(0, PoolType::SAPLING), (1, PoolType::SAPLING)].into(),
             vec![],
             step.shielded_inputs().cloned(),
             step.anchor_height().unwrap(),
-            step.balance().clone(),
+            TransactionBalance::new(
+                change
+                    .map(|value| {
+                        zcash_client_backend::fees::ChangeValue::sapling(
+                            Zatoshis::from_u64(value).unwrap(),
+                            None,
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                step.balance().fee_required(),
+            )
+            .unwrap(),
             StandardFeeRule::Zip317,
             height.into(),
             template.confirmations_policy(),
@@ -803,7 +828,14 @@ mod tests {
             true,
         )
         .unwrap();
-        let bounded = bound_send_max(&params, original).unwrap();
+        (original, donation, payment.clone())
+    }
+
+    fn assert_donation_preserved(
+        bounded: &Proposal<StandardFeeRule, u32>,
+        donation: u64,
+        payment: &zip321::Payment,
+    ) {
         let mut donated = 0;
         let mut delivered = 0;
         for step in bounded.steps() {
@@ -818,9 +850,40 @@ mod tests {
         }
         assert_eq!(donated, donation);
         assert_eq!(
-            donated + delivered + crate::service::proposal_fee_zatoshis(&bounded).unwrap(),
+            donated + delivered + crate::service::proposal_fee_zatoshis(bounded).unwrap(),
             901 * 100_000
         );
+    }
+
+    #[test]
+    fn bounded_batches_preserve_donation_and_recipient_memos() {
+        let params = zcash_protocol::consensus::MAIN_NETWORK;
+        let (original, donation, payment) = donation_split_proposal(None);
+        let bounded = bound_send_max(&params, original).unwrap();
+        assert_donation_preserved(&bounded, donation, &payment);
+    }
+
+    /// The real donation split comes from `propose_transfer`, whose change
+    /// strategy emits a zero-valued change output when the transaction
+    /// balances exactly. Refusing it would leave every oversized sweep with
+    /// a donation unproposable after NU7.
+    #[test]
+    fn zero_valued_change_from_a_balanced_donation_split_is_batched() {
+        let params = zcash_protocol::consensus::MAIN_NETWORK;
+        let (original, donation, payment) = donation_split_proposal(Some(0));
+        let bounded = bound_send_max(&params, original)
+            .expect("zero-valued change carries no value and must not block batching");
+        assert!(bounded.steps().len() > 1);
+        assert_donation_preserved(&bounded, donation, &payment);
+    }
+
+    /// Real change is value the batches would not account for, so it is
+    /// still refused.
+    #[test]
+    fn nonzero_change_still_refuses_batching() {
+        let params = zcash_protocol::consensus::MAIN_NETWORK;
+        let (original, _, _) = donation_split_proposal(Some(1));
+        assert!(bound_send_max(&params, original).is_err());
     }
 
     #[test]
