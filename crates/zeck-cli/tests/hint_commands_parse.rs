@@ -1,7 +1,7 @@
 //! Every `argos …` command line the binary prints must actually parse.
 //!
 //! This exists because of a real failure: a user following
-//! `argos scan-sprout --wallet-file <x> --destination <y>`, printed by
+//! `argos scan --wallet-file <x>`, printed by
 //! Argos itself, got `error: unexpected argument '--wallet-file' found`.
 //! Seven hints were affected, not the two first reported — including
 //! three on the `argos scan` path, which fires straight after a
@@ -144,8 +144,8 @@ fn the_extractor_finds_a_known_hint() {
     assert!(
         commands
             .iter()
-            .any(|args| args.contains(&"scan-sprout".to_owned())
+            .any(|args| args.contains(&"scan".to_owned())
                 && args.contains(&"--wallet-file".to_owned())),
-        "expected the scan-sprout hint carrying --wallet-file; found: {commands:?}"
+        "expected the scan hint carrying --wallet-file; found: {commands:?}"
     );
 }

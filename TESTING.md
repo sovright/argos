@@ -3,7 +3,7 @@
 ## Overview
 
 This document tracks the testing strategy for Argos across seed, wallet-file,
-standalone Sapling-key, and Sprout recovery. The primary focus is **GUI
+standalone Sapling-key recovery, and unsupported Sprout-record notices. The primary focus is **GUI
 testing**, with CLI and live-network coverage for paths that have no cheap
 local substitute.
 
@@ -33,7 +33,7 @@ local substitute.
 - [ ] Opening a wallet does not modify its bytes or timestamp
 - [ ] zcashd `wallet.dat` and ZecWallet Lite files are identified correctly
 - [ ] Encrypted wallets request a passphrase; wrong passphrases fail cleanly
-- [ ] Summary reports transparent, Sapling, and Sprout key counts, mnemonic presence, and diagnostics
+- [ ] Summary reports transparent and Sapling key counts, mnemonic presence, diagnostics, and recognized Sprout records with an unspendable notice
 - [ ] A pasted `secret-extended-key-main1…` / `secret-extended-key-test1…` key is checked for the selected network
 - [ ] Multiple Sapling keys and `#` comment lines are accepted; duplicates are removed
 - [ ] Sapling viewing keys (`zxviews…`) and wrong-network spending keys are rejected
@@ -70,7 +70,7 @@ local substitute.
 - [ ] Fallback to secondary lightwalletd endpoint is reflected in server status label
 - [ ] Imported Sapling balances are reported once per imported key/account
 - [ ] Imported transparent balances are included without being mistaken for HD-derived accounts
-- [ ] A wallet containing Sprout keys shows an explicit separate-recovery warning before totals
+- [ ] A wallet containing Sprout records shows an explicit NU7 unspendable notice before supported-pool totals
 
 ### Step 5: Sweep Review
 - [ ] Transaction table shows: account index, pool, amount, fee, net amount
@@ -88,16 +88,12 @@ local substitute.
 - [ ] Report saved to chosen path and readable as plain text
 - [ ] "Start Over" button clears all state and returns to welcome screen
 
-### Sprout Wallet Flow
-- [ ] A wallet with cached spendable note data offers an immediate Sprout sweep without a scan
-- [ ] A wallet with Sprout keys but no usable note data explains the full-block scan cost before enabling it
-- [ ] Mainnet warning states 1,046,400 blocks, roughly 26 GB transferred, under 500 MB retained, and hours of work
-- [ ] Raw `SK…` / `ST…` keys are checked against the selected network
-- [ ] Scan progress is checkpointed; stopping and restarting resumes from the saved height
-- [ ] A Sprout destination must be a bare Sapling address or a Unified Address with a Sapling receiver
-- [ ] The UI explains that funds land in Sapling, not Orchard
-- [ ] A missing or invalid `sprout-groth16.params` fails before broadcast with an actionable message
-- [ ] Every sent txid, skipped note, and partial failure remains visible
+### Unsupported Sprout Records
+- [ ] A mixed wallet shows the NU7 unspendable notice and continues transparent/Sapling recovery
+- [ ] A Sprout-only wallet shows the notice without offering a scan or sweep
+- [ ] Recognized record counts are not presented as a balance or recovered spending keys
+- [ ] No standalone Sprout key input, scan panel, sweep button, or pack picker is available
+- [ ] Old Sprout checkpoints, journals, and packs remain untouched
 
 ---
 
@@ -130,8 +126,8 @@ local substitute.
 | N14 | Execute sweep | Broadcasts transactions; verify txids and confirmation status shown in UI |
 | N15 | Imported zcashd Sapling + transparent scan | Finds both pools and does not use the HD gap-limit route |
 | N16 | Imported zcashd Sapling + transparent sweep | Broadcasts each applicable pool leg and reports every txid |
-| N17 | Sprout wallet with cached witness | Builds and broadcasts without a chain scan |
-| N18 | Bare-key Sprout scan | Full-block scan finds a planted note, resumes, and sweeps it to Sapling |
+| N17 | Mixed wallet with Sprout records | Shows NU7 unspendable notice; recovers supported transparent/Sapling funds |
+| N18 | Sprout-only wallet | Shows notice without a recovery action or invented balance |
 
 ---
 
@@ -148,7 +144,7 @@ local substitute.
 - [ ] Truncated/corrupt wallet file — diagnostics or a bounded error, never a hang or panic
 - [ ] Wallet containing several Sapling keys — every funded key is scanned and swept
 - [ ] Mixed imported Sapling + transparent wallet — one pool failing does not erase the other pool's results
-- [ ] Forged imported transparent or Sprout key — rejected before scan/sweep
+- [ ] Forged imported transparent or Sapling key — rejected before scan/sweep
 
 ---
 
@@ -182,11 +178,6 @@ argos --wallet-file /path/to/wallet.dat \
 chmod 600 /tmp/sapling-keys.txt
 argos --sapling-key-file /tmp/sapling-keys.txt scan
 
-# Sprout: preview cached wallet notes, or scan bare keys
-argos --wallet-file /path/to/wallet.dat \
-  sweep-sprout --destination u1... --dry-run
-chmod 600 /tmp/sprout-keys.txt
-argos --sprout-key-file /tmp/sprout-keys.txt scan-sprout
 ```
 
 - [ ] `show-keys` prints Sapling, Orchard, and transparent addresses for accounts 0–4
@@ -195,7 +186,7 @@ argos --sprout-key-file /tmp/sprout-keys.txt scan-sprout
 - [ ] `sweep` (without `--confirm-sweep`) prints proposal and exits without broadcasting
 - [ ] `inspect-wallet` performs no network access and writes no workspace
 - [ ] imported Sapling and transparent keys both scan and sweep
-- [ ] `scan-sprout` and `sweep-sprout` appear in ordinary `--help` output without a Cargo feature
+- [ ] Removed Sprout commands and flags are rejected and absent from `--help`
 - [ ] All commands show useful `--help` text
 
 ---

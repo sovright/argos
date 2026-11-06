@@ -6,8 +6,6 @@ Argos is a Zcash wallet recovery tool for ZecWallet Lite seeds. It has three com
 - `crates/zeck-core` — shared Rust library (derivation, scanning, sweeping); package name `argos-core`
 - `crates/zeck-cli` — command-line interface; package name `argos-cli`, binary name `argos`
 - `gui/` — Tauri v2 desktop app (static HTML/JS frontend + Rust backend); package name `argos-gui`
-- `crates/argos-sprout-pack` — maintainer-only tool that builds and verifies
-  the Sprout pack from a local node; package and binary `argos-sprout-pack`
 - `crates/argos-wallet-import` — read-only legacy wallet file parser
   (zcashd `wallet.dat` via a hand-rolled Berkeley DB 6.2 reader, and
   ZecWallet Lite); package name `argos-wallet-import`
@@ -65,20 +63,13 @@ taken from it. `crates/argos-wallet-import/src/zwl.rs` cites the upstream
 writer instead, `zingolabs/zwl-lib` (MIT), for the ZecWallet Lite byte
 layout, and no hand-built ZWL test stream is copied from zewif-zwl.
 
-`czkey` (encrypted Sprout spending keys) is decrypted here and nowhere
-else in the ecosystem: Zallet drops Sprout keys during migration and
-`zewif-zcashd` returns an explicit error for them. Its tests
-(`crates/argos-wallet-import/tests/sprout_key_is_genuine.rs` and
-`transparent_key_is_genuine.rs` re-derive each recovered key and check it
-against the address it was stored under) are therefore the only
-specification that exists — do not weaken them.
-
-Golden fixtures come from a pinned `zcashd:v6.20.0` regtest chain with
-Canopy held inactive, which is the only condition under which zcashd will
-still run `GenerateNewSproutZKey`. No fixture holds funded Sprout notes —
-zcashd refuses all inbound Sprout transfers regardless of Canopy height —
-so the note/witness preservation path is validated structurally, not
-against a real note. See `tests/regtest/fixtures/README.md`.
+Sprout recovery was removed after NU7 disallowed v4 transactions. The wallet
+parser recognizes `zkey`/`czkey` spending-key records only to produce a count
+and `keys::SPROUT_UNSPENDABLE_NOTICE`; it does not decode Sprout keys, notes,
+witnesses, or transactions. Supported transparent and Sapling records in the
+same file continue through normal recovery. The mixed Sprout-era golden
+fixtures remain useful for testing that boundary; see
+`tests/regtest/fixtures/README.md`.
 
 Three ZecWallet Lite fixtures (`crates/argos-wallet-import/tests/fixtures/zwl-*.dat`)
 are written by the upstream writer, `zwl-lib`'s `LightWallet::write`, from
@@ -133,8 +124,7 @@ all: `argos_core::sapling_key` decodes zcashd's bech32
 file produces, so the scan and sweep paths cannot tell the two apart. CLI
 `--sapling-key-file` (a file, never a flag — a spending key in argv lands in
 shell history and `ps`); GUI a paste field on the wallet screen. Both are
-combinable with a wallet file and deduplicate against it. Unlike Sprout's
-base58 constants, the human-readable prefixes come from
+combinable with a wallet file and deduplicate against it. The human-readable prefixes come from
 `zcash_protocol::constants`, so there is no unverifiable-constant caveat —
 but the test pinning them to the ZIP-32 literals stays, so an upstream rename
 cannot silently move Argos off the prefix users hold. Viewing keys
@@ -165,148 +155,6 @@ authorizing key through the low-level PCZT signer, and preserves every txid
 if a later account or the transparent leg fails. Transparent UTXOs use the
 direct recovery path and may produce a separate transaction.
 
-**Sprout is generally available, and Argos's scope for it ends at Sapling.**
-It is part of normal builds rather than an opt-in product tier. This
-is a decision, not a gap. A JoinSplit exists only in a v4 transaction and
-Orchard actions only in v5 (`zcash_primitives`' `read_v5` hardcodes
-`sprout_bundle: None`), so Sprout cannot reach Orchard in one transaction.
-Doing the second hop inside Argos would mean holding an intermediate
-spending key of its own — so instead the sweep pays the Sapling receiver of
-the address the user supplied, under their keys, and the Orchard hop is
-theirs. Argos never custodies value, and a crash mid-flow strands nothing.
-Do not "finish the chain" by adding a carrier key; the wording in
-`sprout_sweep::SPROUT_LANDS_IN_SAPLING` exists to explain this and is
-tested for naming the real constraint.
-
-Two paths reach a Sprout note. A `wallet.dat` that zcashd ever synced
-carries a cached witness, and consensus accepts the historical anchor it
-produces — proven in `sprout_stale_anchor`, where a spend against a root
-the chain had already passed was accepted and mined. That path needs no
-scan and is what `sweep-sprout` uses. A wallet whose keys were imported
-without a rescan has no note data, and only the full-block scan can find
-its notes -- Sprout notes are discoverable solely by trial-decrypting every
-JoinSplit, and no Sprout address index exists anywhere. That scan
-(`sprout_scan` + `p2p`) is wired into both surfaces — `argos scan-sprout`
-and the GUI's scan panel — checkpoints to disk, and resumes from a stored
-block cursor. It runs from height 1 to the chain tip on every network. Do
-not bound it at Canopy: ZIP 211 only requires `vpub_old == 0`, so JoinSplits
-after Canopy still spend and create Sprout notes (mainnet has them from
-1,046,418), and stopping early made post-Canopy spends invisible — a
-migrated note read as spendable. Past the last pinned checkpoint the walk is
-tied to a `TipAnchor` from lightwalletd; see `sprout_scan_run`. Its tree is validated against zcashd's own root, and it has
-been driven end to end on regtest: given only a spending key it finds a
-planted note and derives a witness anchoring to the chain's root.
-
-**A Sprout pack can replace most of that walk** (`sprout_pack`,
-`docs/sprout-pack.md`): every block's JoinSplits from height 1 to a fixed
-end height, in 100,000-block chunks, behind a manifest whose SHA-256 is
-pinned per release in `PINNED_PACKS`. `SproutScanOptions::pack` feeds it
-through `consume_page` (so checkpoint pins and cursor continuity apply), and
-the walk continues over p2p from the pack's end hash, so the "do not bound
-it at Canopy" rule is untouched. Two invariants: the scan checkpoint is
-saved only at chunk boundaries after the chunk's hash is confirmed, so a
-corrupt chunk keeps nothing; and a mainnet scan refuses an unpinned pack
-(checked in `SproutPack::open` and again in `feed_pack`). A bad pack cannot
-mark a live note spent (nullifiers are keyed by `a_sk`), but it can hide
-notes (ciphertexts are not bound by the tree root) or omit real spends.
-`PINNED_PACKS` holds one mainnet pack (blocks 1 to 3,500,000), whose
-manifest hash two Zebra nodes in different regions reproduced. Reproduction
-is not enough on its own, since identical builders reproduce identical bugs:
-no release may ship with a pin until the builder is checked independently
-(regtest pack test plus a mainnet pack-vs-p2p equivalence scan). The
-regtest test (`sprout_pack_regtest`, run in CI) passes; the mainnet scan for
-the 3,500,000 pin has not been run yet. No live node returns the Sprout
-tree root any more (Zebra omits it from `z_gettreestate`), so `verify`
-rebuilding it from the chunks is the only root check. `feed_pack` yields after every
-page so aborting a scan (the GUI's release) stops it promptly. The
-pack is built by the maintainer-only `argos-sprout-pack` binary
-(`sprout_pack_build`), which dials only the named nodes
-(`connect_to_listed_except`) and reuses the scan's `PageFetcher` checks.
-
-The Sprout checkpoint is spend-capable: it contains raw spending keys,
-note plaintexts, and witnesses. `save_checkpoint` creates it atomically at
-`0600` on Unix. Nothing deletes it automatically: `discard_checkpoint` has
-no caller outside tests, so it outlives a completed sweep and the user
-removes it once every saved transaction has fresh, corroborated,
-`MIN_DISCARD_CONFIRMATIONS`-deep mined evidence (`fresh_all_mined`). Do not
-describe it as mere progress metadata or fold it into the ordinary
-FVK-only workspace claim.
-
-**Argos takes a `wallet.dat` or a raw `zkey`, and nothing else.** Not a
-txid, not a node URL. `sprout_key` decodes zcashd's `SK…`/`ST…` form, and
-`--sprout-key-file` (a file, never a flag — a spending key in argv lands in
-shell history and `ps`) feeds the scan. A targeted lookup keyed on the
-paying transaction would be far cheaper than the scan, but it needs a txid
-the user has no way to know, so it is not a route.
-
-**A balance reported from a wallet file alone is the file's claim, not a
-fact.** `sprout_recovery` proves a note is internally self-consistent, not
-that its JoinSplit is on-chain — everything it checks comes from the file.
-A crafted `wallet.dat` can therefore show a phantom balance; consensus
-rejects the sweep, so no funds move, but the number is not trustworthy
-until then. The full-block scan derives everything from the chain and is
-immune.
-
-**Spent status on the wallet-file path is the wallet's own record.**
-zcashd keeps a `CSproutNoteData` for every note it ever received
-(`spentHeight` is memory-only), so `recover_spendable_sprout_notes`
-recomputes it: a note is spent when `PRF^nf(a_sk, rho)` appears in a
-JoinSplit of a transaction the wallet recorded as mined (`hashBlock`
-non-null, `nIndex != -1`). Never count an unmined transaction's
-nullifiers — zcashd keeps expired `z_sendmany`s forever, and treating them
-as spends hides a live note with no way back, which is worse than a
-phantom balance. What the file cannot see (spends from another copy of the
-wallet) is handled at the sweep: every note is tried, and a refusal about
-the note itself — a spent nullifier, an unknown anchor, or a ZIP-401
-eviction, classified from the node's reject reason by `classify_refusal`,
-never from `error_code` alone — is journaled as `Rejected` with the node's
-reason and carried past (`run_sweep` reads the reply through
-`RecordingSubmitter`, because the shared broadcast classifier does not know
-these Sprout reasons). Spent-note refusals never stop it, however many come
-in a row; unknown-anchor ones do after `UNKNOWN_ANCHOR_BREAKER` in a row
-while nothing has been accepted, since that pattern is the server, not the
-notes. A node saying it already has this exact transaction
-(`txn-already-known` and kin) is `SubmissionUnknown` until an observation
-places it. Everything else stops the sweep, because it would repeat for every
-remaining note at the cost of a proving run each: `-10`/`-28` (node not
-ready, by code), expiry, any unrecognised reason, a build failure (the
-post-proof failures are about the destination and bundle, not the note),
-and a transport error (which cannot say whether the transaction landed).
-The tip, expiry height and branch id are read before every note. The loop
-is `run_sweep`, generic over `SweepNode`, and is tested with a scripted
-node — keep new sweep behaviour behind it and tested that way.
-
-A full-block scan of the same keys outranks the file for every spend it
-saw. `sprout_scan_run::chain_spends` reads the checkpoint `scan-sprout`
-leaves in the data directory (same key-set fingerprint, same network and
-key checks as resume, via the shared `load_checkpoint`), and
-`recover_spendable_sprout_notes_with_chain` marks any note whose nullifier
-it saw as spent (`SpentEvidence::Chain`). The rule is one-way: absence from
-the scan proves nothing, since the wallet may have spent after the height
-the scan reached, so a spend the wallet recorded still stands.
-
-Surfaces look the scan up only through `chain_spends_for_wallet`. With no
-checkpoint for exactly the wallet's keys it uses one whose key set is a
-strict superset (a scan run with keys typed in beside the wallet's) — never
-a mere overlap: holding every one of the wallet's `a_sk` is what makes a
-planted checkpoint self-defeating. Parsed evidence is cached in
-`ChainSpendsCache`, keyed by path and network and validated by size and
-mtime, because the GUI asks twice per wallet open.
-
-Sprout sweeps are journaled. `sprout_sweep_journal::SweepJournal` uses a
-version-4 lifecycle journal inside the authenticated per-key artifact root.
-Its header binds the network, full key-set fingerprint, lineage anchor, and
-artifact generation. Exact signed bytes are persisted before any send, and
-every transition is appended and synced. The journal holds outpoints, values,
-raw transactions, and observations — no `a_sk` and no note plaintexts — so it
-is linkable through nullifiers but not spend-capable. Direct legacy journals
-and in-root versions 1–3 are preserved and refused rather than migrated. The
-journal is never deleted: it prevents a repeat run from proving or rebuilding
-a note whose transaction may still mine. The spend-capable scan checkpoint is
-separate and is removed automatically only through guarded cleanup after the
-same canonical mined evidence survives two independently corroborated,
-depth-100 reconciliation rounds for every manifested note.
-
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
 `transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an
@@ -325,8 +173,8 @@ two — always ask `BundleType::num_outputs` rather than assuming; and
 emits testnet-prefixed addresses under regtest.
 
 CLI: `--wallet-file <PATH>` (conflicts with `--seed-file`) plus an
-`inspect-wallet` subcommand that reports recovered key counts, Sprout
-addresses, and unread-record diagnostics with no network access. The
+`inspect-wallet` subcommand that reports recovered key counts, recognized
+Sprout records with an unspendable notice, and unread-record diagnostics with no network access. The
 passphrase is prompt-only — never a flag, so it cannot reach shell history
 or `ps` (T-S6). Wired in `crates/zeck-cli/src/main.rs`; covered by
 `crates/zeck-cli/tests/wallet_file_cli.rs`, which runs the real binary

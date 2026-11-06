@@ -3,14 +3,14 @@
 //! This crate exists to handle other people's Zcash spending keys. A single
 //! `tracing::debug!`, `dbg!`, `unwrap` panic message, or `{:?}` in an error
 //! path is enough to write one to a log file or a crash report, and a
-//! recovered Sprout key is unrecoverable once disclosed.
+//! disclosed spending key compromises the funds it controls.
 //!
 //! The guard is easy to lose: swapping a `Secret<T>` field for a plain
 //! `Vec<u8>`, or adding `#[derive(Debug)]` to a struct that grows a key
 //! field later, both reintroduce the leak with no compiler complaint. These
 //! tests fail loudly if that happens.
 
-use argos_wallet_import::keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey};
+use argos_wallet_import::keys::{ImportedKeys, Provenance, SaplingKey, TransparentKey};
 use argos_wallet_import::zcashd::{derive_master_key, MkeyRecord};
 use argos_wallet_import::ImportDiagnostic;
 use secrecy::{Secret, SecretString};
@@ -18,7 +18,6 @@ use secrecy::{Secret, SecretString};
 /// Distinctive byte patterns, so a leak is unambiguous in the rendered
 /// output rather than something that might coincidentally appear.
 const TRANSPARENT_MARKER: u8 = 0xAB;
-const SPROUT_MARKER: u8 = 0xCD;
 const SAPLING_MARKER: u8 = 0xEF;
 
 /// Passphrase every encrypted golden fixture was created with.
@@ -65,21 +64,6 @@ fn transparent_key_debug_is_redacted() {
 }
 
 #[test]
-fn sprout_key_debug_is_redacted() {
-    // The spending key must be redacted. The payment address is public and
-    // may legitimately appear — it is what the user needs to identify the
-    // funds.
-    let k = SproutKey {
-        a_sk: Secret::new([SPROUT_MARKER; 32]),
-        address: [0x11; 64],
-        provenance: Provenance::Standalone,
-        created_at: None,
-    };
-    let rendered = format!("{k:?}");
-    assert_no_marker(&rendered, SPROUT_MARKER, "sprout a_sk");
-}
-
-#[test]
 fn sapling_key_debug_is_redacted() {
     // 169 bytes: the real serialized extended spending key length.
     let k = SaplingKey {
@@ -94,8 +78,7 @@ fn sapling_key_debug_is_redacted() {
 #[test]
 fn master_key_debug_is_redacted() {
     // The master key unlocks every encrypted record in the wallet — every
-    // transparent key, every Sapling key, and the encrypted Sprout keys
-    // this project exists to recover. Leaking it is strictly worse than
+    // transparent key and every Sapling key. Leaking it is strictly worse than
     // leaking any single key, and it now has a public `expose_secret`
     // accessor, so the type is a live rendering path.
     // Derive from a real zcashd-encrypted wallet rather than a synthetic
@@ -136,12 +119,6 @@ fn an_imported_key_set_does_not_leak_through_debug() {
         provenance: Provenance::HdDerived,
         created_at: None,
     });
-    keys.sprout.push(SproutKey {
-        a_sk: Secret::new([SPROUT_MARKER; 32]),
-        address: [0x11; 64],
-        provenance: Provenance::Standalone,
-        created_at: None,
-    });
     keys.sapling.push(SaplingKey {
         extsk: Secret::new(vec![SAPLING_MARKER; 169]),
         provenance: Provenance::Standalone,
@@ -154,7 +131,6 @@ fn an_imported_key_set_does_not_leak_through_debug() {
     // rather than relying on a comment that it only prints counts.
     let aggregate = format!("{keys:?}");
     assert_no_marker(&aggregate, TRANSPARENT_MARKER, "transparent (aggregate)");
-    assert_no_marker(&aggregate, SPROUT_MARKER, "sprout a_sk (aggregate)");
     assert_no_marker(&aggregate, SAPLING_MARKER, "sapling extsk (aggregate)");
     assert!(
         aggregate.contains('1'),
@@ -165,9 +141,6 @@ fn an_imported_key_set_does_not_leak_through_debug() {
     // to delegate to them.
     for k in &keys.transparent {
         assert_no_marker(&format!("{k:?}"), TRANSPARENT_MARKER, "transparent");
-    }
-    for k in &keys.sprout {
-        assert_no_marker(&format!("{k:?}"), SPROUT_MARKER, "sprout a_sk");
     }
     for k in &keys.sapling {
         assert_no_marker(&format!("{k:?}"), SAPLING_MARKER, "sapling extsk");

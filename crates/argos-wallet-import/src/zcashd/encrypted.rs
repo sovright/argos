@@ -3,20 +3,17 @@
 //! Each record's IV is the first 16 bytes of a 32-byte digest computed
 //! from that record's own public identifier — which is why the master key
 //! alone is enough to decrypt every record. zcashd (`crypter.cpp`,
-//! `DecryptSecret`/`DecryptKey`/`DecryptSproutSpendingKey`/
+//! `DecryptSecret`/`DecryptKey`/
 //! `DecryptSaplingSpendingKey`) uses a *different* digest per record type:
 //!
 //! - `ckey`: `SHA256d(serialized pubkey)` (`CPubKey::GetHash`)
-//! - `czkey`: `SHA256d(serialized Sprout payment address)`
-//!   (`SproutPaymentAddress::GetHash`)
 //! - `csapzkey`: `BLAKE2b-256("ZcashSaplingFVFP", ak || nk || ovk)`
 //!   (`SaplingFullViewingKey::GetFingerprint`) — the fingerprint of the
 //!   *full viewing key*, not a hash of the incoming viewing key that
 //!   appears in the record key.
 //!
-//! `czkey` — encrypted Sprout spending keys — is handled here. Zallet
-//! drops Sprout keys during migration and `zewif-zcashd` returns an error
-//! for them, so this is the only implementation that exists.
+//! Retired Sprout records are recognized by the plaintext collector without
+//! decrypting their values.
 
 use aes::cipher::{block_padding::Pkcs7, generic_array::GenericArray, BlockDecryptMut, KeyIvInit};
 use secrecy::Secret;
@@ -27,7 +24,7 @@ use crate::{
     bdb::RawRecord,
     error::ImportDiagnostic,
     identity,
-    keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
+    keys::{ImportedKeys, Provenance, SaplingKey, TransparentKey},
     secret_bytes::SecretArray,
     zcashd::{
         crypto::MasterKey,
@@ -53,8 +50,7 @@ fn iv_from_digest(digest: &[u8; 32]) -> [u8; 16] {
     iv
 }
 
-/// IV identifier for `ckey`/`czkey`: double-SHA256 of the record's public
-/// identifier (pubkey or Sprout payment address).
+/// IV identifier for `ckey`: double-SHA256 of the public key.
 fn sha256d_iv(identifier: &[u8]) -> [u8; 16] {
     let first = Sha256::digest(identifier);
     let second = Sha256::digest(first);
@@ -127,65 +123,6 @@ pub fn collect_encrypted(
         };
 
         match rec.record_type.as_str() {
-            // Key: "czkey" || SproutPaymentAddress (64 bytes)
-            // Value: receiving key `rk` || encrypted a_sk.
-            // See zcash walletdb.cpp:125 —
-            //   Write(("czkey", addr), make_pair(rk, vchCryptedSecret)).
-            // `rk` is `libzcash::ReceivingKey`, which subclasses `uint256`
-            // (sprout.hpp:46) — a fixed-size type with NO CompactSize
-            // prefix, unlike `vchCryptedSecret`, a `std::vector<uchar>`
-            // which does get one. So the layout is 32 raw bytes, then a
-            // length-prefixed ciphertext — not two length-prefixed fields.
-            "czkey" => {
-                let addr: Option<[u8; 64]> = rec.rest.get(..64).and_then(|s| s.try_into().ok());
-                let Some(address) = addr else {
-                    out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
-                        record_type: "czkey".to_owned(),
-                        reason: "payment address is not 64 bytes".to_owned(),
-                    });
-                    continue;
-                };
-
-                // Skip the fixed-size 32-byte rk, then read the ciphertext.
-                let ct = value
-                    .get(32..)
-                    .and_then(read_length_prefixed)
-                    .map(|(ct, _)| ct);
-
-                let Some(ct) = ct else {
-                    out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
-                        record_type: "czkey".to_owned(),
-                        reason: "value is not a (rk, ciphertext) pair".to_owned(),
-                    });
-                    continue;
-                };
-
-                match decrypt(master, sha256d_iv(&address), ct)
-                    .and_then(|p| Some(SecretArray::new(p.as_slice().try_into().ok()?)))
-                {
-                    Some(a_sk) => {
-                        if let Some(a_sk) = identity::retain_sprout_secret(a_sk, &address) {
-                            out.sprout.push(SproutKey {
-                                a_sk,
-                                address,
-                                provenance: Provenance::Standalone,
-                                created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
-                            });
-                        } else {
-                            out.diagnostics
-                                .push(ImportDiagnostic::PublicIdentifierMismatch {
-                                    record_type: "czkey".to_owned(),
-                                    identifier: "payment address",
-                                });
-                        }
-                    }
-                    None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
-                        record_type: "czkey".to_owned(),
-                        reason: "ciphertext did not decrypt to a 32-byte key".to_owned(),
-                    }),
-                }
-            }
-
             // Key: "ckey" || serialized public key, where the serialized
             // public key is itself CompactSize(len) || raw pubkey bytes
             // (`CPubKey::Serialize`). zcashd derives the IV from
@@ -338,7 +275,7 @@ pub fn collect_encrypted(
 mod tests {
     use super::*;
     use aes::cipher::BlockEncryptMut;
-    use secrecy::{ExposeSecret, SecretString};
+    use secrecy::SecretString;
 
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
@@ -355,41 +292,6 @@ mod tests {
     fn encrypt(master: &MasterKey, iv: [u8; 16], plaintext: &[u8]) -> Vec<u8> {
         let key = *master.expose_secret();
         Aes256CbcEnc::new(&key.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(plaintext)
-    }
-
-    #[test]
-    fn authenticated_overlong_sprout_plaintext_is_rejected() {
-        let (mut pairs, master) = unlock("sprout-encrypted");
-        let mut before = ImportedKeys::default();
-        collect_encrypted(&pairs, &master, &mut before);
-
-        let record = pairs
-            .iter_mut()
-            .find(|record| parse_record_key(&record.key).is_some_and(|r| r.record_type == "czkey"))
-            .expect("fixture has a czkey");
-        let parsed = parse_record_key(&record.key).unwrap();
-        let address: [u8; 64] = parsed.rest[..64].try_into().unwrap();
-        let ct = read_length_prefixed(&record.value()[32..]).unwrap().0;
-        let mut plaintext = decrypt(&master, sha256d_iv(&address), ct)
-            .unwrap()
-            .as_slice()
-            .to_vec();
-        assert_eq!(plaintext.len(), 32);
-        plaintext.push(0xA5);
-        let ct = encrypt(&master, sha256d_iv(&address), &plaintext);
-        let mut value = record.value()[..32].to_vec();
-        value.push(ct.len() as u8);
-        value.extend_from_slice(&ct);
-        record.replace_value(value);
-
-        let mut after = ImportedKeys::default();
-        collect_encrypted(&pairs, &master, &mut after);
-        assert_eq!(after.sprout.len() + 1, before.sprout.len());
-        assert!(after.diagnostics.iter().any(|diagnostic| matches!(
-            diagnostic,
-            ImportDiagnostic::DecryptionFailed { record_type, reason }
-                if record_type == "czkey" && reason.contains("32-byte")
-        )));
     }
 
     #[test]
@@ -422,43 +324,6 @@ mod tests {
             ImportDiagnostic::DecryptionFailed { record_type, reason }
                 if record_type == "ckey" && reason.contains("32-byte")
         )));
-    }
-
-    #[test]
-    fn mismatched_encrypted_sprout_key_drops_temporary_owner() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-
-        let (mut pairs, master) = unlock("sprout-encrypted");
-        let record = pairs
-            .iter_mut()
-            .find(|record| parse_record_key(&record.key).is_some_and(|r| r.record_type == "czkey"))
-            .expect("fixture has a czkey");
-        let old_address: [u8; 64] = parse_record_key(&record.key).unwrap().rest[..64]
-            .try_into()
-            .unwrap();
-        let old_ct = read_length_prefixed(&record.value()[32..]).unwrap().0;
-        let plaintext = decrypt(&master, sha256d_iv(&old_address), old_ct).unwrap();
-        let address_last = 1 + "czkey".len() + 63;
-        record.key[address_last] ^= 1;
-        let new_address: [u8; 64] = parse_record_key(&record.key).unwrap().rest[..64]
-            .try_into()
-            .unwrap();
-        let ct = encrypt(&master, sha256d_iv(&new_address), plaintext.as_slice());
-        let mut value = record.value()[..32].to_vec();
-        value.push(ct.len() as u8);
-        value.extend_from_slice(&ct);
-        record.replace_value(value);
-
-        let dropped = Arc::new(AtomicBool::new(false));
-        let mut out = ImportedKeys::default();
-        SecretArray::<32>::test_with_drop_probe(Arc::clone(&dropped), || {
-            collect_encrypted(&pairs, &master, &mut out);
-        });
-        assert!(out.sprout.is_empty());
-        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -501,28 +366,6 @@ mod tests {
     }
 
     #[test]
-    fn decrypts_encrypted_sprout_spending_keys() {
-        // The capability no other software has.
-        let (pairs, master) = unlock("sprout-encrypted");
-        let mut out = ImportedKeys::default();
-        collect_encrypted(&pairs, &master, &mut out);
-        assert!(!out.sprout.is_empty(), "no czkey records were decrypted");
-    }
-
-    #[test]
-    fn decrypted_sprout_key_matches_the_plaintext_wallet_shape() {
-        let (pairs, master) = unlock("sprout-encrypted");
-        let mut out = ImportedKeys::default();
-        collect_encrypted(&pairs, &master, &mut out);
-        for k in &out.sprout {
-            // a_sk is 32 bytes and must not be all zeros — an all-zero key
-            // is the classic signature of decrypting into a zeroed buffer.
-            assert_ne!(k.a_sk.expose_secret(), &[0u8; 32]);
-            assert_ne!(k.address, [0u8; 64]);
-        }
-    }
-
-    #[test]
     fn decrypts_encrypted_transparent_and_sapling_keys() {
         let (pairs, master) = unlock("modern-encrypted");
         let mut out = ImportedKeys::default();
@@ -533,11 +376,11 @@ mod tests {
 
     #[test]
     fn a_record_that_fails_to_decrypt_is_reported_not_fatal() {
-        let (mut pairs, master) = unlock("sprout-encrypted");
-        // Corrupt one czkey value.
+        let (mut pairs, master) = unlock("modern-encrypted");
+        // Corrupt one ckey value.
         for record in pairs.iter_mut() {
             if crate::zcashd::parse_record_key(&record.key)
-                .map(|r| r.record_type == "czkey")
+                .map(|r| r.record_type == "ckey")
                 .unwrap_or(false)
             {
                 record.value_mut().iter_mut().for_each(|b| *b ^= 0xFF);

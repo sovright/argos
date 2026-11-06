@@ -74,10 +74,6 @@ impl<const N: usize> SecretArray<N> {
         &self.bytes
     }
 
-    pub(crate) fn as_mut_array(&mut self) -> &mut [u8; N] {
-        &mut self.bytes
-    }
-
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
@@ -217,15 +213,13 @@ impl SecretBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroize::{Zeroize, ZeroizeOnDrop};
+    use zeroize::ZeroizeOnDrop;
 
     fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
     #[test]
     fn parser_boundaries_require_secret_buffers() {
         assert_zeroize_on_drop::<SecretBytes>();
-        fn assert_zeroize<T: Zeroize>() {}
-        assert_zeroize::<x25519_dalek::StaticSecret>();
     }
 
     #[test]

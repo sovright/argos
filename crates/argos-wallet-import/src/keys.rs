@@ -125,94 +125,8 @@ impl std::fmt::Debug for SaplingKey {
     }
 }
 
-pub struct SproutKey {
-    /// 32-byte Sprout spending key a_sk.
-    pub a_sk: Secret<[u8; 32]>,
-    /// 64-byte Sprout payment address this key unlocks.
-    pub address: [u8; 64],
-    pub provenance: Provenance,
-    /// When zcashd recorded creating this key, in Unix seconds, from the
-    /// wallet's `CKeyMetadata`. `None` when the file does not say — no
-    /// metadata record, zcashd's own "unknown" marker (`importprivkey` /
-    /// `z_importkey` write 1), or a record that did not parse — and always
-    /// `None` for a key that arrived as text rather than in a wallet file.
-    ///
-    /// The wallet's own claim, from the machine's clock at the time: a lower
-    /// bound on where funds can be is derived from it with a margin, never
-    /// used as a height directly.
-    pub created_at: Option<i64>,
-}
-
-impl std::fmt::Debug for SproutKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SproutKey")
-            .field("a_sk", &"<redacted>")
-            .field("address", &self.address)
-            .field("provenance", &self.provenance)
-            .field("created_at", &self.created_at)
-            .finish()
-    }
-}
-
-/// A Sprout note and its cached witness, preserved verbatim from the
-/// wallet file.
-///
-/// Sub-spec 3's cost depends on whether these cached witnesses can be
-/// brought forward instead of indexing from genesis. Preserving them here
-/// is nearly free; discarding them at this layer would be irreversible.
-///
-/// Holds no secret material — witnesses and addresses are public — so it
-/// keeps the ordinary derives.
-#[derive(Debug, Clone)]
-pub struct SproutNoteData {
-    pub address: [u8; 64],
-    pub nullifier: Option<[u8; 32]>,
-    /// Opaque serialized witness. Not interpreted in sub-spec 1.
-    pub witness: Vec<u8>,
-    /// Which JoinSplit output this note came out of.
-    ///
-    /// Preserved because it is the only link from a note to the ciphertext
-    /// that carries its plaintext. The note records hold `value`, `rho` and
-    /// `r` nowhere; those live in the JoinSplit's `ciphertexts[n]`, and
-    /// nothing else in the wallet says which output of which JoinSplit a
-    /// given note came from.
-    pub outpoint: JsOutPoint,
-}
-
-/// zcashd's `JSOutPoint`: the transaction, the JoinSplit within it, and the
-/// output within that JoinSplit (always 0 or 1 — `ZC_NUM_JS_OUTPUTS` is 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JsOutPoint {
-    pub txid: [u8; 32],
-    pub js_index: u64,
-    pub output_index: u8,
-}
-
-/// The public fields of one `JSDescription`, captured from a `tx` record.
-///
-/// Everything here is public consensus data — it is on-chain in the clear.
-/// The note plaintexts inside `ciphertexts` are not readable without a
-/// Sprout spending key, so this struct is not secret-bearing and keeps the
-/// ordinary derives.
-///
-/// `proof` and `macs` are deliberately not captured: recovery re-proves
-/// from scratch and never re-checks the original proof.
-#[derive(Debug, Clone)]
-pub struct SproutJoinSplit {
-    pub txid: [u8; 32],
-    pub js_index: u64,
-    pub anchor: [u8; 32],
-    pub nullifiers: [[u8; 32]; 2],
-    pub commitments: [[u8; 32]; 2],
-    pub ephemeral_key: [u8; 32],
-    pub random_seed: [u8; 32],
-    /// Per-transaction, not per-JoinSplit, but copied onto each one because
-    /// `hSig` needs it alongside this JoinSplit's own `random_seed` and
-    /// nullifiers, and carrying it here keeps that computation local.
-    pub joinsplit_pubkey: [u8; 32],
-    /// The two note ciphertexts, `ZC_NOTECIPHERTEXT_SIZE` (601) bytes each.
-    pub ciphertexts: [Vec<u8>; 2],
-}
+/// Sprout cannot be spent under the NU7 consensus rules. Shared by frontends.
+pub const SPROUT_UNSPENDABLE_NOTICE: &str = "This wallet contains Sprout records. Sprout funds are unspendable under the NU7 consensus rules. Argos can still recover supported transparent and Sapling funds from this wallet. Mixed wallets previously scanned with Sprout keys use a new workspace and must rescan supported funds. Reconcile previously broadcast transactions before recovering again.";
 
 /// No `Debug`/`Clone` derive: it holds `Vec<TransparentKey>` etc., which
 /// carry `Secret`s. Add a manual redacted impl or a clone path if a caller
@@ -221,17 +135,9 @@ pub struct SproutJoinSplit {
 pub struct ImportedKeys {
     pub transparent: Vec<TransparentKey>,
     pub sapling: Vec<SaplingKey>,
-    pub sprout: Vec<SproutKey>,
-    pub sprout_notes: Vec<SproutNoteData>,
-    /// Every JoinSplit in every `tx` record the wallet holds, indexed by
-    /// `SproutNoteData::outpoint`. Kept flat rather than nested under the
-    /// notes because one JoinSplit's `hSig` covers both of its outputs.
-    pub sprout_joinsplits: Vec<SproutJoinSplit>,
-    /// Transactions in `sprout_joinsplits` that the wallet never recorded as
-    /// mined: a null `hashBlock`, or `nIndex == -1`. zcashd writes a
-    /// transaction before relaying it and keeps it after it expires, so
-    /// these nullifiers are not evidence of a spend.
-    pub sprout_unconfirmed_txids: Vec<[u8; 32]>,
+    /// Recognized `zkey` / `czkey` records, not recovered spending authority.
+    /// Values are neither parsed nor decrypted.
+    pub sprout_records: usize,
     /// A recovered BIP-39 mnemonic, when the source wallet held a seed
     /// rather than (or in addition to) flat key material — currently only
     /// ZWL, whose HD keys are re-derived from this seed rather than stored
@@ -272,14 +178,11 @@ impl ImportedKeys {
     /// HD-derived keys live only in the seed, not the file. See the
     /// `mnemonic` field's docs.
     pub fn is_empty(&self) -> bool {
-        self.transparent.is_empty()
-            && self.sapling.is_empty()
-            && self.sprout.is_empty()
-            && self.mnemonic.is_none()
+        self.transparent.is_empty() && self.sapling.is_empty() && self.mnemonic.is_none()
     }
 
     pub fn total_keys(&self) -> usize {
-        self.transparent.len() + self.sapling.len() + self.sprout.len()
+        self.transparent.len() + self.sapling.len()
     }
 
     /// The "Seed phrase" line for a verified zcashd seed, shared by the CLI
@@ -323,16 +226,11 @@ impl ImportedKeys {
         self.grades().max().unwrap_or(ImportCoverage::Complete)
     }
 
-    /// Each diagnostic's cost to coverage, for this wallet. An unreadable
-    /// transaction costs only Sprout note data — every other pool is scanned
-    /// from the chain — so it costs nothing to a wallet with no Sprout keys.
+    /// Each diagnostic's cost to supported recovery coverage, for this wallet.
     fn grades(&self) -> impl Iterator<Item = ImportCoverage> + '_ {
         self.diagnostics
             .iter()
             .map(|d| match ImportCoverage::of(d) {
-                ImportCoverage::SproutNoteDataUnread if self.sprout.is_empty() => {
-                    ImportCoverage::Complete
-                }
                 ImportCoverage::SeedNotRecovered
                     if matches!(
                         d,
@@ -349,9 +247,8 @@ impl ImportedKeys {
     }
 
     /// Every distinct coverage caveat, most severe first, with the call to
-    /// action once at the end — not only the worst one. A file with both
-    /// unknown records and an unreadable transaction must say both, and two
-    /// failure modes neither of which is worse than the other — unscanned
+    /// action once at the end — not only the worst one. Two distinct
+    /// failure modes — unscanned
     /// unified accounts and an unreadable key record — call for different
     /// things.
     pub fn coverage_notice(&self) -> Option<String> {
@@ -381,7 +278,7 @@ const KEEP_THE_FILE: &str = "Keep the original wallet file.";
 /// than none. Ordered from least to most severe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ImportCoverage {
-    /// Every record that can hold a key was read.
+    /// Every supported key record was read.
     Complete,
     /// Complete as far as can be checked, beside a pre-5.0 seed whose
     /// individually stored keys have no counters to check them against.
@@ -389,10 +286,6 @@ pub enum ImportCoverage {
     /// Only records of unrecognised types were skipped. They may hold
     /// nothing of value, but we cannot say so.
     UnknownRecordsSkipped,
-    /// A transaction record could not be read. Every key was, but Sprout
-    /// notes the transaction received or spent are missing from what the
-    /// file alone reports.
-    SproutNoteDataUnread,
     /// A record known to hold key material could not be read or decrypted.
     KeysUnread,
     /// The file's own seed chain says keys were derived that were not
@@ -429,10 +322,9 @@ impl ImportCoverage {
             | ImportDiagnostic::UnsupportedWalletVersion { .. }
             | ImportDiagnostic::UnrecoveredStandaloneKey { .. }
             | ImportDiagnostic::MissingSpendAuthority { .. } => Self::KeyMaterialMissing,
-            // A transaction holds note data, never keys: every key was
-            // still read, and the full-block scan recovers the notes.
+            // Supported pools are scanned from the chain, not wallet tx records.
             ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx" => {
-                Self::SproutNoteDataUnread
+                Self::Complete
             }
             ImportDiagnostic::UnparseableRecord { .. }
             | ImportDiagnostic::DecryptionFailed { .. }
@@ -472,11 +364,6 @@ impl ImportCoverage {
                  are listed with the other diagnostics; if any held keys, those keys \
                  exist only in the original wallet file.",
             ),
-            Self::SproutNoteDataUnread => Some(
-                "Some transaction records could not be read. Every key was read, but \
-                 Sprout notes those transactions received or spent are missing from what \
-                 this file reports; the full-block Sprout scan recovers them from the chain.",
-            ),
             Self::KeysUnread => Some(
                 "Incomplete — some key records could not be read, so recovered keys \
                  and balances may be missing funds.",
@@ -510,7 +397,7 @@ impl ImportCoverage {
     /// Whether the notice must follow the user to the totals and the
     /// delete-workspace screen, not just the import summary.
     pub fn may_hide_funds(self) -> bool {
-        self >= Self::SproutNoteDataUnread
+        self >= Self::KeysUnread
     }
 }
 
@@ -523,11 +410,7 @@ impl std::fmt::Debug for ImportedKeys {
         f.debug_struct("ImportedKeys")
             .field("transparent", &format!("<{} keys>", self.transparent.len()))
             .field("sapling", &format!("<{} keys>", self.sapling.len()))
-            .field("sprout", &format!("<{} keys>", self.sprout.len()))
-            .field(
-                "sprout_notes",
-                &format!("<{} notes>", self.sprout_notes.len()),
-            )
+            .field("sprout_records", &self.sprout_records)
             .field(
                 "mnemonic",
                 &if self.mnemonic.is_some() {
@@ -555,96 +438,15 @@ mod coverage_tests {
         }
     }
 
-    /// [`with`], for a wallet that holds a Sprout key.
-    fn with_sprout(diagnostics: Vec<ImportDiagnostic>) -> ImportedKeys {
-        let mut keys = with(diagnostics);
-        keys.sprout.push(SproutKey {
-            a_sk: secrecy::Secret::new([1; 32]),
-            address: [2; 64],
-            provenance: Provenance::Standalone,
-            created_at: None,
-        });
-        keys
-    }
-
-    /// Kristi's F9 on #239: a `tx` record holds note data, not keys. One old
-    /// unwalkable transaction must not raise a key-loss banner that follows
-    /// the user to every screen.
+    /// Supported balances are reconstructed from the chain. An unreadable
+    /// wallet transaction must not imply that supported keys were lost.
     #[test]
-    fn an_unreadable_transaction_is_not_graded_as_lost_keys() {
-        let tx = ImportDiagnostic::UnparseableRecord {
-            record_type: "tx".to_owned(),
-            reason: "could not be read".to_owned(),
-        };
-        let coverage = with_sprout(vec![tx.clone()]).coverage();
-        assert_eq!(coverage, ImportCoverage::SproutNoteDataUnread);
-        // Round-5 finding 9: a note received in an unreadable transaction is
-        // uncounted money, so the caveat follows the user to the totals and
-        // the delete-workspace screen — worded as note data, not keys.
-        assert!(coverage.may_hide_funds());
-        let notice = coverage.notice().unwrap();
-        assert!(notice.contains("transaction"), "{notice}");
-        assert!(!notice.contains("key records"), "{notice}");
-
-        let zkey = ImportDiagnostic::UnparseableRecord {
-            record_type: "zkey".to_owned(),
-            reason: "truncated".to_owned(),
-        };
-        assert_eq!(
-            with_sprout(vec![tx, zkey]).coverage(),
-            ImportCoverage::KeysUnread,
-            "a real key record still is"
-        );
-    }
-
-    /// Kristi's round-5 finding 9, second half: a file with both unknown
-    /// records and an unreadable transaction showed only the higher grade's
-    /// notice, dropping the other caveat. Every distinct one is shown, most
-    /// severe first, and the call to action once.
-    #[test]
-    fn every_distinct_caveat_is_shown_and_the_call_to_action_once() {
-        let keys = with_sprout(vec![
-            unknown(),
-            ImportDiagnostic::UnparseableRecord {
-                record_type: "tx".to_owned(),
-                reason: "x".to_owned(),
-            },
-            ImportDiagnostic::UnparseableRecord {
-                record_type: "tx".to_owned(),
-                reason: "y".to_owned(),
-            },
-        ]);
-        let notice = keys.coverage_notice().unwrap();
-        let sprout = ImportCoverage::SproutNoteDataUnread.notice().unwrap();
-        let unknown_notice = ImportCoverage::UnknownRecordsSkipped.notice().unwrap();
-        assert!(
-            notice.contains(sprout) && notice.contains(unknown_notice),
-            "{notice}"
-        );
-        assert!(
-            notice.find(sprout) < notice.find(unknown_notice),
-            "most severe first: {notice}"
-        );
-        assert_eq!(notice.matches(sprout).count(), 1, "one notice per grade");
-        assert_eq!(
-            notice.matches("Keep the original wallet file").count(),
-            1,
-            "{notice}"
-        );
-        assert!(with(vec![]).coverage_notice().is_none());
-    }
-
-    /// Kristi's round-6 finding 7: an unreadable transaction costs only
-    /// Sprout note data, and every other pool is scanned from the chain. A
-    /// wallet with no Sprout keys must not be told it was partly recovered —
-    /// a caveat that would sit beside Delete workspace for no reason.
-    #[test]
-    fn an_unreadable_transaction_is_no_caveat_without_sprout_keys() {
+    fn an_unreadable_transaction_is_no_caveat_for_supported_recovery() {
         let keys = with(vec![ImportDiagnostic::UnparseableRecord {
             record_type: "tx".to_owned(),
             reason: "x".to_owned(),
         }]);
-        assert!(keys.sprout.is_empty());
+        assert_eq!(keys.sprout_records, 0);
         assert_eq!(keys.coverage(), ImportCoverage::Complete);
         assert!(keys.coverage_notice().is_none());
     }
@@ -742,18 +544,16 @@ mod coverage_tests {
     /// Review round 3 on #230, finding 1. Whatever else the file says, a
     /// "verified — every key" line must never sit directly above a coverage
     /// grade that says balances may be missing funds. The shortfall here is
-    /// not a derived key — an unreadable Sprout key, an unreadable
-    /// transaction beside Sprout keys — so the note must not blame the seed
-    /// either.
+    /// not a derived key, so the note must not blame the seed either.
     #[test]
     fn coverage_that_may_hide_funds_withdraws_the_completeness_claim() {
         for diagnostic in [
             ImportDiagnostic::UnparseableRecord {
-                record_type: "zkey".to_owned(),
+                record_type: "key".to_owned(),
                 reason: "truncated".to_owned(),
             },
             ImportDiagnostic::DecryptionFailed {
-                record_type: "czkey".to_owned(),
+                record_type: "ckey".to_owned(),
                 reason: "did not decrypt".to_owned(),
             },
         ] {
@@ -829,7 +629,7 @@ mod coverage_tests {
     #[test]
     fn locked_key_coverage_depends_on_provenance_and_seed() {
         let standalone = ImportDiagnostic::LockedKey {
-            record_type: "zkey".to_owned(),
+            record_type: "key".to_owned(),
             provenance: Provenance::Standalone,
         };
         assert_eq!(
@@ -838,7 +638,7 @@ mod coverage_tests {
         );
 
         let hd = ImportDiagnostic::LockedKey {
-            record_type: "zkey".to_owned(),
+            record_type: "key".to_owned(),
             provenance: Provenance::HdDerived,
         };
         assert_eq!(

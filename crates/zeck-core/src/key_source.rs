@@ -2,7 +2,6 @@
 //!
 //! The scanner and sweeper take a `&dyn KeySource` and no longer know
 //! whether keys were HD-derived from a seed or read out of a wallet file.
-//! This is the seam Sprout key sources plug into later.
 
 use argos_wallet_import::ImportedKeys;
 use secrecy::{ExposeSecret, SecretString};
@@ -149,17 +148,15 @@ impl KeySource for ImportedKeySource {
         // collide even on an empty key set.
         h.update(b"imported");
 
-        // Hash public identifiers only — never secret material. Sprout
-        // addresses and counts are enough to distinguish key sets; secret
-        // key material (transparent, sapling, the recovered mnemonic) is
-        // bound in via a domain-separated inner digest rather than the
+        // Secret key material (transparent, Sapling, the recovered mnemonic)
+        // is bound in via a domain-separated inner digest rather than the
         // secret bytes themselves.
         h.update((self.keys.transparent.len() as u64).to_le_bytes());
         h.update((self.keys.sapling.len() as u64).to_le_bytes());
-        h.update((self.keys.sprout.len() as u64).to_le_bytes());
-        for k in &self.keys.sprout {
-            h.update(k.address);
-        }
+        // Preserve existing workspace identities for supported-only wallets.
+        // This reserved slot was the legacy pool key count; unsupported
+        // record recognition never changes the supported spending authority.
+        h.update(0u64.to_le_bytes());
         for k in &self.keys.transparent {
             // Public-key-derived material is not available here, so bind
             // to a hash of the secret rather than the secret itself.
@@ -216,10 +213,9 @@ impl KeySource for ImportedKeySource {
 
     fn describe(&self) -> String {
         format!(
-            "wallet file ({} transparent, {} sapling, {} sprout)",
+            "wallet file ({} transparent, {} sapling)",
             self.keys.transparent.len(),
-            self.keys.sapling.len(),
-            self.keys.sprout.len()
+            self.keys.sapling.len()
         )
     }
 }
@@ -355,6 +351,32 @@ mod tests {
         let one = ImportedKeySource::new(keys);
 
         assert_ne!(empty.fingerprint().unwrap(), one.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn unsupported_sprout_records_do_not_change_the_workspace_identity() {
+        let supported = ImportedKeySource::new(ImportedKeys::default());
+        let recognized = ImportedKeySource::new(ImportedKeys {
+            sprout_records: 3,
+            ..Default::default()
+        });
+        assert_eq!(
+            supported.fingerprint().unwrap(),
+            recognized.fingerprint().unwrap()
+        );
+        assert_eq!(
+            classify_recovery_route(recognized.keys()),
+            RecoveryRoute::Nothing
+        );
+    }
+
+    #[test]
+    fn supported_only_wallet_fingerprints_keep_their_legacy_format() {
+        let source = ImportedKeySource::new(ImportedKeys::default());
+        assert_eq!(
+            source.fingerprint().unwrap().to_hex(),
+            "3a0f43af3c364939bafc467f54cc0cf20820630a00983f26de89900eeee5a66e"
+        );
     }
 
     #[test]

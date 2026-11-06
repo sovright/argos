@@ -41,7 +41,7 @@
 //! Only an unreadable external version and a missing or wrong passphrase are
 //! fatal errors. Unsupported versions return a non-complete result.
 //!
-//! ZWL never held Sprout keys, so nothing here contributes to sub-spec 3.
+//! ZWL keys are recovered through its mnemonic and supported key records.
 //!
 //! ## Encrypted wallets: one key for the seed and every imported key
 //!

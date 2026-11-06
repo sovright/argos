@@ -80,7 +80,7 @@
           <a href="#before">Before you start</a>
           <a href="#install">Install</a>
           <a href="#walkthrough">Recovery walkthrough</a>
-          <a href="#sprout">Sprout recovery</a>
+          <a href="#sprout">Sprout after NU7</a>
           <a href="#report">Recovery report</a>
           <a href="#troubleshooting">Troubleshooting</a>
           <a href="#security">Security checklist</a>
@@ -90,23 +90,15 @@
           <section id="before">
             <h2>Before You Start</h2>
             <div class="callout">
-              <strong>Urgent: recover Sprout funds before NU7 activates.</strong>
-              <span>
-                NU7 disables version 4 transactions, including all Sprout spends. Your recovery
-                transaction must be <strong>mined before activation</strong>; broadcasting is not
-                enough. Start promptly: a full Sprout scan can take days. Mainnet activation
-                is targeted for about November 5, 2026; the final height is not yet assigned
-                (proposed in <a href="https://github.com/zcash/zips/pull/1405">zcash/zips#1405</a>;
-                see the <a href="https://forum.zcashcommunity.com/t/nu7-timeline/57655">NU7
-                timeline</a>). Check <a href="https://zips.z.cash/zip-0259">ZIP 259</a> for the
-                assigned height. Funds remaining in Sprout after activation will be
-                unspendable under the current NU7 rules.
-              </span>
+              <strong>Sprout funds are unspendable under NU7.</strong>
+              <span>NU7 disallows version 4 transactions, the only format supporting Sprout
+                spends. Argos recognizes Sprout records in wallet files and explains the
+                restriction while continuing transparent and Sapling recovery.
+                See <a href="https://zips.z.cash/zip-0259">ZIP 259</a>.</span>
             </div>
             <p>
               Argos accepts a ZecWallet Lite seed phrase, a ZecWallet Lite or zcashd wallet file,
-              or a standalone Sapling spending key. It also recovers Sprout from zcashd wallet
-              files or standalone Sprout spending keys. You need a trusted computer, internet
+              or a standalone Sapling spending key. You need a trusted computer, internet
               access, and a modern Zcash destination you control.
             </p>
             <div class="callout">
@@ -141,7 +133,7 @@
             <p>
               Choose <strong>I have my seed phrase</strong> for the legacy ZecWallet Lite
               HD path, or <strong>I have a wallet file</strong> for a ZecWallet Lite file, zcashd
-              <code>wallet.dat</code>, or standalone Sapling or Sprout key. A seed recovery does
+              <code>wallet.dat</code>, or standalone Sapling key. A seed recovery does
               not require a wallet file.
             </p>
 
@@ -156,20 +148,14 @@
             <p>
               Choose, drag, or enter the path to a wallet file. Argos reads the file but never
               modifies it. For an encrypted wallet, enter the passphrase when prompted; it is used
-              in memory and is not written to disk. Review the counts for transparent, Sapling,
-              and Sprout keys and any records Argos could not read before continuing.
+              in memory and is not written to disk. Review the recovered transparent and Sapling key counts, any Sprout notice,
+              and any records Argos could not read before continuing.
             </p>
             <p>
               If you have a zcashd Sapling extended spending key instead of a file, paste one or
               more <code>secret-extended-key-main1…</code> or
               <code>secret-extended-key-test1…</code> keys, one per line, and check them before
               continuing. Viewing keys are not accepted because they cannot authorize a sweep.
-            </p>
-            <p>
-              If all you have is a Sprout spending key (<code>SK…</code> on mainnet,
-              <code>ST…</code> on testnet), open <strong>I only have a Sprout spending key</strong>
-              on the same screen. No wallet file is needed; see <a href="#sprout">Sprout
-              recovery</a>.
             </p>
 
             <h3>3. Configure</h3>
@@ -189,7 +175,7 @@
               Argos syncs compact blocks, checks either the derived legacy account layout or the
               imported keys, and summarizes the covered balances. Seed recovery covers
               transparent, Sapling, and Orchard. A seedless zcashd import covers its transparent
-              and Sapling keys; Sprout is shown and recovered separately so a partial total cannot
+              and Sapling keys; unsupported Sprout records are reported separately so a partial total cannot
               be mistaken for the whole wallet. The local workspace lets you resume or repeat a
               scan without starting from nothing. When upgrading to 1.5.5, older workspaces
               without the current storage protections are preserved but require a fresh scan in
@@ -212,61 +198,17 @@
           </section>
 
           <section id="sprout">
-            <h2>Sprout Recovery</h2>
-            <div class="callout">
-              <strong>Sprout recovery deadline: the sweep must be mined before NU7 activation.</strong>
-              <span>
-                NU7 disables version 4 transactions and therefore Sprout spends. A broadcast or
-                completed scan alone does not meet this deadline. Mainnet activation is
-                targeted for about November 5, 2026; the final height is not yet assigned
-                (proposed in <a href="https://github.com/zcash/zips/pull/1405">zcash/zips#1405</a>;
-                see the <a href="https://forum.zcashcommunity.com/t/nu7-timeline/57655">NU7
-                timeline</a>). Start promptly and check
-                <a href="https://zips.z.cash/zip-0259">ZIP 259</a> for the assigned height. After a
-                sweep broadcasts, confirm the transaction is mined before activation.
-                Remaining Sprout funds will be unspendable under the current NU7 rules.
-                Historical scanning and reporting can still identify funds after activation.
-              </span>
-            </div>
-            <p>
-              Sprout support is included in normal Argos builds. A ZecWallet Lite seed alone cannot
-              reconstruct Sprout keys, because the legacy wallet generated those independently.
-              Use a zcashd <code>wallet.dat</code> or an <code>SK…</code> mainnet or
-              <code>ST…</code> testnet spending key. In the app, a raw key needs no wallet file:
-              on the wallet-file screen, open <strong>I only have a Sprout spending key</strong>,
-              choose the network, paste the keys one per line, and start the scan. The NU7
-              deadline is shown with the panel. The CLI equivalent is
-              <code>argos scan-sprout --sprout-key-file</code>.
-            </p>
-            <p>
-              After opening a wallet file, Argos first checks whether it already contains spendable
-              note data and a cached witness. If it does, use <strong>Sweep Sprout funds</strong>;
-              no chain scan is required. If it contains keys but no usable note data, Argos offers
-              a resumable full-block scan.
-            </p>
-            <div class="callout">
-              <strong>A Sprout scan is not an ordinary scan.</strong>
-              <span>
-                Compact blocks omit Sprout ciphertexts. Mainnet recovery reads full blocks
-                from genesis through the chain tip to find notes and later spends. Plan for
-                roughly 280 GB of transfer, likely days of work, and under 500 MB retained on
-                disk; the transfer estimate grows with the chain. Progress is checkpointed so
-                you can stop and resume.
-              </span>
-            </div>
-            <p>
-              That checkpoint is spend-capable: it contains the Sprout spending keys, recovered
-              note plaintexts, and witnesses. Protect it like the original wallet file. Argos
-              does not remove it, even after a sweep; delete it yourself only once Argos reports
-              fresh canonical mined evidence for every Sprout transaction.
-            </p>
-            <p>
-              Sprout funds can only land in Sapling. Argos accepts a bare Sapling address or the
-              Sapling receiver of a Unified Address. A single transaction cannot reach Orchard
-              because Sprout JoinSplits and Orchard actions use different transaction versions.
-              Move the funds from Sapling to Orchard afterward from your destination wallet if you
-              want that second hop.
-            </p>
+            <h2>Sprout after NU7</h2>
+            <p>NU7 disallows version 4 transactions, the only format supporting Sprout
+              spends. Remaining Sprout funds are unspendable under those rules. Argos no
+              longer imports standalone Sprout keys, scans Sprout history, or constructs
+              Sprout sweeps.</p>
+            <p>A wallet file containing Sprout records can still recover its supported
+              transparent and Sapling funds. Argos shows an explanatory notice; the
+              recognized record count is not a Sprout balance.</p>
+            <p>Existing wallet files, checkpoints, journals, and packs are left untouched.
+              Preserve old recovery artifacts and transaction records. This version does
+              not reconcile or clean up artifacts from the removed Sprout workflow.</p>
           </section>
 
           <section id="report">
@@ -344,12 +286,10 @@
               </p>
             </details>
             <details>
-              <summary>A wallet has Sprout keys but no spendable notes</summary>
-              <p>
-                The keys are intact, but the file lacks the cached note and witness data needed for
-                a direct sweep. Keep the original file and run the full-block Sprout scan. Do not
-                treat the ordinary transparent/Sapling total as the wallet's complete balance.
-              </p>
+              <summary>A wallet contains Sprout records</summary>
+              <p>NU7 makes Sprout funds unspendable. The notice does not prevent recovery of
+                transparent and Sapling funds from the same wallet. Keep the original file;
+                the supported-pool total is not a claim about the wallet's Sprout funds.</p>
             </details>
           </section>
 

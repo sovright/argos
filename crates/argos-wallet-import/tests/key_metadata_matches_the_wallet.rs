@@ -2,13 +2,12 @@
 //! *that* key, read from the golden fixtures.
 //!
 //! zcashd keeps a `CKeyMetadata` record beside every key: `keymeta` keyed by
-//! the public key, `zkeymeta` by the Sprout payment address, `sapzkeymeta` by
+//! the public key and `sapzkeymeta` by
 //! the Sapling incoming viewing key. A creation time attached to the wrong
 //! key is worse than none — it can move a scan's start past a note — so the
 //! lookup here does not trust the parser's own matching. It re-derives each
 //! key's public identifier with an independent implementation (`secp256k1`
-//! for the pubkey, `sapling-crypto` for the ivk; the Sprout address is the
-//! record's own key) and reads the time straight from the metadata record
+//! for the pubkey, `sapling-crypto` for the ivk) and reads the time straight from the metadata record
 //! stored under that identifier.
 
 use std::collections::HashMap;
@@ -113,19 +112,9 @@ fn every_fixture_key_carries_the_time_stored_for_it() {
             );
         }
 
-        let zkeymeta = stored_times(&pairs, "zkeymeta");
-        for key in &keys.sprout {
-            let want = zkeymeta[key.address.as_slice()];
-            assert_eq!(key.created_at, Some(want), "{fixture}: sprout");
-            assert!(
-                (PLAUSIBLE_FROM..PLAUSIBLE_TO).contains(&want),
-                "{fixture}: {want}"
-            );
-        }
         assert_eq!(
-            keys.sprout.len(),
-            usize::from(fixture.starts_with("sprout")),
-            "{fixture}"
+            keys.sprout_records,
+            usize::from(fixture.starts_with("sprout"))
         );
 
         // Reading metadata must not cost the wallet any coverage, and none of

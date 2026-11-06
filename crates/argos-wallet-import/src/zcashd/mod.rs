@@ -6,7 +6,6 @@ pub mod metadata;
 pub mod plaintext;
 pub mod records;
 pub mod seed;
-pub mod sprout;
 
 pub use crypto::{
     classify_encryption, derive_master_key, find_mkey, EncryptionMetadata, MasterKey, MkeyRecord,
@@ -15,7 +14,6 @@ pub use encrypted::collect_encrypted;
 pub use metadata::{KeyMetadataIndex, MetadataKind, UNKNOWN_CREATE_TIME_AT_OR_BEFORE};
 pub use plaintext::collect_plaintext;
 pub use records::{compact_size, parse_record_key, RecordKey};
-pub use sprout::collect_sprout_notes;
 
 use std::collections::HashSet;
 
@@ -76,11 +74,11 @@ pub fn import_zcashd(
         | ImportDiagnostic::PublicIdentifierMismatch { record_type, .. }
         | ImportDiagnostic::LockedKey { record_type, .. } => matches!(
             record_type.as_str(),
-            "key" | "zkey" | "sapzkey" | "ckey" | "czkey" | "csapzkey"
+            "key" | "sapzkey" | "ckey" | "csapzkey"
         ),
         _ => false,
     });
-    if out.is_empty() && !absence_already_explained {
+    if out.is_empty() && out.sprout_records == 0 && !absence_already_explained {
         out.diagnostics
             .push(ImportDiagnostic::MissingSpendAuthority {
                 format: "Berkeley DB",
@@ -95,7 +93,6 @@ pub fn import_zcashd(
 fn import_records(pairs: &[bdb::RawRecord], master: Option<&MasterKey>) -> ImportedKeys {
     let mut out = ImportedKeys::default();
     let mut recovered = collect_plaintext(pairs, &mut out);
-    collect_sprout_notes(pairs, &mut out);
     if let Some(master) = master {
         recovered.extend(collect_encrypted(pairs, master, &mut out));
     }
@@ -571,7 +568,7 @@ mod tests {
     #[test]
     fn imports_a_plaintext_wallet_without_a_passphrase() {
         let keys = import_zcashd(&read("sprout-plaintext"), None).unwrap();
-        assert!(!keys.sprout.is_empty());
+        assert!(keys.sprout_records > 0);
         assert!(!keys.is_empty());
     }
 
@@ -582,10 +579,10 @@ mod tests {
     }
 
     #[test]
-    fn imports_an_encrypted_sprout_wallet_end_to_end() {
+    fn imports_supported_keys_from_an_encrypted_mixed_wallet() {
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         let keys = import_zcashd(&read("sprout-encrypted"), Some(&pass)).unwrap();
-        assert!(!keys.sprout.is_empty(), "no Sprout keys recovered");
+        assert!(keys.sprout_records > 0, "no Sprout records recognized");
         assert!(keys.total_keys() > 0);
     }
 

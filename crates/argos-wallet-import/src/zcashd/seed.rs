@@ -159,7 +159,6 @@ impl SeedRecords<'_> {
             let sapling = match kind {
                 MetadataKind::Transparent => false,
                 MetadataKind::Sapling => true,
-                MetadataKind::Sprout => return None,
             };
             let position = legacy_position(&hd.keypath, sapling)?;
             Some((sapling, id, &hd.seed_fp, position))

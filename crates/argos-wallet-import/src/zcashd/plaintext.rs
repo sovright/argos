@@ -7,7 +7,7 @@ use crate::{
     identity,
     keys::{
         merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
-        SaplingKey, SproutKey, TransparentKey,
+        SaplingKey, TransparentKey,
     },
     secret_bytes::SecretArray,
     zcashd::{
@@ -39,6 +39,7 @@ const IGNORED: &[&str] = &[
     "tx",
     "version",
     "witnesscachesize",
+    "zkeymeta",
 ];
 
 fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
@@ -129,38 +130,9 @@ pub fn collect_plaintext(
                 Some(network) => merge_embedded_network(out, network),
                 None => unrecognized_network(out, "zcashd", "invalid networkinfo value"),
             },
-            "zkey" => {
-                let addr: Option<[u8; 64]> = rec.rest.get(..64).and_then(|s| s.try_into().ok());
-                // Verified against the golden fixtures: the value is the bare
-                // 32-byte a_sk with NO CompactSize prefix (observed value
-                // length is exactly 32). Do not use read_length_prefixed here
-                // — it would read the first key byte as a length.
-                let a_sk = <[u8; 32]>::try_from(value).ok().map(SecretArray::new);
-
-                match (addr, a_sk) {
-                    (Some(address), Some(a_sk)) => {
-                        if let Some(a_sk) = identity::retain_sprout_secret(a_sk, &address) {
-                            out.sprout.push(SproutKey {
-                                a_sk,
-                                address,
-                                // zcashd Sprout keys were never HD-derived.
-                                provenance: Provenance::Standalone,
-                                created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
-                            });
-                        } else {
-                            out.diagnostics
-                                .push(ImportDiagnostic::PublicIdentifierMismatch {
-                                    record_type: "zkey".to_owned(),
-                                    identifier: "payment address",
-                                });
-                        }
-                    }
-                    _ => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
-                        record_type: "zkey".to_owned(),
-                        reason: "address or spending key has the wrong length".to_owned(),
-                    }),
-                }
-            }
+            // Sprout has no spend format after NU7. Recognize the record
+            // type only; never parse or decrypt its spending material.
+            "zkey" | "czkey" => out.sprout_records += 1,
             // Verified against the fixtures: the value is a raw 169-byte
             // extended spending key with NO length prefix — depth(1) +
             // parent_fvk_tag(4) + child_index(4) + chain_code(32) +
@@ -235,7 +207,7 @@ pub fn collect_plaintext(
             // Encrypted variants are handled in Task 10 once the master
             // key is available; skip silently here rather than reporting
             // them as unknown.
-            "ckey" | "czkey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" => {}
+            "ckey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" => {}
             // Read into `metadata` above, and by `seed` for coverage.
             other if is_metadata_record(other) => {}
             // Assessed as a whole, with the master key in hand, by `seed`.
@@ -252,7 +224,6 @@ pub fn collect_plaintext(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::ExposeSecret;
 
     fn record(kind: &str, key_rest: &[u8], value: &[u8]) -> crate::bdb::RawRecord {
         let mut k = vec![kind.len() as u8];
@@ -321,59 +292,6 @@ mod tests {
             .any(|d| matches!(d, ImportDiagnostic::ConflictingNetworkMetadata { .. })));
     }
 
-    fn genuine_sprout_pair() -> ([u8; 64], [u8; 32]) {
-        let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap().records;
-        pairs
-            .into_iter()
-            .find_map(|record| {
-                let rec = parse_record_key(&record.key)?;
-                if rec.record_type != "zkey" {
-                    return None;
-                }
-                Some((
-                    rec.rest.get(..64)?.try_into().ok()?,
-                    record.value().get(..32)?.try_into().ok()?,
-                ))
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn extracts_a_sprout_spending_key() {
-        let (addr, value) = genuine_sprout_pair();
-        // The value is the bare 32-byte a_sk with no CompactSize prefix —
-        // confirmed against the golden fixtures.
-        let pairs = vec![record("zkey", &addr, &value)];
-
-        let mut out = ImportedKeys::default();
-        collect_plaintext(&pairs, &mut out);
-
-        assert_eq!(out.sprout.len(), 1);
-        let k = &out.sprout[0];
-        assert_eq!(k.address, addr);
-        assert_eq!(k.a_sk.expose_secret(), &value);
-    }
-
-    #[test]
-    fn mismatched_plaintext_sprout_key_drops_temporary_owner() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-
-        let (mut address, value) = genuine_sprout_pair();
-        address[0] ^= 1;
-        let pairs = vec![record("zkey", &address, &value)];
-        let dropped = Arc::new(AtomicBool::new(false));
-        let mut out = ImportedKeys::default();
-        SecretArray::<32>::test_with_drop_probe(Arc::clone(&dropped), || {
-            collect_plaintext(&pairs, &mut out);
-        });
-        assert!(out.sprout.is_empty());
-        assert!(dropped.load(Ordering::SeqCst));
-    }
-
     #[test]
     fn mismatched_plaintext_transparent_key_drops_temporary_owner() {
         use std::sync::{
@@ -400,80 +318,6 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
-    fn metadata(time: i64) -> Vec<u8> {
-        let mut v = 10i32.to_le_bytes().to_vec();
-        v.extend_from_slice(&time.to_le_bytes());
-        v.push(0); // empty HD keypath
-        v.extend_from_slice(&[0u8; 32]);
-        v
-    }
-
-    /// Each key gets the time stored under its own identifier, an imported
-    /// key's "unknown" marker gives no time, and a damaged record gives no
-    /// time plus one diagnostic — while every key is still recovered.
-    #[test]
-    fn creation_times_attach_to_their_own_keys() {
-        // Each address is derived from its key, so the identity check that
-        // refuses a key filed under someone else's address lets all three in.
-        let (known_sk, unknown_sk, damaged_sk) = ([0x01; 32], [0x02; 32], [0x03; 32]);
-        let known = identity::sprout_address_from_spending_key(&known_sk);
-        let unknown = identity::sprout_address_from_spending_key(&unknown_sk);
-        let damaged = identity::sprout_address_from_spending_key(&damaged_sk);
-        let mut truncated = metadata(1_700_000_300);
-        truncated.truncate(10);
-        let pairs = vec![
-            record("zkey", &known, &known_sk),
-            record("zkey", &unknown, &unknown_sk),
-            record("zkey", &damaged, &damaged_sk),
-            record("zkeymeta", &known, &metadata(1_700_000_100)),
-            // What `z_importkey` writes for a key of unknown age.
-            record("zkeymeta", &unknown, &metadata(1)),
-            record("zkeymeta", &damaged, &truncated),
-            // Same bytes, other pool: must not leak onto a Sprout key.
-            record("sapzkeymeta", &[0x02; 32], &metadata(1_700_000_200)),
-        ];
-
-        let mut out = ImportedKeys::default();
-        collect_plaintext(&pairs, &mut out);
-
-        let time_of = |addr: [u8; 64]| {
-            out.sprout
-                .iter()
-                .find(|k| k.address == addr)
-                .map(|k| k.created_at)
-                .unwrap()
-        };
-        assert_eq!(out.sprout.len(), 3, "metadata never costs a key");
-        assert_eq!(time_of(known), Some(1_700_000_100));
-        assert_eq!(time_of(unknown), None);
-        assert_eq!(time_of(damaged), None);
-        assert_eq!(
-            out.diagnostics,
-            vec![ImportDiagnostic::UnreadableKeyMetadata {
-                record_type: "zkeymeta".to_owned(),
-                reason: "value is too short for a creation time".to_owned(),
-            }]
-        );
-        assert_eq!(out.coverage(), crate::keys::ImportCoverage::Complete);
-    }
-
-    #[test]
-    fn a_malformed_record_does_not_silence_a_good_one() {
-        // This is the governing principle: partial recovery.
-        let (addr, good) = genuine_sprout_pair();
-
-        let pairs = vec![
-            record("zkey", &[0x99; 3], &[0x00]), // too-short address
-            record("zkey", &addr, &good),
-        ];
-
-        let mut out = ImportedKeys::default();
-        collect_plaintext(&pairs, &mut out);
-
-        assert_eq!(out.sprout.len(), 1, "the good key must survive");
-        assert_eq!(out.diagnostics.len(), 1, "the bad one must be reported");
-    }
-
     #[test]
     fn unknown_record_types_are_reported_not_silently_dropped() {
         // "bestblock" is a real, expected zcashd record type (in IGNORED);
@@ -482,7 +326,7 @@ mod tests {
         let pairs = vec![record("not_a_real_record_type", &[], &[0x01])];
         let mut out = ImportedKeys::default();
         collect_plaintext(&pairs, &mut out);
-        assert!(out.sprout.is_empty());
+        assert_eq!(out.sprout_records, 0);
         assert_eq!(out.diagnostics.len(), 1);
     }
 
@@ -531,7 +375,7 @@ mod tests {
         collect_plaintext(&pairs, &mut out);
 
         assert!(out.transparent.is_empty());
-        assert!(out.sprout.is_empty());
+        assert_eq!(out.sprout_records, 0);
         assert!(out.sapling.is_empty());
         assert_eq!(
             out.diagnostics.len(),
@@ -541,14 +385,14 @@ mod tests {
     }
 
     #[test]
-    fn extracts_sprout_keys_from_the_golden_fixture() {
+    fn recognizes_retired_sprout_records_in_a_mixed_wallet() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
         let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mut out = ImportedKeys::default();
         collect_plaintext(&pairs, &mut out);
         assert!(
-            !out.sprout.is_empty(),
-            "no Sprout keys from the real wallet"
+            out.sprout_records > 0,
+            "no retired Sprout records recognized"
         );
         assert!(!out.transparent.is_empty(), "no transparent keys");
     }

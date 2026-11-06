@@ -1,3 +1,8 @@
+> Historical assessment: this document describes the implementation before
+> Sprout removal on 2026-11-06. Sprout keys, checkpoints, and reviewed-sweep
+> lifetimes below no longer describe active functionality. See
+> [the current threat model](THREAT_MODEL.md) for the supported recovery paths.
+
 # Evaluation: locking and zeroizing secret material in memory (audit Suggestion 9)
 
 **Status:** implemented lifecycle reduction; page locking remains an evaluated

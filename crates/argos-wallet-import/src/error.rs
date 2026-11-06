@@ -108,7 +108,7 @@ pub enum ImportDiagnostic {
     )]
     UncheckedLegacySeed { record_type: String },
 
-    /// A key's creation-time record (`keymeta`, `zkeymeta`, `sapzkeymeta`)
+    /// A key's creation-time record (`keymeta`, `sapzkeymeta`)
     /// could not be read. The key itself is unaffected; it just has no
     /// creation time, so nothing about where to start scanning for it is
     /// inferred from the file.

@@ -5,7 +5,6 @@
 //! | record        | record key                                | describes        |
 //! |---------------|-------------------------------------------|------------------|
 //! | `keymeta`     | `CPubKey` (CompactSize(len) \|\| pubkey)  | `key` / `ckey`   |
-//! | `zkeymeta`    | `SproutPaymentAddress` (64 bytes)         | `zkey` / `czkey` |
 //! | `sapzkeymeta` | `SaplingIncomingViewingKey` (32 bytes)    | `sapzkey` / `csapzkey` |
 //!
 //! Each record key's remainder is byte-for-byte the remainder of the key
@@ -47,15 +46,13 @@ const LATEST_PLAUSIBLE_CREATE_TIME: i64 = 4_102_444_800;
 /// carries an HD keypath and a seed fingerprint.
 const VERSION_WITH_HDDATA: i32 = 10;
 
-/// The three metadata record types and the key records each describes.
-const METADATA_RECORDS: [&str; 3] = ["keymeta", "zkeymeta", "sapzkeymeta"];
+/// Supported metadata record types and the key records each describes.
+const METADATA_RECORDS: [&str; 2] = ["keymeta", "sapzkeymeta"];
 
-/// Which pool a metadata record describes. Kept distinct so a Sapling ivk and
-/// a Sprout address that happened to share bytes could not be confused.
+/// Which supported pool a metadata record describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetadataKind {
     Transparent,
-    Sprout,
     Sapling,
 }
 
@@ -63,7 +60,6 @@ impl MetadataKind {
     fn of_record(record_type: &str) -> Option<Self> {
         match record_type {
             "keymeta" => Some(Self::Transparent),
-            "zkeymeta" => Some(Self::Sprout),
             "sapzkeymeta" => Some(Self::Sapling),
             _ => None,
         }
@@ -289,10 +285,10 @@ mod tests {
 
         let mut diagnostics = Vec::new();
         let index = KeyMetadataIndex::build(
-            &[record("zkeymeta", &[0xAB; 64], metadata_v10(1, ""))],
+            &[record("sapzkeymeta", &[0xAB; 32], metadata_v10(1, ""))],
             Some(&mut diagnostics),
         );
-        assert_eq!(index.created_at(MetadataKind::Sprout, &[0xAB; 64]), None);
+        assert_eq!(index.created_at(MetadataKind::Sapling, &[0xAB; 32]), None);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -365,7 +361,7 @@ mod tests {
             ("dated twice, same time", vec![dated(), dated()]),
         ];
         for (name, values) in cases {
-            for kind in ["keymeta", "zkeymeta", "sapzkeymeta"] {
+            for kind in ["keymeta", "sapzkeymeta"] {
                 let pairs: Vec<_> = values
                     .iter()
                     .map(|v| record(kind, &[0x33; 32], v.clone()))
@@ -473,7 +469,7 @@ mod tests {
             index.created_at(MetadataKind::Transparent, &[0x22; 32]),
             Some(1_700_000_500)
         );
-        assert_eq!(index.created_at(MetadataKind::Sprout, &[0x22; 32]), None);
+
         assert_eq!(index.created_at(MetadataKind::Sapling, &[0x22; 31]), None);
     }
 }

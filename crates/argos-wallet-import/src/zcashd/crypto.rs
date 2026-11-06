@@ -56,7 +56,7 @@ pub fn classify_encryption(pairs: &[RawRecord]) -> EncryptionMetadata {
             continue;
         };
         match record.record_type.as_str() {
-            "ckey" | "czkey" | "csapzkey" | "chdseed" | "cmnemonicphrase" => {
+            "ckey" | "csapzkey" | "chdseed" | "cmnemonicphrase" => {
                 encrypted_records = true;
             }
             "mkey" => match parse_mkey(value) {
@@ -88,7 +88,7 @@ pub fn classify_encryption(pairs: &[RawRecord]) -> EncryptionMetadata {
     }
 }
 
-/// The decrypted wallet master key. Every `ckey`, `czkey`, and `csapzkey`
+/// The decrypted wallet master key. Every `ckey` and `csapzkey`
 /// record is encrypted under this.
 pub struct MasterKey(pub(crate) Secret<[u8; 32]>);
 
@@ -99,7 +99,7 @@ impl std::fmt::Debug for MasterKey {
 }
 
 impl MasterKey {
-    /// Access the raw key bytes, for decrypting the `ckey`/`czkey`/
+    /// Access the raw key bytes, for decrypting the `ckey` and
     /// `csapzkey` records that follow. Callers must not let these bytes
     /// escape the scope of that decryption — never log, print, or copy
     /// them into a longer-lived structure.

@@ -2,17 +2,13 @@
 
 Argos is a recovery workspace for legacy Zcash wallets. It recovers from
 ZecWallet Lite seed phrases and wallet files, zcashd `wallet.dat` files, and
-standalone Sapling or Sprout spending keys.
+standalone Sapling spending keys.
 
-> **Urgent: recover Sprout funds before NU7 activates.** NU7 disables version 4
-> transactions, including all Sprout spends. Your recovery transaction must be
-> **mined before activation**; broadcasting it is not enough. Start promptly:
-> a full Sprout scan can take days. Mainnet activation is targeted for about
-> November 5, 2026; the final height is not yet assigned (proposed in
-> [zcash/zips#1405](https://github.com/zcash/zips/pull/1405); see the
-> [NU7 timeline](https://forum.zcashcommunity.com/t/nu7-timeline/57655)). Check
-> [ZIP 259](https://zips.z.cash/zip-0259) for the assigned height. Funds remaining in
-> Sprout after activation will be unspendable under the current NU7 rules.
+> **Sprout funds are unspendable under NU7.** NU7 disallows version 4
+> transactions, the only format that supports Sprout spends. Argos no longer
+> scans or sweeps Sprout funds. Wallet import recognizes Sprout records and
+> explains this limitation while continuing transparent and Sapling recovery.
+> See [ZIP 259](https://zips.z.cash/zip-0259).
 
 This repository now contains:
 
@@ -38,7 +34,6 @@ Argos now includes the major recovery phases end to end:
 - Legacy wallet file import (`--wallet-file`): zcashd `wallet.dat` and ZecWallet Lite, including encrypted wallets
 - Standalone Sapling extended spending keys, supplied through `--sapling-key-file` or pasted into the desktop app
 - Scan and sweep support for imported transparent and Sapling keys
-- Generally available Sprout recovery from `wallet.dat` or standalone `SK…` / `ST…` spending keys, including resumable full-block scans when a wallet has no cached note witnesses
 
 ## Recovery sources
 
@@ -46,9 +41,8 @@ Argos now includes the major recovery phases end to end:
 |---|---|
 | BIP-39 seed phrase (12–24 words; ZecWallet Lite used 24) | Derives, scans, and sweeps transparent, Sapling, and Orchard funds across the legacy account layout. ZecWallet Lite did not derive Sprout keys from this seed. |
 | ZecWallet Lite wallet file | Recovers the mnemonic and re-enters the same complete HD recovery path as a typed seed. |
-| zcashd `wallet.dat` | Scans and sweeps every imported transparent and Sapling key. Sprout notes use the separate Sprout workflow described below. |
+| zcashd `wallet.dat` | Scans and sweeps every imported transparent and Sapling key. Sprout records are identified as unsupported under NU7. |
 | Sapling extended spending key | Scans and sweeps `secret-extended-key-main1…` or `secret-extended-key-test1…` keys without requiring a wallet file. |
-| Sprout spending key | Scans and sweeps `SK…` (mainnet) or `ST…` (testnet) keys without requiring a wallet file. |
 
 Wallet files are opened read-only and never modified. If one is encrypted,
 Argos prompts for its passphrase. There is deliberately no passphrase flag,
@@ -56,13 +50,12 @@ so the passphrase cannot end up in shell history or `ps` output.
 
 In the desktop app, a successful inspection creates an opaque review ID for a
 backend-owned snapshot of the opened file: its length, SHA-256 digest, and
-filesystem object identity. Later wallet-backed scans, Sprout proposals, and
-Sprout execution reopen and verify that exact source. An in-place edit or even
+filesystem object identity. Later wallet-backed scans reopen and verify that
+exact source. An in-place edit or even
 an identical-byte replacement is refused with “wallet changed since review;
 inspect it again.”
 
-The parser also validates recovered transparent, Sapling, and Sprout secret
-keys against the addresses or viewing keys stored in the wallet at runtime;
+The parser also validates recovered transparent and Sapling secret keys against the addresses or viewing keys stored in the wallet at runtime;
 well-formed but mismatched key material is not accepted as spend authority.
 
 ```
@@ -70,8 +63,9 @@ argos --wallet-file /path/to/wallet.dat inspect-wallet
 ```
 
 `inspect-wallet` is entirely local: no network, nothing written to disk.
-It reports how many transparent, Sapling, and Sprout keys were recovered,
-lists Sprout addresses, and names every record it could not read.
+It reports recovered transparent and Sapling key counts, warns when Sprout
+records are present, and names every supported record it could not read.
+Sprout record counts are not a balance or a claim that keys were recovered.
 
 The ordinary `scan` and `sweep` commands cover imported Sapling and
 transparent keys. A zcashd wallet commonly contains several Sapling keys;
@@ -143,200 +137,25 @@ argos --sapling-key-file sapling-keys.txt sweep --destination u1... --dry-run
 Viewing keys such as `zxviews…` are rejected: they can reveal balances but
 cannot authorize the sweep Argos is promising.
 
-## Recovering Sprout funds
+## Sprout after NU7
 
-> **Sprout recovery deadline:** the sweep must be **mined before NU7 activation**.
-> NU7 disables version 4 transactions and therefore Sprout spends. A broadcast
-> or completed scan alone does not meet this deadline. Mainnet activation is
-> targeted for about November 5, 2026; the final height is not yet assigned
-> (proposed in [zcash/zips#1405](https://github.com/zcash/zips/pull/1405); see the
-> [NU7 timeline](https://forum.zcashcommunity.com/t/nu7-timeline/57655)). Start
-> promptly and check [ZIP 259](https://zips.z.cash/zip-0259) for the assigned height.
-> After a sweep broadcasts, confirm the transaction is mined before activation.
-> Remaining Sprout funds will be unspendable under the current NU7 rules.
-> Historical scanning and reporting can still identify funds after activation.
+NU7 disallows version 4 transactions, so remaining Sprout funds are
+unspendable under those rules. Argos has removed Sprout key import, scanning,
+sweeping, and pack tooling. A wallet containing Sprout records still imports
+its supported transparent and Sapling keys; the Sprout notice is separate
+from the supported-pool balance.
 
-Sprout support is part of normal Argos builds and requires no Cargo feature.
-It is intentionally separate from the ordinary compact-block scan:
+Mixed wallets previously scanned with Sprout keys get a new workspace and
+must rescan their supported funds. Reconcile previously broadcast transactions
+before recovering again; supported-only wallets keep their existing workspace
+identity.
 
-- If a synced `wallet.dat` contains note data and a cached witness,
-  `sweep-sprout` can use that historical witness without scanning the chain.
-- If all you have is a spending key, or the wallet has no usable note data,
-  `scan-sprout` trial-decrypts every historical JoinSplit. Compact blocks do
-  not contain those ciphertexts, so this reads full blocks directly from the
-  Zcash P2P network from genesis to the chain tip. It does not stop at
-  Canopy: that upgrade only stopped new value entering Sprout. Sprout notes
-  could still be created and spent after Canopy, until NU7 disables Sprout
-  spends. On mainnet that is about 3.5
-  million blocks, roughly 280 GB of transfer, likely days of work, and under
-  500 MB retained on disk. Progress is checkpointed and resumable, and
-  re-running a finished scan catches up to the new tip.
-
-The Sprout checkpoint is spend-capable: it contains the raw keys, recovered
-note plaintexts, and witnesses needed to resume and sweep. Before the first
-secret, checkpoint, or journal byte is written, Argos publishes the exact data
-directory as a create-time-authenticated private container. Opaque roots bound
-to the network and full key-set fingerprint inside that container hold the
-checkpoint, version-4 journal, locks, replacement candidates, and deletion
-quarantines. Unix uses
-current-user-owned `0700` roots and `0600` files without extended or inherited
-ACLs. Windows uses a protected DACL granting full control only to the current
-user and LocalSystem, plus DPAPI `CurrentUser` and HKCU authority so a
-temporarily tightened stale handle cannot authorize reuse. Existing unmarked
-data directories, direct checkpoints or journals, and in-root version-1 to
-version-3 journals are preserved unchanged and refused for recovery use;
-chmod, DACL changes, or adding a marker cannot adopt them. A bounded read-only
-diagnostic can report transaction IDs from exact-private direct legacy
-journals, but those unauthenticated IDs never authorize spending or cleanup.
-
-If the old default data directory is unmarked, the CLI selects
-`./argos_data_v2` and the GUI selects `AppDataDir/workspace-v2`, explains that
-the old data was left in place, and requires a rescan. An explicitly selected
-unmarked directory is refused with guidance to choose a new, empty directory.
-
-The current binary cannot prove that an unmarked legacy directory contains
-every historical broadcast record. Preserve the entire old directory,
-including journals and any saved raw transaction bytes. Use the trusted prior
-Argos release or manual checks against independent chain sources to reconcile
-every pending or unknown txid and its raw transaction evidence. Then select a
-genuinely absent data-directory path for the current binary and rescan. Never
-delete the old directory, wallet, checkpoint, journal, or raw transaction
-evidence until the funds and every transaction are independently settled. The
-current binary deliberately has no automatic adoption or migration path.
-Protect the checkpoint and the original wallet
-or Sprout key until Argos has freshly observed every manifested transaction as
-canonical mined. A successful broadcast, a node accepting a transaction, or a
-previously observed mined state is not enough to discard either source. After
-a scan-derived sweep, Argos removes the exact checkpoint only when every
-manifested transaction has survived the two newest mature reconciliation
-rounds with the same canonical height and block hash, at least 100 blocks deep
-and corroborated by two independent operator authorities. Every other outcome
-retains the checkpoint and reports why.
-
-Before submitting a Sprout transaction, Argos durably journals its exact
-serialized bytes. The version-4 journal header binds the full key-set
-fingerprint, network, lineage anchor, and artifact generation. Before proving,
-reconciliation, or send, Argos validates authenticated sibling roots and stops
-if another key set's journal claims any of the same Sprout notes. An accepted
-submission remains **pending** until a confirmation source reports it mined.
-Mining reported by a single operator (the default, with no
-`--confirmation-source`) lets the sweep move on but is never final: only an
-independent pair of operators agreeing on the block, at least 10 confirmations
-deep, counts as fresh canonical mined evidence. If submission has an unknown
-outcome (a lost reply or an unfamiliar refusal), Argos stops before processing
-later notes: on the next run it reconciles that transaction and, while it
-remains valid, retries the same bytes rather than building a different spend. A
-saved transaction is replaced only once a configured source reports it absent
-more than 20 blocks past its expiry height. It can never be mined after that,
-so a source that lies about it can at
-worst cause a replacement that consensus rejects as a double spend; the old
-transaction stays listed as superseded. A refusal about one note alone (its
-nullifier is already spent, its witness anchor is unknown, another mempool
-transaction spends it, or the mempool evicted it) records that note as
-rejected, and the sweep continues with the next note. Any other reply from the
-primary submission endpoint remains **SubmissionUnknown** until observation
-resolves its lifecycle. On a network whose NU7 activation height is assigned
-(testnet: 4,465,026), Argos refuses to build a Sprout transaction for a block
-at or past activation, because NU7 disables the version 4 format Sprout needs.
-
-The journal (`sprout-sweep-<fingerprint>.journal` inside the authenticated
-per-key root under the data directory) holds each note's outpoint and swept
-value, each transaction's exact signed bytes, fee and expiry, and its lifecycle
-states with the observations behind them. It holds no spending keys and no note
-plaintexts, so it cannot spend anything, but the signed bytes reveal each
-note's nullifier and link the wallet's Sprout notes to their sweep transactions.
-On Unix it is kept at
-`0600`. It is appended one synced record at a time, not atomically replaced: a
-crash can leave a torn final record, which the next run discards. Legacy direct
-journals and in-root versions 1 through 3 are preserved unchanged and refused;
-they are never upgraded in place or treated as proof that submission completed.
-Keep the wallet or key, checkpoint, and journal available through every retry
-and restart. A checkpoint is retained while any manifested note is prepared,
-unknown, pending, contested, rejected, expired but recoverable, missing, or not
-fully reconciled. After a scan-derived sweep, the CLI and GUI automatically
-invoke the guarded cleanup machinery. It requires
-the current checkpoint notes to equal the durable manifest for the exact
-checkpoint generation (lineage anchor, authority generation, length, digest,
-and file object), and every entry to be currently mined with the same canonical
-block height and hash in the two newest separate reconciliation rounds. Each
-round needs matching observations from two independent operator authorities at
-a depth of 100 blocks. An intervening single-operator, disputed, unavailable,
-or failed observation restarts that two-round requirement while preserving the
-saved transaction and its lifecycle history. A durable
-discard-start record and note tombstones preserve the generation, manifest,
-signed transaction bytes, and evidence before authority
-enters `Retiring`. The exact object is then quarantined and deleted, authority
-becomes `Retired`, and the journal records completion last. A restart restores
-any surviving canonical or quarantined checkpoint for fresh review; it never
-uses stale observations to finish deleting that survivor.
-
-Checkpoint replacement and deletion use retained handles and same-directory
-staging. Keep the Argos private data directory and its staging files on one
-filesystem. On Unix, a hostile process running as the same user can still race
-the final identity check and `unlinkat`; filesystem modes do not isolate the
-same UID. On Windows, the exact handle, namespace-rooted operations, DACLs, and
-delete behavior must pass native x64 Windows CI as the final execution gate;
-ARM64 remains a compile-only CI target. Do not run an older Argos version
-concurrently against the same Sprout data directory: older binaries do not
-honor the directory-wide network operation guard. Current Argos repeats
-sibling-journal validation just before every send, but an older process can
-still race after that final check.
-
-Configure confirmation sources with the global option
-`--confirmation-source operator-id=https://host:port`, repeated for distinct,
-independently administered operators. Use a stable operator label; two hosts or
-mirrors run by one operator count as one source and must not be relabelled as
-independent. To reconcile the Sprout journal automatically, rerun the confirmed
-`sweep-sprout` command or confirmed `scan-sprout` sweep with the same keys,
-network, and `--data-dir`; the generic `reconcile` command does not read the
-Sprout journal.
-
-Sprout scan checkpoints written before block bodies were authenticated against
-their headers (checkpoint versions 1 to 3, including scans saved with a
-decrypt-from bound) are refused for resume and as spend evidence. Preserve the
-whole old data directory and the spending-key source, reconcile its transaction
-history as described above, choose a genuinely absent data-directory path, and
-run a fresh scan; the decrypt-from bound is derived again from the wallet when
-it starts.
-
-```bash
-# First see whether the wallet already has spendable note data.
-argos --wallet-file /path/to/wallet.dat inspect-wallet
-
-# Preview a direct wallet-backed Sprout sweep.
-argos --wallet-file /path/to/wallet.dat \
-  --confirmation-source operator-a=https://lightwalletd-a.example:443 \
-  --confirmation-source operator-b=https://lightwalletd-b.example:443 \
-  sweep-sprout \
-  --destination u1... --dry-run
-
-# Scan one or more standalone keys, then optionally sweep the result.
-chmod 600 sprout-keys.txt
-argos --sprout-key-file sprout-keys.txt scan-sprout
-argos --sprout-key-file sprout-keys.txt scan-sprout \
-  --destination u1... --confirm-sweep
-```
-
-Sprout funds land in Sapling, even when the destination is a Unified Address.
-A Sprout JoinSplit is a version 4 transaction while Orchard actions require
-version 5, so one transaction cannot reach Orchard. If desired, move the
-funds from Sapling to Orchard afterward from your own wallet. Broadcasting a
-Sprout sweep also requires the approximately 725 MB
-`sprout-groth16.params`; Argos checks `--sprout-params`, then
-`$ARGOS_SPROUT_PARAMS`, then the conventional `~/.zcash-params` location.
-
-Ordinary imported-key results state that Sprout is handled separately rather
-than folding it silently into a zero balance. Argos will not
-report a balance that silently excludes a pool it never looked at — "0.5
-ZEC recovered" reads as complete to the person who most needs the answer,
-so every uncovered pool is named, with a reminder to keep the original
-wallet file.
-
-Transparent recovery does not use the wallet-database account model at
-all. That model exists to serve shielded scanning; transparent funds need
-only `GetAddressUtxos` and the transaction builder. This matters because a
-transparent-only wallet *cannot* have an account: ZIP-316 forbids a
-unified viewing key containing only transparent items.
+Existing wallets, checkpoints, journals, and packs are left untouched.
+Old Sprout checkpoints contain raw spending keys: keep them private even though
+Sprout spends are currently disabled. Those keys would still authorize spending
+if consensus rules later re-enabled it; this is not a promise of future recovery.
+Preserve old recovery artifacts and transaction records. This version does
+not reconcile or clean up artifacts created by the removed Sprout workflow.
 
 ## Security audit
 
@@ -355,15 +174,11 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Recovery sessions persist wallet/cache state on disk for auditability and sweep construction. Workspace subdirectories are random per session so the path does not reveal a stable seed fingerprint.
 - New private storage is assembled create-only in a staging root. Argos syncs the root marker, workspace leaf, empty database, and database marker before atomically publishing the root. A crash before publication leaves no trusted final root; a published partial or identity-mismatched generation fails closed. The resume panel represents an insecure or unmarked legacy workspace only as a rescan-required row derived from its path. It never reads that workspace's label, balances, scan height, or database. Preserve that tree, reconcile its pending or unknown transaction IDs using the prior trusted version or independent chain checks, and start a rescan in a genuinely absent data directory; do not delete the old evidence during reconciliation.
 - Private recovery directories and sensitive files use exact current-user-owned `0700`/`0600` modes without extended or inherited ACLs on supported Unix systems. On Windows the current token user must own them and a protected current-user+LocalSystem DACL is required. All reused objects must already match these controls and their create-time lineage before any permission change, read, truncate, append, or other sensitive use. Argos never repairs them in place because changing permissions cannot revoke stale handles. Preserve an insecure or unmarked legacy workspace, reconcile its transaction history using trusted independent evidence, then create a new recovery under a genuinely absent data-directory path and rescan; changing its mode, DACL, or marker does not make it trusted. Windows authenticates the private-root lineage marker with DPAPI `CurrentUser` and keeps a permanent per-leaf/database anchor in HKCU, keyed by the full canonical workspace/database context, whose state advances `Pending` -> `Active` -> `Revoked`. The first database authorization in a process performs an exclusive cold preflight; retained exact-object authority then permits that process's SQLite writer and progress readers to coexist. SQLite sidecars proven absent before connection open are the narrow creation exception: SQLite creates them while Argos retains their exact-private parent, then Argos normalizes and verifies them before releasing that parent. Workspace cleanup first syncs its durable cleanup marker, then revokes the Windows lineage anchor before deleting the tombstone. These controls do not isolate another process running as the same user or an administrator, and rollback of the user's HKCU/profile state remains a Windows residual.
-- The GUI clears seed, passphrase, and pasted-key fields once a scan accepts them; when a running scan finishes, fails, or is cancelled; after Sprout execution; on **Forget this file**, abandonment to the welcome screen, **Start over**, and window close. A failed scan start preserves the wallet passphrase and pasted keys for retry within the existing review deadline; changing the data directory invalidates derived scan and proposal evidence. Ordinary navigation and a wallet-inspection error also keep the wallet passphrase only within the active review window: the GUI drops the passphrase, pasted keys, and opaque review ID after 29 minutes, before the backend's 30-minute review limit. Finished Sprout scan secrets expire after 30 minutes; reviewed proposals expire 15 minutes after creation and carry their exact source identity until then. Running scans retain their keys until completion or explicit release, and release waits for workers before the last owner is dropped.
+- The GUI clears seed, passphrase, and pasted-key fields once a scan accepts them; when a running scan finishes, fails, or is cancelled; on **Forget this file**, abandonment to the welcome screen, **Start over**, and window close. A failed scan start preserves the wallet passphrase and pasted keys for retry within the existing review deadline; changing the data directory invalidates derived scan and proposal evidence. Ordinary navigation and a wallet-inspection error also keep the wallet passphrase only within the active review window: the GUI drops the passphrase, pasted keys, and opaque review ID after 29 minutes, before the backend's 30-minute review limit. Running scans retain their keys until completion or explicit release, and release waits for workers before the last owner is dropped.
 - Secret owners use best-effort zeroization on drop. This shortens ordinary plaintext lifetime but cannot defeat swap, crash/core dumps, allocator or compiler copies, kernel caches, DMA, forensic capture, or a compromised process; use an encrypted disk and encrypted or disabled swap for high-value recovery.
 - Transparent funds are imported into the wallet workspace using Argos's audited legacy derivation, not modern per-account transparent derivation.
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
-- Sprout transactions are journaled before submission in version-4 authenticated roots bound to the network, full key-set fingerprint, lineage anchor, and artifact generation. Argos rejects overlapping note claims across sibling roots. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. A saved transaction is rebuilt only after a configured source reports it absent more than 20 blocks past its expiry height; the old transaction remains visible as superseded. A refusal about one note alone records that note as rejected and the sweep continues; any other non-accept reply from the primary submission endpoint remains SubmissionUnknown until observation resolves it.
-- Keep the original wallet or Sprout key, scan checkpoint, and journal until Argos reports fresh canonical mined evidence for every saved Sprout transaction. A scan-derived sweep may remove the exact checkpoint through guarded cleanup only after the same canonical mined height and block hash survive the two newest independently corroborated depth-100 reconciliation rounds; otherwise Argos retains it and reports why. A broadcast, visible arrival, node acceptance, or one confirmation is insufficient.
-- A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
-- A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.
 - The GUI defaults to auto gap-limit mode and can switch to an explicit account count when the user wants an exact scan depth.
 - The desktop complete screen can save a plain-text recovery report inside the persisted workspace.
 

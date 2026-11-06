@@ -2,7 +2,7 @@
 //! viewing key it was stored under.
 //!
 //! The third of this crate's genuineness tests, after
-//! `sprout_key_is_genuine.rs` and `transparent_key_is_genuine.rs`. Sapling
+//! `transparent_key_is_genuine.rs`. Sapling
 //! was the pool that had none — which is exactly the gap that let a
 //! `csapzkey` of any length through the parser: the encrypted path pushed
 //! whatever `decrypt` returned, and nothing downstream of it in this crate

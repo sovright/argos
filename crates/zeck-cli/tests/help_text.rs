@@ -43,8 +43,6 @@ fn top_level_help_matches_behaviour() {
     // scan.rs imports the complete transparent range only when
     // `account.index == 0`.
     assert!(h.contains("account 0 only"), "{h}");
-    // ...and must not read as though that clamp applies to Sprout.
-    assert!(h.contains("scan-sprout` is not affected"), "{h}");
     // The default server is mainnet whatever --network says, and the
     // lightwalletd chain-name check then refuses it for testnet.
     assert!(h.contains("https://testnet.zec.rocks:443"), "{h}");
@@ -58,11 +56,6 @@ fn top_level_help_matches_behaviour() {
         !h.contains("Supersedes --birthday and --birthday-date"),
         "{h}"
     );
-    // `collect_sprout_scan_keys` is its only reader.
-    assert!(h.contains("Read only by `scan-sprout`"), "{h}");
-    // `refuse_unconsumed_birthday_skip` refuses the date and auto-detect
-    // flags on `scan-sprout`, which reads --birthday alone.
-    assert!(h.contains("Refused by `scan-sprout`"), "{h}");
     // `needs_chain_fallback`: an undated Sapling key rules out the UTXO
     // fallback, so Sapling is scanned from activation.
     assert!(h.contains("unless a Sapling key is undated"), "{h}");
@@ -113,67 +106,8 @@ fn reconcile_help_explains_observation_and_exact_byte_resubmission() {
 }
 
 #[test]
-fn scan_sprout_help_describes_custom_priority_and_public_fallback() {
-    // `connect_to_any` tries custom peers in their own priority tier, then
-    // public candidates and a separate mainnet fallback tier.
-    let h = help(&["scan-sprout"]);
-    let prose = h.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(!h.contains("instead of the DNS seeds"), "{h}");
-    assert!(
-        prose.contains("own priority batches before public DNS-seed peers"),
-        "{h}"
-    );
-    assert!(
-        prose.contains("If those attempts fail, Argos samples public peers"),
-        "{h}"
-    );
-    // `first_scan_height` starts a fresh walk at 1 and the walk ends only at
-    // the chain tip (`empty_reply_is_chain_tip`): the pre-Sapling era is
-    // covered, so are Sprout notes after Canopy, and no birthday narrows it.
-    assert!(h.contains("from height 1"), "{h}");
-    assert!(h.contains("before Sapling activation"), "{h}");
-    assert!(h.contains("to the chain tip"), "{h}");
-    assert!(h.contains("after Canopy"), "{h}");
-    assert!(
-        !h.contains("not including, Canopy"),
-        "the scan no longer stops at Canopy: {h}"
-    );
-    // `connect_with_resolver` gives mainnet fallbacks their own final tier.
-    assert!(h.contains("fallback nodes run by the Argos project"), "{h}");
-    // `default_params_path` treats the variable as the file itself.
-    assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
-    // `plan_sprout_decrypt`: the walk always starts at 1; a dated wallet
-    // may skip trial decryption, and --birthday can only lower that.
-    assert!(!h.contains("--birthday does not apply"), "{h}");
-    assert!(h.contains("--no-birthday-skip"), "{h}");
-    assert!(h.contains("can only lower"), "{h}");
-    // It also takes --wallet-file, and broadcasts through lightwalletd.
-    // Pinned to the prose: with top-level flags global (#232), the option
-    // list names --wallet-file on every subcommand, so a bare
-    // `contains("--wallet-file")` would pass with the sentence deleted.
-    assert!(h.contains("--wallet-file, or both"), "{h}");
-    assert!(h.contains("lightwalletd"), "{h}");
-}
-
-#[test]
-fn sweep_sprout_help_names_the_network_it_broadcasts_to() {
-    // `sweep_sprout_notes` runs `validate_lightwalletd_network`, and the
-    // default server is mainnet.
-    let h = help(&["sweep-sprout"]);
-    assert!(h.contains("must serve --network"), "{h}");
-    assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
-}
-
-#[test]
 fn inspect_wallet_help_names_both_inputs() {
     // The key-source match accepts a key file alone for inspect-wallet.
     let h = help(&["inspect-wallet"]);
     assert!(h.contains("--sapling-key-file"), "{h}");
-}
-
-#[test]
-fn scan_sprout_help_describes_the_automatic_pack_download() {
-    let h = help(&["scan-sprout"]);
-    assert!(h.contains("--no-sprout-pack-download"), "{h}");
-    assert!(h.contains("downloaded automatically"), "{h}");
 }
