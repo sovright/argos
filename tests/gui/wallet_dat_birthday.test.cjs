@@ -43,10 +43,22 @@ test("pre-Sapling heights get pre-Sapling dates, never before genesis", () => {
 
 const hint = loadFunction("birthdayDetectHint");
 
-test("a seed-path result keeps its short hint", () => {
-  const text = hint({ birthday: 1_500_000, method: "transparent", message: "m" }, "Jan 2022");
-  const block = (1_500_000).toLocaleString();
-  assert.equal(text, `✓ Auto-detected birthday: block ${block} (≈ Jan 2022).`);
+test("a seed-path result shows the core's late-birthday caution", () => {
+  const message =
+    "Transparent activity detected at block 1510000. Birthday set 10000 blocks earlier to 1500000. " +
+    "Argos will scan only from block 1500000 forward, so any notes received before it will not be found. " +
+    "If this wallet is older than that, set an earlier birthday and rescan.";
+  for (const method of ["transparent", "shielded_probe", "no_activity"]) {
+    const text = hint({ birthday: 1_500_000, method, message }, "Jan 2022");
+    const block = (1_500_000).toLocaleString();
+    assert.ok(text.startsWith(`✓ Auto-detected birthday: block ${block} (≈ Jan 2022).`), text);
+    assert.ok(text.includes(message), `${method}: ${text}`);
+  }
+});
+
+test("a result without a message keeps the short hint", () => {
+  const text = hint({ birthday: 1_500_000, method: "transparent" }, "Jan 2022");
+  assert.equal(text, `✓ Auto-detected birthday: block ${(1_500_000).toLocaleString()} (≈ Jan 2022).`);
 });
 
 test("a wallet.dat result names the key creation times and keeps the core's caveat", () => {
