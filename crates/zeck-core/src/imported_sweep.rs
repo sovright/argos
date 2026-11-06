@@ -962,7 +962,6 @@ async fn sweep_imported_wallet_into(
     outcome: &mut ImportedSweepOutcome,
     review: ImportedSweepReview<'_>,
 ) -> ZeckResult<()> {
-    use crate::imported::imported_transparent_keys;
     let ImportedSweepReview {
         sapling_fees: reviewed_sapling_fees,
         transparent_fee: reviewed_transparent_fee,
@@ -989,7 +988,8 @@ async fn sweep_imported_wallet_into(
 
     // Transparent, through the path that needs no account at all.
     let transparent_result = run_transparent_followup(!outcome.followup_blocked, || async {
-        let transparent = imported_transparent_keys(keys)?;
+        // The whole sweepable set; an uncompressed key cannot be signed for.
+        let transparent = crate::imported::sweepable_transparent_keys(keys)?;
         submit_transparent_followup(
             &mut log,
             &transparent,
@@ -1667,6 +1667,7 @@ mod routing_tests {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             });
             keys
         };

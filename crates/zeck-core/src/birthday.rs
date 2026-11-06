@@ -1910,6 +1910,7 @@ mod tests {
             secret: Secret::new([byte; 32]),
             provenance: Provenance::HdDerived,
             created_at,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         }
     }
 

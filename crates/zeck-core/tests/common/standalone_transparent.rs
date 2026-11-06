@@ -35,6 +35,7 @@ pub fn imported_transparent_key(
         secret: Secret::new(secret.secret_bytes()),
         provenance: Provenance::Standalone,
         created_at: None,
+        pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
     });
     secret.non_secure_erase();
 

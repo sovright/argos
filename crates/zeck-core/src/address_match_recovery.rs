@@ -76,6 +76,9 @@ pub fn prepare_match_recovery(
                 secret: Secret::new(secret.secret_bytes()),
                 provenance: Provenance::HdDerived,
                 created_at: None,
+                // Seed-derived, and matched just above against the address
+                // derivation produces, which is the compressed one.
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             });
             Ok(Arc::new(MatchedImportedKeySource::new(keys, coordinates)))
         }

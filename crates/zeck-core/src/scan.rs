@@ -351,6 +351,7 @@ impl ScanTaskState {
                 sleep_event: None,
                 in_sandblasting_zone: false,
                 gap_extension: None,
+                unsweepable_transparent: Vec::new(),
             },
             cancelled: Arc::new(AtomicBool::new(false)),
             workspace: None,
@@ -502,6 +503,35 @@ async fn run_recovery_scan_inner(
             "Validating keys from {}.",
             config.key_source.describe()
         ));
+    }
+
+    // Keys Argos holds but cannot sweep yet (transparent keys filed in
+    // uncompressed form) are looked up here, at their own addresses, before
+    // any route runs: every route below takes only keys it can sweep, so this
+    // is the one place their coins are seen. The result is reported on its
+    // own and never joins an account balance.
+    if let Some(keys) = config.key_source.imported_keys() {
+        let unsweepable: Vec<_> = crate::imported::imported_transparent_keys(keys)?
+            .into_iter()
+            .filter(|key| !key.is_sweepable())
+            .collect();
+        if !unsweepable.is_empty() {
+            {
+                let mut guard = state.lock().await;
+                guard.progress.message = Some(format!(
+                    "Checking {} uncompressed transparent address(es), which Argos can show \
+                     but not sweep yet…",
+                    unsweepable.len()
+                ));
+            }
+            let found = crate::transparent_recovery::probe_unsweepable_transparent(
+                &unsweepable,
+                config.network,
+                &config.lightwalletd_url,
+            )
+            .await?;
+            state.lock().await.progress.unsweepable_transparent = found;
+        }
     }
 
     // Every account slot the HD scanner walks is derived from a seed. A
@@ -1211,7 +1241,11 @@ async fn register_mixed_keys(
     let resolved = imported_transparent_keys(keys)?;
     let mut selected_transparent = Vec::new();
     for (key_index, key) in keys.transparent.iter().enumerate() {
+        // Selected by index into `keys.transparent`, which `resolved` is
+        // aligned with. An uncompressed key is never selected: it cannot be
+        // registered or swept, and the import already reports it.
         if key.provenance == Provenance::Standalone
+            && resolved[key_index].is_sweepable()
             && transparent_seen.insert(resolved[key_index].address)
         {
             selected_transparent.push(key_index);
@@ -1280,7 +1314,7 @@ async fn register_mixed_keys(
     for &key_index in &selected_transparent {
         let key = &resolved[key_index];
         if !existing.contains_key(&key.address) {
-            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, key.secret_key());
+            let pubkey = key.standalone_receiver_pubkey(&secp)?;
             wallet_db
                 .import_standalone_transparent_pubkey(anchor_id, pubkey)
                 .map_err(|err| {
@@ -1565,9 +1599,7 @@ async fn run_imported_scan(
     config: &RuntimeScanConfig,
     keys: &argos_wallet_import::ImportedKeys,
 ) -> ZeckResult<()> {
-    use crate::imported::{
-        imported_account_display, imported_transparent_keys, register_imported_accounts,
-    };
+    use crate::imported::{imported_account_display, register_imported_accounts};
 
     {
         let mut guard = state.lock().await;
@@ -1648,7 +1680,9 @@ async fn run_imported_scan(
         let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), network)?;
         register_imported_accounts(&mut wallet_db, keys, &account_birthday)?
     };
-    let resolved_transparent = imported_transparent_keys(keys)?;
+    // The quick probe fills the first account's balance, which the sweep
+    // then moves: keys Argos cannot sweep stay out of it.
+    let resolved_transparent = crate::imported::sweepable_transparent_keys(keys)?;
 
     let mut displays = Vec::with_capacity(registered.len());
     let mut tracked = Vec::with_capacity(registered.len());
@@ -1755,7 +1789,8 @@ async fn run_transparent_only_scan(
     config: &RuntimeScanConfig,
     keys: &argos_wallet_import::ImportedKeys,
 ) -> ZeckResult<()> {
-    let transparent = crate::imported::imported_transparent_keys(keys)?;
+    // Only keys Argos can sweep: the report below is what the sweep moves.
+    let transparent = crate::imported::sweepable_transparent_keys(keys)?;
 
     // Before the network call, not after: a scan that dies at the endpoint
     // must still leave a session behind. This path used to create the
@@ -4140,6 +4175,7 @@ mod tests {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             });
             assert_eq!(
                 crate::key_source::classify_recovery_route(&keys),

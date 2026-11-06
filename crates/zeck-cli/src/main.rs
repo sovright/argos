@@ -972,7 +972,14 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
         keys.sapling.len()
     };
     warn_about_partial_import(keys);
-    if uncovered_sapling == 0 && keys.sprout.is_empty() {
+    // Read and kept with its own address, but no path here can sweep it yet:
+    // it is left out of every scan and sweep below, so it is named here.
+    let uncompressed = keys
+        .transparent
+        .iter()
+        .filter(|key| key.pubkey_form == argos_wallet_import::PubkeyForm::Uncompressed)
+        .count();
+    if uncovered_sapling == 0 && keys.sprout.is_empty() && uncompressed == 0 {
         return;
     }
 
@@ -994,6 +1001,13 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
         );
         eprintln!("    Sprout is recovered separately — run `inspect-wallet` to see what");
         eprintln!("    this file holds for them, and what recovering them would cost.");
+    }
+    if uncompressed > 0 {
+        eprintln!(
+            "    {uncompressed} uncompressed transparent key(s) in this wallet are NOT swept here."
+        );
+        eprintln!("    Argos cannot sweep them yet. Their addresses are checked and listed");
+        eprintln!("    separately; no swept balance below includes them.");
     }
     eprintln!("    Any balance reported below excludes those pools entirely.");
     eprintln!("    Keep the original wallet file: those keys exist only there.");
@@ -2501,7 +2515,17 @@ async fn print_wallet_inspection(
         Ok(resolved) if !resolved.is_empty() => {
             println!("Transparent addresses:");
             for key in &resolved {
-                println!("  {}", encode_transparent_address(&key.address, network));
+                // Each address is the one the wallet filed the key under. An
+                // uncompressed key's coins sit at its uncompressed address,
+                // which Argos can show but cannot sweep yet.
+                if key.is_sweepable() {
+                    println!("  {}", encode_transparent_address(&key.address, network));
+                } else {
+                    println!(
+                        "  {}  (uncompressed key: not swept by Argos yet; keep the wallet file)",
+                        encode_transparent_address(&key.address, network)
+                    );
+                }
             }
             println!();
         }
@@ -3040,10 +3064,20 @@ async fn main() -> Result<()> {
             match &cli.command {
                 Commands::Scan => {
                     warn_about_uncovered_pools(keys, false);
-                    let resolved = imported_transparent_keys(keys)?;
+                    let resolved = argos_core::imported::sweepable_transparent_keys(keys)?;
                     let report =
                         scan_transparent_only(&resolved, network, &cli.lightwalletd_url).await?;
                     print_transparent_report(&report);
+                    // The keys left out above are still looked up, at their
+                    // own addresses, and reported on their own.
+                    let unsweepable =
+                        argos_core::transparent_recovery::probe_unsweepable_transparent(
+                            &imported_transparent_keys(keys)?,
+                            network,
+                            &cli.lightwalletd_url,
+                        )
+                        .await?;
+                    print_unsweepable_transparent(&unsweepable);
                     if echo_scan_summary(std::io::stdout().is_terminal()) {
                         eprintln!();
                         eprintln!(
@@ -3064,7 +3098,7 @@ async fn main() -> Result<()> {
                     ..
                 } => {
                     warn_about_uncovered_pools(keys, false);
-                    let resolved = imported_transparent_keys(keys)?;
+                    let resolved = argos_core::imported::sweepable_transparent_keys(keys)?;
                     if !*dry_run {
                         print_single_operator_notice(
                             &cli.lightwalletd_url,
@@ -4004,6 +4038,27 @@ fn print_scan_result(progress: &argos_core::ScanProgress) {
             println!();
         }
     }
+    print_unsweepable_transparent(&progress.unsweepable_transparent);
+}
+
+/// Coins at the addresses of keys Argos cannot sweep yet. Printed apart from
+/// every balance a sweep moves, and never silent when there are such keys.
+fn print_unsweepable_transparent(rows: &[argos_core::models::UnsweepableTransparentFunds]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("━━━ Not swept: uncompressed transparent keys ━━━");
+    for row in rows {
+        println!(
+            "  {}  {} in {} UTXO(s)",
+            row.address,
+            format_zec(row.zatoshis),
+            row.utxo_count
+        );
+    }
+    println!("  Argos cannot sweep these yet. Keep the original wallet file: it is the");
+    println!("  only copy of these keys.");
 }
 
 /// CLI-specific follow-ups to the shared completion guidance: the commands
@@ -4836,12 +4891,14 @@ mod tests {
                 secret: Secret::new([1; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
             });
             if include_second {
                 imported.transparent.push(TransparentKey {
                     secret: Secret::new([2; 32]),
                     provenance: Provenance::Standalone,
                     created_at: None,
+                    pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
                 });
             }
             imported_transparent_keys(&imported).unwrap()
@@ -5395,6 +5452,7 @@ mod tests {
             sleep_event: None,
             in_sandblasting_zone: false,
             gap_extension: None,
+            unsweepable_transparent: Vec::new(),
         }
     }
 

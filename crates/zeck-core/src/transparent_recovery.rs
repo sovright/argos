@@ -97,14 +97,22 @@ pub async fn fetch_transparent_utxos(
     keys: &[ImportedTransparentKey],
     network: ZeckNetwork,
 ) -> ZeckResult<Vec<TransparentUtxo>> {
+    fetch_transparent_utxos_for(client, keys.iter().map(|key| key.address), network).await
+}
+
+/// Fetch every UTXO at `addresses`, by the same rules as
+/// [`fetch_transparent_utxos`]: from height 0, only for addresses asked
+/// about, each script checked against the address.
+async fn fetch_transparent_utxos_for(
+    client: &mut CompactTxStreamerClient<Channel>,
+    addresses: impl IntoIterator<Item = TransparentAddress>,
+    network: ZeckNetwork,
+) -> ZeckResult<Vec<TransparentUtxo>> {
     // Map encoded address back to the parsed form, so a reply can be tied
     // to the key that spends it without re-parsing.
-    let mut by_encoded = std::collections::HashMap::with_capacity(keys.len());
-    for key in keys {
-        by_encoded.insert(
-            encode_transparent_address(&key.address, network),
-            key.address,
-        );
+    let mut by_encoded = std::collections::HashMap::new();
+    for address in addresses {
+        by_encoded.insert(encode_transparent_address(&address, network), address);
     }
 
     let encoded: Vec<String> = by_encoded.keys().cloned().collect();
@@ -219,6 +227,70 @@ fn deduplicate_fetched_utxos(utxos: Vec<TransparentUtxo>) -> ZeckResult<Vec<Tran
         unique.push(utxo);
     }
     Ok(unique)
+}
+
+/// What sits at each address of a key Argos holds but cannot sweep yet.
+///
+/// One row per distinct unsweepable address, in key order, including the
+/// ones that hold nothing, so the report says each was checked. A UTXO is
+/// counted only at the address it was returned for; nothing here feeds a
+/// balance a sweep would move.
+pub fn summarize_unsweepable(
+    keys: &[ImportedTransparentKey],
+    utxos: &[TransparentUtxo],
+    network: ZeckNetwork,
+) -> Vec<crate::models::UnsweepableTransparentFunds> {
+    let mut rows: Vec<(TransparentAddress, u64, u32)> = Vec::new();
+    for key in keys.iter().filter(|key| !key.is_sweepable()) {
+        if !rows.iter().any(|(address, _, _)| *address == key.address) {
+            rows.push((key.address, 0, 0));
+        }
+    }
+    for utxo in utxos {
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|(address, _, _)| *address == utxo.address)
+        {
+            row.1 = row.1.saturating_add(u64::from(utxo.txout.value()));
+            row.2 = row.2.saturating_add(1);
+        }
+    }
+    rows.into_iter()
+        .map(
+            |(address, zatoshis, utxo_count)| crate::models::UnsweepableTransparentFunds {
+                address: encode_transparent_address(&address, network),
+                zatoshis,
+                utxo_count,
+            },
+        )
+        .collect()
+}
+
+/// Look up the coins at the addresses of keys Argos cannot sweep yet.
+///
+/// Read-only: the same `GetAddressUtxos` lookup the sweepable keys get,
+/// from height 0, matched by the same rules. Keys Argos can sweep are not
+/// looked up here; their own scan does that.
+pub async fn probe_unsweepable_transparent(
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> ZeckResult<Vec<crate::models::UnsweepableTransparentFunds>> {
+    let unsweepable: Vec<&ImportedTransparentKey> =
+        keys.iter().filter(|key| !key.is_sweepable()).collect();
+    if unsweepable.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let utxos = fetch_transparent_utxos_for(
+        &mut client,
+        unsweepable.iter().map(|key| key.address),
+        network,
+    )
+    .await?;
+    Ok(summarize_unsweepable(keys, &utxos, network))
 }
 
 /// Summarize a UTXO set into a per-address report.
@@ -620,7 +692,7 @@ where
     let mut signing_set = TransparentSigningSet::new();
     let mut pubkey_for_address = std::collections::HashMap::new();
     for key in keys {
-        let pubkey = signing_set.add_key(key.signing_key_copy());
+        let pubkey = signing_set.add_key(key.signing_key_copy()?);
         pubkey_for_address.insert(key.address, pubkey);
     }
 
@@ -1050,6 +1122,93 @@ mod tests {
         assert_eq!(report.funded[0].utxo_count, 2);
     }
 
+    /// Secret key 1 in both forms, compressed first.
+    fn secret_one_in_both_forms() -> argos_wallet_import::ImportedKeys {
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        let mut keys = argos_wallet_import::ImportedKeys::default();
+        for form in [
+            argos_wallet_import::PubkeyForm::Compressed,
+            argos_wallet_import::PubkeyForm::Uncompressed,
+        ] {
+            keys.transparent
+                .push(argos_wallet_import::keys::TransparentKey {
+                    secret: secrecy::Secret::new(secret),
+                    provenance: argos_wallet_import::Provenance::Standalone,
+                    created_at: None,
+                    pubkey_form: form,
+                });
+        }
+        keys
+    }
+
+    #[test]
+    fn both_forms_of_one_secret_keep_their_coins_apart_and_lose_none() {
+        let keys = secret_one_in_both_forms();
+        let all = crate::imported::imported_transparent_keys(&keys).expect("resolve");
+        let (compressed, uncompressed) = (all[0].address, all[1].address);
+        assert_ne!(compressed, uncompressed, "one secret, two addresses");
+
+        let utxos = vec![
+            utxo(compressed, 1_000, 0xA1),
+            utxo(uncompressed, 2_000, 0xB1),
+            utxo(uncompressed, 3_000, 0xB2),
+        ];
+
+        // The sweep is given the compressed key only, so only its coins.
+        let sweepable = crate::imported::sweepable_transparent_keys(&keys).expect("sweepable");
+        assert_eq!(
+            sweepable.iter().map(|key| key.address).collect::<Vec<_>>(),
+            vec![compressed]
+        );
+        let swept: u64 = utxos
+            .iter()
+            .filter(|coin| sweepable.iter().any(|key| key.address == coin.address))
+            .map(|coin| u64::from(coin.txout.value()))
+            .sum();
+        assert_eq!(swept, 1_000);
+
+        // The uncompressed key's coins are reported at its own address.
+        let report = summarize_unsweepable(&all, &utxos, ZeckNetwork::Mainnet);
+        assert_eq!(
+            report,
+            vec![crate::models::UnsweepableTransparentFunds {
+                address: "t1X9yaRpCHJpWX1HrGUxEu39xyQinmo3Ana".to_owned(),
+                zatoshis: 5_000,
+                utxo_count: 2,
+            }]
+        );
+
+        // Every coin is in exactly one of the two, so none is lost.
+        let reported: u64 = report.iter().map(|row| row.zatoshis).sum();
+        assert_eq!(swept + reported, 6_000);
+
+        // And the sweep's record names it as left behind.
+        let skipped = report[0].as_skipped_sweep().expect("funded, so skipped");
+        assert_eq!(skipped.account_index, 0);
+        assert_eq!(skipped.gross_zatoshis, 5_000);
+        assert!(skipped
+            .reason
+            .contains("t1X9yaRpCHJpWX1HrGUxEu39xyQinmo3Ana"));
+        assert!(skipped.reason.contains("Keep the original wallet file"));
+    }
+
+    #[test]
+    fn an_empty_uncompressed_address_is_still_listed_as_checked() {
+        let keys = secret_one_in_both_forms();
+        let all = crate::imported::imported_transparent_keys(&keys).expect("resolve");
+
+        let report = summarize_unsweepable(&all, &[], ZeckNetwork::Mainnet);
+
+        assert_eq!(report.len(), 1, "the uncompressed address was looked up");
+        assert_eq!(report[0].zatoshis, 0);
+        assert_eq!(report[0].utxo_count, 0);
+        assert!(
+            report[0].as_skipped_sweep().is_none(),
+            "nothing there, so nothing is left behind"
+        );
+    }
+
     #[test]
     fn repeated_outpoint_is_counted_only_once() {
         // A lightwalletd batch can repeat the same outpoint. It is still one
@@ -1162,7 +1321,11 @@ mod sweep_tests {
         use crate::broadcast::DurableBroadcastLog;
 
         let mut secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let key = crate::imported::ImportedTransparentKey::new(&mut secret, addr(1));
+        let key = crate::imported::ImportedTransparentKey::new(
+            &mut secret,
+            addr(1),
+            argos_wallet_import::PubkeyForm::Compressed,
+        );
         let utxos = vec![utxo(addr(1), 1_000_000, 9)];
         let built = plan_sweep(&MAIN_NETWORK, height(), &utxos)
             .unwrap()
@@ -1537,6 +1700,7 @@ mod seedless_destination_tests {
                 secret: secrecy::Secret::new([1u8; 32]),
                 provenance: argos_wallet_import::Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             }],
             ..Default::default()
         }

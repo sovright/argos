@@ -514,6 +514,10 @@ fn recover_tkey(
                 secret: secret.into_secret(),
                 provenance,
                 created_at: None,
+                // `transparent_matches_address` just matched the stored
+                // address against the compressed P2PKH address of this
+                // secret, so compressed is the form that holds its coins.
+                pubkey_form: crate::keys::PubkeyForm::Compressed,
             },
             network,
         ),
@@ -687,6 +691,8 @@ fn read_key_vectors(
                         secret,
                         provenance: Provenance::HdDerived,
                         created_at: None,
+                        // Matched against the compressed address above.
+                        pubkey_form: crate::keys::PubkeyForm::Compressed,
                     });
                 } else {
                     out.diagnostics

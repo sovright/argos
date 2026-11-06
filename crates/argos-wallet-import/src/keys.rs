@@ -17,6 +17,39 @@ pub enum Provenance {
     Standalone,
 }
 
+/// How a transparent key's public key is serialized, and so which P2PKH
+/// address holds its coins.
+///
+/// zcashd inherits Bitcoin Core's `CKey::fCompressed`: `importprivkey` takes
+/// it from the WIF's trailing `0x01` byte, and the wallet files the key
+/// under that serialization of its public key. The address is `Hash160` of
+/// those exact bytes, so one secret has two different addresses, and a key
+/// read in the wrong form is scanned at an address that never held its
+/// coins. Every key zcashd generates itself is compressed; uncompressed ones
+/// come only from importing an old uncompressed WIF.
+///
+/// No `Default`: every place that makes a [`TransparentKey`] has to say
+/// which form it read, so no key can fall into the wrong one by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PubkeyForm {
+    /// The 33-byte SEC1 form, `02`/`03` || x.
+    Compressed,
+    /// The 65-byte SEC1 form, `04` || x || y.
+    Uncompressed,
+}
+
+impl PubkeyForm {
+    /// The form a serialized secp256k1 public key of `len` bytes is in.
+    /// `None` for any other length.
+    pub fn of_serialized_len(len: usize) -> Option<Self> {
+        match len {
+            33 => Some(Self::Compressed),
+            65 => Some(Self::Uncompressed),
+            _ => None,
+        }
+    }
+}
+
 /// Network identity found in a wallet's own metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddedNetwork {
@@ -87,6 +120,9 @@ pub struct TransparentKey {
     /// bound on where funds can be is derived from it with a margin, never
     /// used as a height directly.
     pub created_at: Option<i64>,
+    /// The form the wallet filed this key's public key in, which decides its
+    /// address. See [`PubkeyForm`].
+    pub pubkey_form: PubkeyForm,
 }
 
 impl std::fmt::Debug for TransparentKey {
@@ -95,6 +131,7 @@ impl std::fmt::Debug for TransparentKey {
             .field("secret", &"<redacted>")
             .field("provenance", &self.provenance)
             .field("created_at", &self.created_at)
+            .field("pubkey_form", &self.pubkey_form)
             .finish()
     }
 }

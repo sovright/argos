@@ -163,8 +163,20 @@ impl KeySource for ImportedKeySource {
         for k in &self.keys.transparent {
             // Public-key-derived material is not available here, so bind
             // to a hash of the secret rather than the secret itself.
+            //
+            // The form is part of a key's identity (one secret, two
+            // addresses), so an uncompressed key gets its own domain. A
+            // compressed key keeps the original one, which keeps every
+            // existing workspace's fingerprint, and so its resume, unchanged.
             let mut inner = Sha256::new();
-            inner.update(b"argos-transparent-id-v1");
+            inner.update(match k.pubkey_form {
+                argos_wallet_import::PubkeyForm::Compressed => {
+                    b"argos-transparent-id-v1".as_slice()
+                }
+                argos_wallet_import::PubkeyForm::Uncompressed => {
+                    b"argos-transparent-uncompressed-id-v1".as_slice()
+                }
+            });
             inner.update(k.secret.expose_secret());
             h.update(inner.finalize());
         }
@@ -289,6 +301,10 @@ pub fn classify_recovery_route(keys: &ImportedKeys) -> RecoveryRoute {
     } else if !keys.sapling.is_empty() {
         RecoveryRoute::ImportedAccounts
     } else if !keys.transparent.is_empty() {
+        // Uncompressed keys count here too. Argos cannot sweep them yet, but
+        // the scan looks their addresses up and reports what they hold
+        // (`ScanProgress::unsweepable_transparent`); refusing the wallet
+        // would hide that balance.
         RecoveryRoute::TransparentOnly
     } else {
         RecoveryRoute::Nothing
@@ -351,6 +367,7 @@ mod tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         let one = ImportedKeySource::new(keys);
 
@@ -522,6 +539,7 @@ mod tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         let source = ImportedKeySource::new(keys);
 
@@ -541,10 +559,57 @@ mod tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         assert_ne!(classify_recovery_route(&keys), RecoveryRoute::Hd);
 
         keys.transparent[0].provenance = Provenance::HdDerived;
         assert_eq!(classify_recovery_route(&keys), RecoveryRoute::Hd);
+    }
+
+    fn secret_one_in(
+        forms: &[argos_wallet_import::PubkeyForm],
+    ) -> argos_wallet_import::ImportedKeys {
+        use argos_wallet_import::keys::{Provenance, TransparentKey};
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        let mut keys = argos_wallet_import::ImportedKeys::default();
+        for form in forms {
+            keys.transparent.push(TransparentKey {
+                secret: secrecy::Secret::new(secret),
+                provenance: Provenance::Standalone,
+                created_at: None,
+                pubkey_form: *form,
+            });
+        }
+        keys
+    }
+
+    #[test]
+    fn a_wallet_of_uncompressed_keys_only_is_still_scanned() {
+        use argos_wallet_import::PubkeyForm;
+        // Refusing it would hide what its addresses hold: the scan reports
+        // those coins even though no sweep moves them.
+        for forms in [
+            &[PubkeyForm::Uncompressed][..],
+            &[PubkeyForm::Uncompressed, PubkeyForm::Compressed][..],
+        ] {
+            assert_eq!(
+                classify_recovery_route(&secret_one_in(forms)),
+                RecoveryRoute::TransparentOnly
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_forms_of_one_secret_are_different_key_sets() {
+        use argos_wallet_import::PubkeyForm;
+        let compressed = ImportedKeySource::new(secret_one_in(&[PubkeyForm::Compressed]));
+        let uncompressed = ImportedKeySource::new(secret_one_in(&[PubkeyForm::Uncompressed]));
+        assert_ne!(
+            compressed.fingerprint().unwrap(),
+            uncompressed.fingerprint().unwrap(),
+            "one secret, two addresses: a workspace for one must not resume as the other"
+        );
     }
 }

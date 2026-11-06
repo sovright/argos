@@ -27,13 +27,13 @@ use crate::{
     bdb::RawRecord,
     error::ImportDiagnostic,
     identity,
-    keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
+    keys::{ImportedKeys, Provenance, PubkeyForm, SaplingKey, SproutKey, TransparentKey},
     secret_bytes::SecretArray,
     zcashd::{
         crypto::MasterKey,
         metadata::{KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
-        RecoveredKeyIds,
+        uncompressed_key_not_swept, RecoveredKeyIds,
     },
     SecretBytes,
 };
@@ -202,35 +202,32 @@ pub fn collect_encrypted(
                     });
                     continue;
                 };
-                // An uncompressed public key means `importprivkey` of an
-                // uncompressed WIF: its coins sit at the P2PKH address of the
-                // 65-byte key. A `TransparentKey` carries no compression flag,
-                // and argos-core scans and spends compressed P2PKH only, so
-                // keeping the secret would scan an address that never held
-                // these coins. Refuse it loudly, as `secret_from_key_der`
-                // already refuses an uncompressed plaintext `key`.
-                if pubkey.len() == 65 {
-                    out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
-                        record_type: "ckey".to_owned(),
-                        reason: "uncompressed public key; only compressed transparent keys are \
-                                 recovered"
-                            .to_owned(),
-                    });
-                    continue;
-                }
+                // The stored public key's length is zcashd's compression flag:
+                // `DecryptKey` (`crypter.cpp`) rebuilds the key with
+                // `key.Set(secret, vchPubKey.IsCompressed())`. A 65-byte key
+                // came from `importprivkey` of an uncompressed WIF, and its
+                // coins sit at the P2PKH address of those 65 bytes, so the form
+                // travels with the key and the address is derived from the
+                // bytes the wallet recorded.
                 let iv = sha256d_iv(pubkey);
                 match read_length_prefixed(value)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
                     .and_then(|p| Some(SecretArray::new(p.as_slice().try_into().ok()?)))
                 {
                     Some(secret) => {
-                        if let Some(secret) = identity::retain_transparent_secret(secret, pubkey) {
+                        if let Some((secret, pubkey_form)) =
+                            identity::retain_transparent_secret(secret, pubkey)
+                        {
                             out.transparent.push(TransparentKey {
                                 secret,
                                 provenance: Provenance::HdDerived,
                                 created_at: metadata
                                     .created_at(MetadataKind::Transparent, &rec.rest),
+                                pubkey_form,
                             });
+                            if pubkey_form == PubkeyForm::Uncompressed {
+                                out.diagnostics.push(uncompressed_key_not_swept("ckey"));
+                            }
                             recovered.transparent.insert(rec.rest);
                         } else {
                             out.diagnostics

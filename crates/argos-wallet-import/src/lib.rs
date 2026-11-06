@@ -36,7 +36,7 @@ pub mod zcashd;
 pub mod zwl;
 
 pub use error::{ImportDiagnostic, ImportError};
-pub use keys::{EmbeddedNetwork, ImportCoverage, ImportedKeys, Provenance, SaplingKey};
+pub use keys::{EmbeddedNetwork, ImportCoverage, ImportedKeys, Provenance, PubkeyForm, SaplingKey};
 pub use secret_bytes::SecretBytes;
 pub use sniff::{sniff, WalletFormat};
 

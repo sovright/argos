@@ -3188,6 +3188,7 @@ function updateScanUI(progress) {
   }
 
   renderAccountRows(progress.accounts);
+  renderUnsweepableTransparent(progress.unsweepable_transparent || []);
 
   // sleep_event is sticky on the backend — once the poller spots a suspend
   // the banner stays up for the rest of the scan, with timestamps and lost
@@ -3286,6 +3287,35 @@ function renderAccountRows(accounts) {
     appendCell(tr, String(acc.status));
     tbody.appendChild(tr);
   });
+}
+
+// Coins at the addresses of keys Argos cannot sweep yet (transparent keys the
+// wallet filed in uncompressed form). Shown apart from the account table,
+// whose balances are what a sweep moves; these never join them.
+function renderUnsweepableTransparent(rows) {
+  const card = $("scan-unsweepable");
+  card.replaceChildren();
+  if (rows.length === 0) {
+    card.style.display = "none";
+    return;
+  }
+  const heading = document.createElement("p");
+  heading.style.fontWeight = "700";
+  heading.textContent = "Not swept: uncompressed transparent keys";
+  card.appendChild(heading);
+  const list = document.createElement("ul");
+  list.className = "discovery-list";
+  rows.forEach((row) => {
+    const li = document.createElement("li");
+    li.textContent = `${row.address}: ${fmt(row.zatoshis)} in ${row.utxo_count} UTXO(s)`;
+    list.appendChild(li);
+  });
+  card.appendChild(list);
+  const note = document.createElement("p");
+  note.textContent =
+    "Argos cannot sweep these yet. Keep the original wallet file: it is the only copy of these keys.";
+  card.appendChild(note);
+  card.style.display = "";
 }
 
 function appendCell(tr, text) {
