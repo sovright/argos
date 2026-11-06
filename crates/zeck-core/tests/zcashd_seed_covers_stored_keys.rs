@@ -107,11 +107,13 @@ fn every_stored_key_is_a_legacy_account_derivation_of_the_seed() {
         // counter: a missing, extra, or duplicated key all fail. Compared
         // with `assert!` rather than `assert_eq!` so a failure does not
         // print spending keys.
-        let master = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed);
+        let master = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed)
+            .expect("valid fixture Sapling key");
         let mut derived_sapling: Vec<Vec<u8>> = (0..counters.sapling)
             .map(|i| {
                 let path = [32, COIN_TYPE, LEGACY_ACCOUNT, i].map(ChildIndex::hardened);
                 sapling_crypto::zip32::ExtendedSpendingKey::from_path(&master, &path)
+                    .expect("valid fixture Sapling path")
                     .to_bytes()
                     .to_vec()
             })
@@ -143,14 +145,14 @@ fn every_stored_key_is_a_legacy_account_derivation_of_the_seed() {
                 account
                     .derive_external_secret_key(child(i))
                     .unwrap()
-                    .secret_bytes()
+                    .to_secret_bytes()
             })
             .collect();
         derived_transparent.extend((0..counters.t_internal).map(|i| {
             account
                 .derive_internal_secret_key(child(i))
                 .unwrap()
-                .secret_bytes()
+                .to_secret_bytes()
         }));
         let mut stored: Vec<[u8; 32]> = keys
             .transparent
@@ -172,7 +174,8 @@ fn every_stored_key_is_a_legacy_account_derivation_of_the_seed() {
         let hd_zero = sapling_crypto::zip32::ExtendedSpendingKey::from_path(
             &master,
             &[32, COIN_TYPE, 0].map(ChildIndex::hardened),
-        );
+        )
+        .expect("valid fixture Sapling path");
         assert!(!keys
             .sapling
             .iter()

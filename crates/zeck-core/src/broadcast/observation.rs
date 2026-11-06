@@ -52,11 +52,13 @@ pub struct TxObservation {
 /// arrives second; the destination is fixed by the reviewed request, so no
 /// value can be redirected. The margin absorbs ordinary tip skew and a short
 /// reorg around the expiry height, which is why a single configured source
-/// suffices.
+/// suffices. This is a chain-depth margin, independent of the target block
+/// interval; NU7 does not change it into a wall-clock timeout.
 pub const EXPIRY_MARGIN_BLOCKS: u32 = 20;
 
 /// Confirmations a corroborated (independent-pair) Mined transaction needs
-/// before Argos tells the user the source keys may be discarded.
+/// before Argos tells the user the source keys may be discarded. This is a
+/// corroborated chain-depth policy, retained across NU7, not elapsed time.
 pub const MIN_DISCARD_CONFIRMATIONS: u32 = 10;
 
 fn independent_evidence_sources(a: &EndpointTxEvidence, b: &EndpointTxEvidence) -> bool {

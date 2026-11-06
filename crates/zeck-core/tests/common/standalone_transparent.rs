@@ -32,7 +32,7 @@ pub fn imported_transparent_key(
 
     let mut keys = ImportedKeys::default();
     keys.transparent.push(TransparentKey {
-        secret: Secret::new(secret.secret_bytes()),
+        secret: Secret::new(secret.to_secret_bytes()),
         provenance: Provenance::Standalone,
         created_at: None,
     });
@@ -47,7 +47,7 @@ pub fn imported_transparent_key(
 /// Derive the standalone key through the same path the importer uses, so
 /// the funder and the test cannot disagree about the address.
 pub fn standalone_transparent_key() -> argos_core::imported::ImportedTransparentKey {
-    let mut secret = secp256k1::SecretKey::from_slice(&STANDALONE_TRANSPARENT_SECRET)
+    let mut secret = secp256k1::SecretKey::from_secret_bytes(STANDALONE_TRANSPARENT_SECRET)
         .expect("the standalone test key is a valid secp256k1 scalar");
     imported_transparent_key(&mut secret)
 }

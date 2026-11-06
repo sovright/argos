@@ -842,18 +842,18 @@ mod tests {
 
     #[cfg(feature = "argos-network")]
     #[test]
-    fn network_validation_accepts_regtest_chain_with_feature() {
-        // With the feature enabled, the regtest chain name is accepted as
-        // a synonym for testnet, and the Sapling-activation-height check
-        // is skipped (regtest activates Sapling at height 1, not testnet's
-        // 280 000).
+    fn network_validation_requires_local_parameters_for_regtest_height() {
+        // Enabling the feature alone must not let a server opt out of the
+        // public testnet height check. Only explicit local parameter setup
+        // (covered by the separate regtest harness process) permits that.
         let info = LightdInfo {
             chain_name: "regtest".to_owned(),
             sapling_activation_height: 1,
             ..LightdInfo::default()
         };
-        validate_lightwalletd_network(ZeckNetwork::Testnet, &info)
-            .expect("regtest chain must be accepted under the argos-network feature");
+        let err = validate_lightwalletd_network(ZeckNetwork::Testnet, &info)
+            .expect_err("a server cannot install local consensus parameters");
+        assert!(err.to_string().contains("Sapling activation height"));
     }
 
     #[cfg(feature = "argos-network")]

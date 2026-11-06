@@ -39,3 +39,6 @@ pub use submission::*;
 
 #[cfg(test)]
 mod tests;
+
+// Fresh-tip validation is shared by submission and exact-byte retries.
+pub(crate) use submission::validate_retry_at_tip;

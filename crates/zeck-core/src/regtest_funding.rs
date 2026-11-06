@@ -254,6 +254,8 @@ pub async fn transfer_from_treasury(
     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
         &mut wallet_db,
         &params,
+        &zcash_client_backend::util::SystemClock,
+        &mut crate::workspace::wallet_rng(),
         &prover,
         &prover,
         &SpendingKeys::new(usk, HashMap::new()),

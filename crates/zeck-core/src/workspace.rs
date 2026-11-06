@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rand_core::OsRng;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use secrecy::{SecretString, SecretVec};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +19,12 @@ use crate::{
     models::{RuntimeScanConfig, TransparentScanConfig, ZeckNetwork},
     private_fs::{self, PrivateOpenMode},
 };
+
+/// OS-backed CSPRNG for the NU7 SDK; fails closed if system entropy is unavailable.
+pub(crate) type WalletRng = UnwrapErr<SysRng>;
+pub(crate) fn wallet_rng() -> WalletRng {
+    UnwrapErr(SysRng)
+}
 
 /// Filename for the per-workspace session metadata sidecar. Lives next to
 /// `wallet.sqlite` inside the workspace root.
@@ -65,12 +71,12 @@ pub(crate) struct WalletDbRebuild {
 impl WalletDbRebuild {
     pub(crate) fn wallet_db(
         &mut self,
-    ) -> WalletDb<&mut rusqlite::Connection, ArgosParams, SystemClock, OsRng> {
+    ) -> WalletDb<&mut rusqlite::Connection, ArgosParams, SystemClock, WalletRng> {
         WalletDb::from_connection(
             &mut self.connection,
             consensus_network(self.network),
             SystemClock,
-            OsRng,
+            wallet_rng(),
         )
     }
 }
@@ -321,7 +327,7 @@ impl RecoveryWorkspace {
                 &mut connection,
                 consensus_network(network),
                 SystemClock,
-                OsRng,
+                wallet_rng(),
             );
             init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
                 ZeckError::Wallet(format!("initializing an in-memory wallet rebuild: {err}"))
@@ -529,6 +535,7 @@ pub fn regtest_local_network() -> LocalNetwork {
         nu6_1: h,
         nu6_2: h,
         nu6_3: h,
+        nu7: None,
     }
 }
 
@@ -548,6 +555,7 @@ impl ArgosParams {
             nu6_1: h,
             nu6_2: h,
             nu6_3: h,
+            nu7: None,
         })
     }
 }
@@ -978,18 +986,23 @@ fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rus
 pub fn open_wallet_db_for_tests(
     path: &Path,
     network: ArgosParams,
-) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>> {
+) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, WalletRng>> {
     open_wallet_db(path, network)
 }
 
 pub(crate) fn open_wallet_db(
     path: &Path,
     network: ArgosParams,
-) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>> {
+) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, WalletRng>> {
     let conn = open_tuned_wallet_connection(path).map_err(|err| {
         ZeckError::Storage(format!("opening wallet database {}: {err}", path.display()))
     })?;
-    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng))
+    Ok(WalletDb::from_connection(
+        conn,
+        network,
+        SystemClock,
+        wallet_rng(),
+    ))
 }
 
 /// On-disk metadata describing a scan session. Written next to the wallet
@@ -1342,8 +1355,12 @@ fn try_build_incomplete_row(
 fn read_synced_height(wallet_db_path: &Path, network: ZeckNetwork) -> Option<u32> {
     let connection = open_wallet_connection_for_listing(wallet_db_path).ok()?;
     rusqlite::vtab::array::load_module(&connection).ok()?;
-    let wallet_db =
-        WalletDb::from_connection(connection, consensus_network(network), SystemClock, OsRng);
+    let wallet_db = WalletDb::from_connection(
+        connection,
+        consensus_network(network),
+        SystemClock,
+        wallet_rng(),
+    );
     let summary = wallet_db
         .get_wallet_summary(ConfirmationsPolicy::MIN)
         .ok()

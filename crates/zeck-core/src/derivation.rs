@@ -168,7 +168,8 @@ fn derive_account(
     let zip32_index = AccountId::try_from(index)
         .map_err(|_| ZeckError::InvalidConfig(format!("account index {index} is out of range")))?;
 
-    let sapling_extsk = sapling::spending_key(seed, network.coin_type(), zip32_index);
+    let sapling_extsk = sapling::spending_key(seed, network.coin_type(), zip32_index)
+        .ok_or_else(|| ZeckError::Internal("Sapling spending-key derivation failed".to_owned()))?;
     let sapling_address = sapling_extsk
         .to_diversifiable_full_viewing_key()
         .default_address()
@@ -180,10 +181,16 @@ fn derive_account(
     let orchard_fvk = orchard::keys::FullViewingKey::from(&orchard_sk);
     let orchard_address = orchard_fvk.address_at(0u32, orchard::keys::Scope::External);
 
-    let unified = UnifiedAddress::try_from_items(vec![
-        Receiver::Orchard(orchard_address.to_raw_address_bytes()),
-        Receiver::Sapling(sapling_address.to_bytes()),
-    ])
+    let unified = UnifiedAddress::try_from_items(
+        zcash_address::unified::Revision::R0,
+        vec![
+            Receiver::Orchard(orchard_address.to_raw_address_bytes()),
+            Receiver::Sapling(sapling_address.to_bytes()),
+        ]
+        .into_iter()
+        .map(zcash_address::unified::Uitem::Data)
+        .collect(),
+    )
     .map_err(|err| ZeckError::Internal(err.to_string()))?;
 
     let child_index = NonHardenedChildIndex::from_index(index).ok_or_else(|| {
@@ -281,8 +288,7 @@ pub(crate) fn transparent_address_from_seed(
     index: u32,
 ) -> ZeckResult<zcash_transparent::address::TransparentAddress> {
     let secret = legacy_transparent_secret_key_for_account(network, seed, account, scope, index)?;
-    let public =
-        secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::signing_only(), &secret);
+    let public = secp256k1::PublicKey::from_secret_key(&secret);
     Ok(zcash_transparent::address::TransparentAddress::from_pubkey(
         &public,
     ))

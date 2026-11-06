@@ -363,7 +363,7 @@ end = "2027-06-26"
 
 [[trusted.hyper-rustls]]
 criteria = "safe-to-deploy"
-user-id = 2751 # Joe Birr-Pixton (ctz)
+user-id = 2751
 start = "2019-03-16"
 end = "2027-06-26"
 
@@ -442,7 +442,7 @@ notes = "PR #248 publisher trust for objc2-user-notifications 0.3.2; bounded to 
 
 [[trusted.openssl-probe]]
 criteria = "safe-to-deploy"
-user-id = 4556 # Dirkjan Ochtman (djc)
+user-id = 4556
 start = "2025-12-29"
 end = "2027-06-26"
 
@@ -490,13 +490,13 @@ end = "2027-06-23"
 
 [[trusted.rustls-native-certs]]
 criteria = "safe-to-deploy"
-user-id = 4556 # Dirkjan Ochtman (djc)
+user-id = 4556
 start = "2023-06-14"
 end = "2027-06-26"
 
 [[trusted.rustls-platform-verifier]]
 criteria = "safe-to-deploy"
-user-id = 4556 # Dirkjan Ochtman (djc)
+user-id = 4556
 start = "2024-12-18"
 end = "2027-06-26"
 

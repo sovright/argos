@@ -73,7 +73,7 @@ pub fn prepare_match_recovery(
             verify_public_match(&coordinates, &encoded)?;
             let mut keys = ImportedKeys::default();
             keys.transparent.push(TransparentKey {
-                secret: Secret::new(secret.secret_bytes()),
+                secret: Secret::new(secret.to_secret_bytes()),
                 provenance: Provenance::HdDerived,
                 created_at: None,
             });
@@ -86,12 +86,18 @@ pub fn prepare_match_recovery(
                     coordinates.account
                 ))
             })?;
-            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), account);
+            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), account)
+                .ok_or_else(|| {
+                    ZeckError::Internal("Sapling spending-key derivation failed".to_owned())
+                })?;
             let dfvk = match coordinates.scope {
                 AddressScope::External => extsk.to_diversifiable_full_viewing_key(),
-                AddressScope::Internal => {
-                    extsk.derive_internal().to_diversifiable_full_viewing_key()
-                }
+                AddressScope::Internal => extsk
+                    .derive_internal()
+                    .ok_or_else(|| {
+                        ZeckError::Internal("Sapling internal-key derivation failed".to_owned())
+                    })?
+                    .to_diversifiable_full_viewing_key(),
             };
             let address = dfvk.address(coordinates.index.into()).ok_or_else(|| {
                 ZeckError::InvalidConfig("saved Sapling diversifier index is invalid".to_owned())
@@ -126,9 +132,15 @@ pub fn prepare_match_recovery(
             };
             let address =
                 orchard::keys::FullViewingKey::from(&sk).address_at(coordinates.index, scope);
-            let encoded = zcash_address::unified::Address::try_from_items(vec![
-                zcash_address::unified::Receiver::Orchard(address.to_raw_address_bytes()),
-            ])
+            let encoded = zcash_address::unified::Address::try_from_items(
+                zcash_address::unified::Revision::R0,
+                vec![zcash_address::unified::Receiver::Orchard(
+                    address.to_raw_address_bytes(),
+                )]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+            )
             .map_err(|err| ZeckError::Internal(err.to_string()))?
             .encode(&match network {
                 ZeckNetwork::Mainnet => zcash_protocol::consensus::NetworkType::Main,
@@ -263,7 +275,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             keys.transparent[0].secret.expose_secret(),
-            &wanted.secret_bytes()
+            &wanted.to_secret_bytes()
         );
         assert_eq!(source.match_coordinates().unwrap().index, 19);
         assert_eq!(
@@ -278,9 +290,15 @@ mod tests {
         let sk = orchard::keys::SpendingKey::from_zip32_seed(&SEED, 1, account).unwrap();
         let address = orchard::keys::FullViewingKey::from(&sk)
             .address_at(23u32, orchard::keys::Scope::External);
-        let encoded = zcash_address::unified::Address::try_from_items(vec![
-            zcash_address::unified::Receiver::Orchard(address.to_raw_address_bytes()),
-        ])
+        let encoded = zcash_address::unified::Address::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![zcash_address::unified::Receiver::Orchard(
+                address.to_raw_address_bytes(),
+            )]
+            .into_iter()
+            .map(zcash_address::unified::Uitem::Data)
+            .collect(),
+        )
         .unwrap()
         .encode(&zcash_protocol::consensus::NetworkType::Test);
         let source = prepare_match_recovery(
@@ -304,11 +322,13 @@ mod tests {
     #[test]
     fn sapling_internal_handoff_rederives_exact_scope_and_index() {
         let account = AccountId::try_from(4).unwrap();
-        let extsk = zcash_keys::keys::sapling::spending_key(&SEED, 133, account);
+        let extsk = zcash_keys::keys::sapling::spending_key(&SEED, 133, account)
+            .expect("valid fixture Sapling key");
         let (index, address) = (1u32..1000)
             .find_map(|index| {
                 extsk
                     .derive_internal()
+                    .expect("valid fixture internal key")
                     .to_diversifiable_full_viewing_key()
                     .address(index.into())
                     .map(|address| (index, address))
