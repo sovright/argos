@@ -7,10 +7,14 @@ use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, SendResponse,
 };
 use zcash_primitives::transaction::{Transaction, TxId};
-use zcash_protocol::consensus::BranchId;
+use zcash_protocol::consensus::{BlockHeight, BranchId};
 
 use super::{lifecycle::rejection_can_be_definitive, TxLifecycleState, TxObservation};
-use crate::error::{ZeckError, ZeckResult};
+use crate::{
+    error::{ZeckError, ZeckResult},
+    models::ZeckNetwork,
+    workspace::consensus_network,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -52,8 +56,17 @@ pub trait BroadcastStore {
 
 /// A single raw transaction submission. The caller owns the durable record.
 #[async_trait]
-pub trait TxSubmitter {
+pub trait TxSubmitter: Send {
     async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status>;
+
+    /// Fresh evidence from the endpoint that will receive an explicit retry.
+    /// Ordinary submitters cannot silently authorize old bytes with an unknown
+    /// height; adapters supporting retry must validate the requested network.
+    async fn validated_tip(&mut self, _network: ZeckNetwork) -> ZeckResult<u32> {
+        Err(ZeckError::Broadcast(
+            "cannot establish a fresh network-validated tip for retry; keep the stored transaction bytes and reconcile their status before replanning".into(),
+        ))
+    }
 }
 
 pub struct LightwalletdSubmitter<'a> {
@@ -62,6 +75,10 @@ pub struct LightwalletdSubmitter<'a> {
 
 #[async_trait]
 impl TxSubmitter for LightwalletdSubmitter<'_> {
+    async fn validated_tip(&mut self, network: ZeckNetwork) -> ZeckResult<u32> {
+        crate::nu7::validated_tip_from_client(self.client, network).await
+    }
+
     async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
         self.client
             .send_transaction(RawTransaction {
@@ -178,6 +195,40 @@ pub(crate) fn txid_from_raw(raw_tx: &[u8]) -> ZeckResult<TxId> {
         ));
     }
     Ok(parsed.txid())
+}
+
+/// Check the exact persisted transaction against the candidate next block.
+/// V5/V6 retain their format across upgrades, but their encoded branch binds
+/// their signatures. Reading old bytes with a new fallback branch cannot
+/// change that encoded authority. This check neither mutates nor rebuilds them.
+pub(crate) fn validate_retry_at_tip(
+    raw_tx: &[u8],
+    network: ZeckNetwork,
+    tip: u32,
+) -> ZeckResult<()> {
+    let next_height = tip.checked_add(1).filter(|_| tip > 0).ok_or_else(|| {
+        ZeckError::Broadcast("cannot establish a supported next-block height for retry; keep the stored transaction bytes and reconcile their status before replanning".into())
+    })?;
+    let branch = BranchId::for_height(
+        &consensus_network(network),
+        BlockHeight::from_u32(next_height),
+    );
+    let mut cursor = Cursor::new(raw_tx);
+    let transaction = Transaction::read(&mut cursor, branch).map_err(|err| {
+        ZeckError::TransactionBuild(format!(
+            "cannot parse persisted transaction for retry: {err}"
+        ))
+    })?;
+    if cursor.position() != raw_tx.len() as u64 {
+        return Err(ZeckError::TransactionBuild(
+            "persisted transaction has trailing bytes".into(),
+        ));
+    }
+    crate::nu7::validate_transaction_for_tip(network, tip, &transaction).map_err(|err| {
+        ZeckError::Broadcast(format!(
+            "stored transaction cannot be retried ({err}); keep its exact bytes and reconcile its status before replanning"
+        ))
+    })
 }
 
 pub async fn submit_prepared_transaction<S, N>(

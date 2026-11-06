@@ -218,3 +218,22 @@ test("a cleared-passphrase wallet never reaches the backend", async () => {
   assert.equal(called, false);
   assert.match(h.hints.at(-1).text, /passphrase/);
 });
+
+test("auto-detection drops a result when the network or endpoint changes", async () => {
+  for (const [id, value] of [
+    ["network-select", "testnet"],
+    ["lightwalletd-url", "https://changed.example"],
+  ]) {
+    const h = harness({
+      walletFile: null,
+      seed: "abandon art",
+      invoke: async () => {
+        h.els.get(id).value = value;
+        return { birthday: 999 };
+      },
+    });
+    await h.run();
+    assert.equal(h.els.has("birthday-height"), false, id);
+    assert.match(h.hints.at(-1).text, /discarded/);
+  }
+});

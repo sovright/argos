@@ -137,6 +137,19 @@ argos --sapling-key-file sapling-keys.txt sweep --destination u1... --dry-run
 Viewing keys such as `zxviews…` are rejected: they can reveal balances but
 cannot authorize the sweep Argos is promising.
 
+## Supported recovery at NU7
+
+Argos binds reviewed sweeps to the consensus branch and rechecks network tip,
+transaction version, expiry and shielded bundle limits before submission or
+retry. Large supported sweeps are split into bounded transactions; retain every
+reported transaction ID until its outcome is known. An unknown broadcast
+outcome stops later recovery work.
+
+The NU7 qualification suite covers encoding, schedules, database migration and
+a separate local block/proxy boundary. A funded rehearsal of supported sweeps
+and imported Sapling PCZT remains a release gate; see
+[qualification details](docs/qualification/nu7-supported-recovery.md).
+
 ## Sprout after NU7
 
 NU7 disallows version 4 transactions, so remaining Sprout funds are

@@ -1,0 +1,13 @@
+[package]
+name = "argos-legacy-wallet-db-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+rand_core = "=0.6.4"
+secrecy = "=0.8.0"
+zcash_client_backend = { version = "=0.24.0-rc.4", default-features = false, features = ["orchard", "transparent-inputs", "transparent-key-import"] }
+zcash_client_sqlite = { version = "=0.22.0-rc.4", default-features = false, features = ["orchard", "serde", "transparent-inputs", "transparent-key-import"] }
+zcash_protocol = "=0.10.1"
+zcash_primitives = "=0.30.0"

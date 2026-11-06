@@ -13,7 +13,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
-    derive_accounts, detect_birthday, estimate_birthday_from_date,
+    derive_accounts, detect_birthday, estimate_birthday_from_date_for_network,
     imported::{encode_transparent_address, imported_transparent_keys},
     transparent_recovery::{
         quote_transparent_only, scan_transparent_only, sweep_transparent_only_from_quote,
@@ -1013,7 +1013,7 @@ async fn resolve_birthday(
         eprintln!("✓ {}", result.message);
         Ok(result.birthday)
     } else if let Some(date) = &cli.birthday_date {
-        Ok(estimate_birthday_from_date(date, &cli.lightwalletd_url).await?)
+        Ok(estimate_birthday_from_date_for_network(date, &cli.lightwalletd_url, network).await?)
     } else {
         Ok(cli.birthday_or_default())
     }

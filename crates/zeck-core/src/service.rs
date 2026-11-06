@@ -157,8 +157,12 @@ fn execution_donation_address(network: crate::models::ZeckNetwork) -> String {
 }
 
 /// The concrete wallet database type used throughout the execution path.
-type SweepWalletDb =
-    WalletDb<rusqlite::Connection, crate::workspace::ArgosParams, SystemClock, rand_core::OsRng>;
+type SweepWalletDb = WalletDb<
+    rusqlite::Connection,
+    crate::workspace::ArgosParams,
+    SystemClock,
+    crate::workspace::WalletRng,
+>;
 type HdSweepProposal = zcash_client_backend::proposal::Proposal<StandardFeeRule, Infallible>;
 type ImportedSweepProposal =
     zcash_client_backend::proposal::Proposal<StandardFeeRule, ReceivedNoteId>;
@@ -362,14 +366,17 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
     let mut bytes = Vec::with_capacity(encoded.len() + 64);
     bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&encoded);
-    let version = proposal.proposed_version().unwrap_or_else(|| {
-        let branch = zcash_protocol::consensus::BranchId::for_height(
-            &consensus_network(network),
-            BlockHeight::from_u32(proposal.min_target_height().into()),
-        );
-        zcash_primitives::transaction::TxVersion::suggested_for_branch(branch)
-    });
+    let branch = zcash_protocol::consensus::BranchId::for_height(
+        &consensus_network(network),
+        BlockHeight::from_u32(proposal.min_target_height().into()),
+    );
+    let version = proposal
+        .proposed_version()
+        .unwrap_or_else(|| zcash_primitives::transaction::TxVersion::suggested_for_branch(branch));
     bytes.extend_from_slice(&version.header().to_le_bytes());
+    // NU6.3 and NU7 both use V6. Bind the consensus branch independently
+    // of version, including when an explicit version was proposed.
+    bytes.extend_from_slice(&u32::from(branch).to_le_bytes());
     // The public protobuf intentionally omits the wallet's local note ID and
     // transparent script/owner. Bind those too: they are consumed by signing.
     bytes.extend_from_slice(&(proposal.steps().len() as u64).to_le_bytes());
@@ -3054,8 +3061,7 @@ fn build_exact_sweep_proposal(
                         fee_zatoshis: fee,
                         net_zatoshis: net,
                         donation_zatoshis: donation,
-                        note: "Exact ZIP-317 send-max proposal from spendable shielded notes."
-                            .to_owned(),
+                        note: format!("Exact ZIP-317 send-max proposal; {} bounded transaction(s) recover all selected shielded notes.", proposal.steps().len()),
                         memo: Some(memo_text.clone()),
                     });
                     legs.push(ExactSweepLeg::HdSend {
@@ -3109,7 +3115,7 @@ fn build_exact_sweep_proposal(
                     fee_zatoshis: fee,
                     net_zatoshis: net,
                     donation_zatoshis: 0,
-                    note: "Exact ZIP-317 imported Sapling proposal.".to_owned(),
+                    note: format!("Exact ZIP-317 imported Sapling proposal; {} bounded transaction(s) recover all selected notes.", proposal.steps().len()),
                     memo: None,
                 });
                 legs.push(ExactSweepLeg::ImportedSapling {
@@ -3727,10 +3733,9 @@ async fn execute_sweep_for_session(
     let transparent_account = legacy_transparent_account_key_from_seed(runtime.network, &seed)?;
     let network = consensus_network(runtime.network);
     let prover = LocalTxProver::bundled();
-    // Sum of the donation outputs actually broadcast (0 when a per-account
-    // donation was below the floor or its split fell back). Reported on the
-    // outcome so the completion screen shows the true donated total rather than
-    // the proposal's estimate.
+    // Donation outputs of mined or still-at-risk transactions, including
+    // partial batches and lost submission replies. Unsent and definitively
+    // rejected/expired transactions contribute nothing.
     let mut total_donation_zatoshis = 0u64;
     let mut follow_up_review_required = false;
     let mut results = Vec::new();
@@ -3839,21 +3844,15 @@ async fn execute_sweep_for_session(
                         lightwalletd_url: runtime.lightwalletd_url.as_str(),
                         confirmation_sources: &runtime.confirmation_sources,
                     };
-                    let (_fee, account_donation) = execute_send_max_step(
+                    execute_send_max_step(
                         &mut ctx,
                         tracked_account,
                         &usk,
                         proposal,
                         *donation_zatoshis,
+                        &mut total_donation_zatoshis,
                     )
                     .await?;
-                    total_donation_zatoshis = total_donation_zatoshis
-                        .checked_add(account_donation)
-                        .ok_or_else(|| {
-                            ZeckError::Internal(
-                                "donation total overflowed the supported range".to_owned(),
-                            )
-                        })?;
                 }
                 _ => unreachable!("hd_leg_plan returns only HD legs"),
             }
@@ -4062,6 +4061,7 @@ async fn execute_shielding_step(
         ctx.workspace.wallet_db_path(),
         consensus_network(ctx.network),
     )?;
+    crate::nu7_limits::validate_proposal(&consensus_network(ctx.network), proposal)?;
     let fee_zatoshis = proposal_fee_zatoshis(proposal)?;
     require_fee_matches(ctx.reviewed_fee_zatoshis, fee_zatoshis)?;
     let fee_through_shield = checked_fee_total(ctx.prior_fee_zatoshis, fee_zatoshis)?;
@@ -4072,6 +4072,8 @@ async fn execute_shielding_step(
     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
         &mut wallet_db,
         &consensus_network(ctx.network),
+        &SystemClock,
+        &mut crate::workspace::wallet_rng(),
         ctx.prover,
         ctx.prover,
         &SpendingKeys::new(usk.clone(), standalone_keys),
@@ -4389,6 +4391,22 @@ fn propose_hd_send_max(
         donation_proposal_or_fallback(split_result, max_proposal, donation, account_index)
     };
 
+    let proposal = crate::nu7_limits::bound_send_max(&consensus_network(network), proposal)?;
+    let donation_zatoshis = if donation_zatoshis > 0 {
+        proposal.steps().iter().try_fold(0u64, |sum, step| {
+            checked_fee_total(
+                sum,
+                step.transaction_request()
+                    .payments()
+                    .get(&0)
+                    .and_then(|payment| payment.amount())
+                    .map(u64::from)
+                    .unwrap_or(0),
+            )
+        })?
+    } else {
+        0
+    };
     Ok(Some((proposal, donation_zatoshis)))
 }
 
@@ -4398,12 +4416,14 @@ async fn execute_send_max_step(
     usk: &UnifiedSpendingKey,
     proposal: &ImportedSweepProposal,
     donation_zatoshis: u64,
-) -> ZeckResult<(u64, u64)> {
+    total_donation_zatoshis: &mut u64,
+) -> ZeckResult<u64> {
     let mut wallet_db = open_wallet_db(
         ctx.workspace.wallet_db_path(),
         consensus_network(ctx.network),
     )?;
 
+    crate::nu7_limits::validate_proposal(&consensus_network(ctx.network), proposal)?;
     let fee_zatoshis = proposal_fee_zatoshis(proposal)?;
     require_fee_matches(ctx.reviewed_fee_zatoshis, fee_zatoshis)?;
     enforce_max_fee(
@@ -4414,6 +4434,8 @@ async fn execute_send_max_step(
     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
         &mut wallet_db,
         &consensus_network(ctx.network),
+        &SystemClock,
+        &mut crate::workspace::wallet_rng(),
         ctx.prover,
         ctx.prover,
         &SpendingKeys::from_unified_spending_key(usk.clone()),
@@ -4424,17 +4446,84 @@ async fn execute_send_max_step(
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("creating sweep transaction: {err}")))?;
 
-    broadcast_transactions(
+    let txids: Vec<_> = txids.into_iter().collect();
+    if txids.len() != proposal.steps().len() {
+        return Err(ZeckError::TransactionBuild(
+            "constructed transaction count does not match reviewed recovery batches".to_owned(),
+        ));
+    }
+    // The SDK returns transactions in proposal-step order. Bind each donation
+    // to its actual txid before submitting, rather than counting the whole
+    // account only after every batch succeeds.
+    let donations = txids
+        .iter()
+        .zip(proposal.steps())
+        .map(|(txid, step)| {
+            let amount = if donation_zatoshis == 0 {
+                0
+            } else {
+                step.transaction_request()
+                    .payments()
+                    .get(&0)
+                    .and_then(|payment| payment.amount())
+                    .map(u64::from)
+                    .unwrap_or(0)
+            };
+            (txid.to_string(), amount)
+        })
+        .collect::<HashMap<_, _>>();
+    let planned_donation = donations
+        .values()
+        .try_fold(0u64, |sum, amount| checked_fee_total(sum, *amount))?;
+    if planned_donation != donation_zatoshis {
+        return Err(ZeckError::TransactionBuild(
+            "constructed batch donations do not match the reviewed total".to_owned(),
+        ));
+    }
+    let first_result = ctx.results.len();
+    let broadcast_result = broadcast_transactions(
         ctx,
         &mut wallet_db,
         tracked_account.derived.index,
-        txids.into_iter().collect(),
+        txids,
         "sweep",
         fee_zatoshis,
     )
-    .await?;
+    .await;
+    // Account for every retained result before propagating a later failure.
+    // Unknown replies are at risk just like their fees; rejected or expired
+    // transactions cannot carry a donation onto the chain.
+    complete_send_max_broadcast(
+        total_donation_zatoshis,
+        &donations,
+        &ctx.results[first_result..],
+        broadcast_result,
+    )?;
 
-    Ok((fee_zatoshis, donation_zatoshis))
+    Ok(fee_zatoshis)
+}
+
+fn complete_send_max_broadcast(
+    total: &mut u64,
+    donations: &HashMap<String, u64>,
+    results: &[TxBroadcastResult],
+    broadcast_result: ZeckResult<()>,
+) -> ZeckResult<()> {
+    record_submitted_donations(total, donations, results)?;
+    broadcast_result
+}
+
+fn record_submitted_donations(
+    total: &mut u64,
+    donations: &HashMap<String, u64>,
+    results: &[TxBroadcastResult],
+) -> ZeckResult<()> {
+    *total = results
+        .iter()
+        .filter(|result| result.status.fee_is_at_risk())
+        .filter_map(|result| result.txid.as_ref().and_then(|txid| donations.get(txid)))
+        .try_fold(*total, |sum, amount| checked_fee_total(sum, *amount))?;
+    Ok(())
 }
 
 pub(crate) fn proposal_fee_zatoshis<NoteRef>(
@@ -5993,13 +6082,13 @@ mod tests {
         };
         let signer_map = standalone_transparent_signing_keys(&tracked, &account_key).unwrap();
         assert_eq!(signer_map.len(), coordinates.len());
-        let secp = secp256k1::Secp256k1::signing_only();
+
         for coordinate in coordinates {
             let secrets = signer_map
                 .get(&coordinate.address)
                 .expect("coordinate signer");
             assert_eq!(secrets.len(), 1);
-            let public = secp256k1::PublicKey::from_secret_key(&secp, &secrets[0]);
+            let public = secp256k1::PublicKey::from_secret_key(&secrets[0]);
             assert_eq!(
                 zcash_transparent::address::TransparentAddress::from_pubkey(&public),
                 coordinate.address
@@ -7135,9 +7224,15 @@ mod tests {
         let sk = orchard::keys::SpendingKey::from_bytes([7u8; 32]).unwrap();
         let fvk = orchard::keys::FullViewingKey::from(&sk);
         let address = fvk.address_at(0u32, orchard::keys::Scope::External);
-        Address::try_from_items(vec![Receiver::Orchard(address.to_raw_address_bytes())])
-            .unwrap()
-            .encode(&zcash_protocol::consensus::NetworkType::Main)
+        Address::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Orchard(address.to_raw_address_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .unwrap()
+        .encode(&zcash_protocol::consensus::NetworkType::Main)
     }
 
     #[tokio::test]
@@ -9858,7 +9953,8 @@ mod propose_workspace_guard_tests {
             .unwrap();
         assert!(!root.exists());
         let registry_path =
-            super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Testnet).unwrap();
+            super::network_broadcast_log_path(&artifact_data_dir(&tempdir), ZeckNetwork::Testnet)
+                .unwrap();
         let log = DurableBroadcastLog::open(registry_path).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![91, 92]);
         drop((primary, secondary));
@@ -10374,7 +10470,9 @@ pub(crate) mod leg_fee_pin_tests {
             lightwalletd_url: "https://127.0.0.1:1",
             confirmation_sources: &[],
         };
-        let result = execute_send_max_step(&mut ctx, &tracked, &usk, &proposal, 0).await;
+        let mut donated = 0;
+        let result =
+            execute_send_max_step(&mut ctx, &tracked, &usk, &proposal, 0, &mut donated).await;
         assert!(
             matches!(
                 result,
@@ -10521,6 +10619,49 @@ pub(crate) mod leg_fee_pin_tests {
     }
 
     #[test]
+    fn same_version_nu7_branch_change_invalidates_review_on_both_networks() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::{BranchId, NetworkUpgrade, Parameters};
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let params = consensus_network(network);
+            let activation = params.activation_height(NetworkUpgrade::Nu7).unwrap();
+            assert_eq!(
+                BranchId::for_height(&params, activation - 1),
+                BranchId::Nu6_3
+            );
+            assert_eq!(
+                TxVersion::suggested_for_branch(BranchId::Nu6_3),
+                TxVersion::V6
+            );
+            assert_eq!(
+                TxVersion::suggested_for_branch(BranchId::Nu7),
+                TxVersion::V6
+            );
+            let template = offline_proposal::<Infallible>(10_000);
+            for explicit in [None, Some(TxVersion::V6)] {
+                let at = |height: BlockHeight| {
+                    Proposal::multi_step(
+                        *template.fee_rule(),
+                        height.into(),
+                        template.confirmations_policy(),
+                        template.steps().clone(),
+                    )
+                    .unwrap()
+                    .with_proposed_version(explicit)
+                };
+                assert_ne!(
+                    canonical_proposal(&at(activation - 1), network),
+                    canonical_proposal(&at(activation), network)
+                );
+                assert_eq!(
+                    canonical_proposal(&at(activation), network),
+                    canonical_proposal(&at(activation + 1), network)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_reviewed_leg_without_an_executable_account_fails_closed() {
         let plan = plan_with_leg_fee(10_000);
         assert!(hd_leg_plan(&plan.legs, &[hd_account()]).is_ok());
@@ -10550,28 +10691,271 @@ mod leg_gating_tests {
     use crate::models::ZeckNetwork;
     use zcash_client_backend::proto::service::SendResponse;
 
+    fn nu5_height() -> u32 {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        u32::from(
+            consensus_network(ZeckNetwork::Mainnet)
+                .activation_height(NetworkUpgrade::Nu5)
+                .unwrap(),
+        )
+    }
+
     fn prepared(expiry: u32) -> PreparedTransaction {
-        crate::test_support::empty_v5_prepared(expiry, 10_000)
+        crate::test_support::empty_v5_prepared(nu5_height() + expiry, 10_000)
+    }
+
+    fn pre_nu7_prepared(expiry: u32) -> PreparedTransaction {
+        use zcash_primitives::transaction::{Authorized, TransactionData};
+        let tx = TransactionData::<Authorized>::from_parts_v6(
+            zcash_protocol::consensus::BranchId::Nu6_3,
+            0,
+            BlockHeight::from_u32(expiry),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw_tx = vec![];
+        tx.write(&mut raw_tx).unwrap();
+        PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx,
+            fee_zatoshis: 10_000,
+            expiry_height: Some(expiry),
+        }
     }
 
     #[derive(Default)]
     struct Node {
         sent: Vec<Vec<u8>>,
         lose_reply_for: Option<Vec<u8>>,
+        reject_for: Option<Vec<u8>>,
+        tips: VecDeque<u32>,
     }
 
     #[async_trait::async_trait]
     impl TxSubmitter for Node {
+        async fn validated_tip(&mut self, _network: ZeckNetwork) -> ZeckResult<u32> {
+            Ok(self.tips.pop_front().unwrap_or_else(|| nu5_height() + 100))
+        }
+
         async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
             self.sent.push(raw.clone());
             if self.lose_reply_for.as_ref() == Some(&raw) {
                 return Err(tonic::Status::unavailable("GoAway"));
+            }
+            if self.reject_for.as_ref() == Some(&raw) {
+                return Ok(SendResponse {
+                    error_code: -26,
+                    error_message: "invalid proof".to_owned(),
+                });
             }
             Ok(SendResponse {
                 error_code: 0,
                 error_message: String::new(),
             })
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_after_proving_refuses_exact_bytes_before_persisting_or_sending() {
+        let activation = crate::nu7::MAINNET_ACTIVATION_HEIGHT;
+        let prepared = pre_nu7_prepared(activation + 120);
+        let retained = prepared.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        let mut node = Node {
+            tips: [activation - 1].into(),
+            ..Node::default()
+        };
+        let mut observer = Observer(HashMap::new());
+        let mut results = vec![];
+        let error = submit_and_confirm_batch(
+            vec![prepared.clone()],
+            0,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut |_, _| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("branch"));
+        assert!(node.sent.is_empty());
+        assert!(results.is_empty());
+        assert!(log.latest(prepared.txid).is_none());
+        assert_eq!(
+            prepared, retained,
+            "refusal does not replace signed bytes or invent a lifecycle state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_between_batch_submissions_preserves_the_first_result() {
+        let activation = crate::nu7::MAINNET_ACTIVATION_HEIGHT;
+        let first = pre_nu7_prepared(activation + 120);
+        let second = pre_nu7_prepared(activation + 121);
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        let mut node = Node {
+            tips: [activation - 2, activation - 1].into(),
+            ..Node::default()
+        };
+        let mut observer = Observer(HashMap::new());
+        let mut results = vec![];
+        assert!(submit_and_confirm_batch(
+            vec![first.clone(), second.clone()],
+            0,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut |_, _| Ok(())
+        )
+        .await
+        .is_err());
+        assert_eq!(node.sent, vec![first.raw_tx.clone()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].txid.as_deref(),
+            Some(first.txid.to_string().as_str())
+        );
+        assert_eq!(
+            log.latest(first.txid).unwrap().prepared.raw_tx,
+            first.raw_tx
+        );
+        assert!(log.latest(second.txid).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn later_batch_failure_retains_submitted_batch_donations() {
+        let activation = crate::nu7::MAINNET_ACTIVATION_HEIGHT;
+        for first_mined in [false, true] {
+            for stop in ["activation", "rejected", "unknown"] {
+                let first = pre_nu7_prepared(activation + 120);
+                let second = pre_nu7_prepared(activation + 121);
+                // Each constructed batch has its own reviewed donation output.
+                let donations = HashMap::from([
+                    (first.txid.to_string(), 25_000),
+                    (second.txid.to_string(), 30_000),
+                ]);
+                let dir = tempfile::tempdir().unwrap();
+                let mut log =
+                    DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+                let mut node = Node {
+                    tips: [
+                        activation - 2,
+                        if stop == "activation" {
+                            activation - 1
+                        } else {
+                            activation - 2
+                        },
+                    ]
+                    .into(),
+                    lose_reply_for: (stop == "unknown").then(|| second.raw_tx.clone()),
+                    reject_for: (stop == "rejected").then(|| second.raw_tx.clone()),
+                    ..Node::default()
+                };
+                let mut observer = Observer(if first_mined {
+                    HashMap::from([(first.txid, default_operator_mined(activation - 3))])
+                } else {
+                    HashMap::new()
+                });
+                let mut results = vec![];
+                let result = submit_and_confirm_batch(
+                    vec![first.clone(), second.clone()],
+                    0,
+                    "sweep",
+                    &mut results,
+                    &mut log,
+                    &mut node,
+                    &mut observer,
+                    ZeckNetwork::Mainnet,
+                    &mut |_, _| Ok(()),
+                )
+                .await;
+                assert!(result.is_err(), "{stop}");
+                let original_error = result.as_ref().unwrap_err().to_string();
+                // Exercise the production completion path: account for retained
+                // results even while returning the original later-batch error.
+                let mut total_donation = 7_000;
+                let result =
+                    complete_send_max_broadcast(&mut total_donation, &donations, &results, result);
+                assert_eq!(result.as_ref().unwrap_err().to_string(), original_error);
+                let outcome =
+                    assemble_sweep_outcome(results, vec![], total_donation, result).unwrap();
+                assert!(outcome.error.is_some());
+                assert_eq!(
+                    outcome.transactions[0].txid.as_deref(),
+                    Some(first.txid.to_string().as_str())
+                );
+                assert_eq!(
+                    outcome.transactions[0].status,
+                    if first_mined {
+                        TxLifecycleState::MinedSingleSource
+                    } else {
+                        TxLifecycleState::Pending
+                    }
+                );
+                assert_eq!(
+                    outcome.total_donation_zatoshis,
+                    7_000 + 25_000 + if stop == "unknown" { 30_000 } else { 0 },
+                    "{stop}, first_mined={first_mined}"
+                );
+                assert_eq!(
+                    outcome.transactions.len(),
+                    if stop == "activation" { 1 } else { 2 }
+                );
+                if stop == "activation" {
+                    assert!(log.latest(second.txid).is_none());
+                } else {
+                    assert_eq!(
+                        outcome.transactions[1].status,
+                        if stop == "unknown" {
+                            TxLifecycleState::SubmissionUnknown
+                        } else {
+                            TxLifecycleState::Rejected
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn donation_accounting_ignores_unsubmitted_expired_rejected_and_unrelated_results() {
+        let txid = "reviewed-batch".to_owned();
+        let donations = HashMap::from([(txid.clone(), 25_000)]);
+        let mut results: Vec<_> = [
+            TxLifecycleState::NotSubmitted,
+            TxLifecycleState::Expired,
+            TxLifecycleState::Rejected,
+        ]
+        .into_iter()
+        .map(|status| TxBroadcastResult {
+            source_account: 0,
+            txid: Some(txid.clone()),
+            status,
+            fee_zatoshis: 10_000,
+            detail: String::new(),
+            confirmed_height: None,
+            safe_to_discard: false,
+        })
+        .collect();
+        let mut unrelated = results[0].clone();
+        unrelated.status = TxLifecycleState::Mined;
+        unrelated.txid = Some("another-leg".to_owned());
+        results.push(unrelated);
+        let mut total = 7_000;
+        record_submitted_donations(&mut total, &donations, &results).unwrap();
+        assert_eq!(total, 7_000);
     }
 
     /// The default configuration: zec.rocks and na.zec.rocks, one operator.
@@ -10770,7 +11154,7 @@ mod leg_gating_tests {
 mod zip317_fee_fidelity_tests {
     use super::*;
     use crate::models::ZeckNetwork;
-    use rand_core::OsRng;
+    use crate::workspace::wallet_rng;
     use sapling_crypto as sapling;
     use zcash_client_backend::fees::{ChangeStrategy, ChangeValue};
     use zcash_primitives::transaction::{
@@ -10820,6 +11204,11 @@ mod zip317_fee_fidelity_tests {
             .compute_balance::<_, u32>(
                 &network,
                 height.into(),
+                height,
+                &zcash_client_backend::data_api::anchor_retention::PoolMigrationParams::new(
+                    zcash_protocol::zip318::BlockSpacing::UNIFORM,
+                    zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval::ZIP_318,
+                ),
                 &[] as &[Infallible],
                 &[] as &[zcash_transparent::bundle::TxOut],
                 &(
@@ -10830,7 +11219,7 @@ mod zip317_fee_fidelity_tests {
                 &zcash_client_backend::fees::orchard::EmptyBundleView,
                 &zcash_client_backend::fees::orchard::EmptyBundleView,
                 None,
-                &(),
+                &zcash_client_backend::data_api::ChangeReceivers::new(true, true, None),
             )
             .expect("change strategy prices the sweep");
         assert!(
@@ -10843,7 +11232,8 @@ mod zip317_fee_fidelity_tests {
         let quoted = u64::from(balance.fee_required());
 
         // Build the same transaction for real.
-        let extsk = sapling::zip32::ExtendedSpendingKey::master(&[7; 32]);
+        let extsk = sapling::zip32::ExtendedSpendingKey::master(&[7; 32])
+            .expect("valid fixture Sapling key");
         let (_, address) = extsk.default_address();
         let fvk = extsk.to_diversifiable_full_viewing_key().fvk().clone();
         let notes = note_values
@@ -10893,7 +11283,7 @@ mod zip317_fee_fidelity_tests {
                 &zcash_transparent::builder::TransparentSigningSet::new(),
                 &[extsk],
                 &[],
-                OsRng,
+                wallet_rng(),
                 &prover,
                 &prover,
                 &FeeRule::standard(),
@@ -10945,11 +11335,12 @@ mod zip317_fee_fidelity_tests {
         use crate::transparent_recovery::tests_support::utxo;
         let network = consensus_network(ZeckNetwork::Mainnet);
         let height = network.activation_height(NetworkUpgrade::Nu5).unwrap() + 10_000;
-        let mut secret = secp256k1::SecretKey::from_slice(&[0x24; 32]).unwrap();
-        let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+        let mut secret = secp256k1::SecretKey::from_secret_bytes([0x24; 32]).unwrap();
+        let public = secp256k1::PublicKey::from_secret_key(&secret);
         let address = zcash_transparent::address::TransparentAddress::from_pubkey(&public);
         let key = crate::imported::ImportedTransparentKey::new(&mut secret, address);
         let recipient = sapling::zip32::ExtendedSpendingKey::master(&[9; 32])
+            .expect("valid fixture Sapling key")
             .default_address()
             .1;
         let prover = LocalTxProver::bundled();

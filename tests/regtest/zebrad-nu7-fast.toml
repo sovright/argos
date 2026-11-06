@@ -1,0 +1,35 @@
+# Private NU7 qualification only. Never use a public network or real wallet.
+# Matches qualified_params_at(10) in nu7_readiness.rs.
+# Fast branch-boundary gate only; ZIP 212 is not yet enforced.
+[network]
+network = "Regtest"
+
+[network.testnet_parameters.activation_heights]
+BeforeOverwinter = 1
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 1
+NU6 = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 1
+NU7 = 10
+
+[state]
+ephemeral = false
+# CACHE_DIR is supplied by Compose so the entrypoint creates/chowns it.
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+# Host publication is restricted to loopback in Compose.
+enable_cookie_auth = false
+
+[mining]
+# Public all-zoo/vote BIP-39 test vector; synthetic regtest coins only.
+miner_address = "tmFzBQeQYURQartF8tcvECq1minSJwyERe2"
+
+[tracing]
+use_color = false

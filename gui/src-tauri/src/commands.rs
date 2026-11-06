@@ -8,7 +8,8 @@ use std::{
 
 use crate::reviewed_intent::{WalletReviewId, WalletReviewRegistry};
 use argos_core::{
-    detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
+    detect_birthday as zeck_detect_birthday,
+    estimate_birthday_from_date_for_network as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
     validate_destination_address, validate_mnemonic_words, BirthdayDetectResult, IncompleteSession,
     RecoveryService, ReviewedSweepProposal, ScanConfig, ScanHandle, SweepOutcome, SweepProposalId,
@@ -1083,9 +1084,11 @@ pub async fn estimate_birthday_from_date(
     app: AppHandle,
     date: String,
     lightwalletd_url: String,
+    network: Option<String>,
 ) -> Result<u32, String> {
     ensure_tos_accepted(&app)?;
-    estimate_birthday(&date, &lightwalletd_url)
+    let network = parse_wallet_network(network.as_deref().unwrap_or("mainnet"))?;
+    estimate_birthday(&date, &lightwalletd_url, network)
         .await
         .map_err(|err| err.to_string())
 }

@@ -516,7 +516,7 @@ mod tests {
                 NonHardenedChildIndex::from_index(index).unwrap(),
             )
             .unwrap();
-        let pk = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &sk);
+        let pk = secp256k1::PublicKey::from_secret_key(&sk);
         crate::imported::encode_transparent_address(
             &TransparentAddress::from_pubkey(&pk),
             ZeckNetwork::Mainnet,
@@ -724,7 +724,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             imported.transparent[0].secret.expose_secret(),
-            &expected.secret_bytes(),
+            &expected.to_secret_bytes(),
             "the retained match must hand the existing signer its exact nonzero-index key"
         );
         let serialized = serde_json::to_string(&result).unwrap();

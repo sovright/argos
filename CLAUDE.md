@@ -125,7 +125,7 @@ file produces, so the scan and sweep paths cannot tell the two apart. CLI
 `--sapling-key-file` (a file, never a flag — a spending key in argv lands in
 shell history and `ps`); GUI a paste field on the wallet screen. Both are
 combinable with a wallet file and deduplicate against it. The human-readable prefixes come from
-`zcash_protocol::constants`, so there is no unverifiable-constant caveat —
+`zcash_keys::constants`, so there is no unverifiable-constant caveat —
 but the test pinning them to the ZIP-32 literals stays, so an upstream rename
 cannot silently move Argos off the prefix users hold. Viewing keys
 (`zxviews…`) are deliberately refused: they would show a balance that cannot
@@ -157,8 +157,8 @@ direct recovery path and may produce a separate transaction.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
-`transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an
-account to.
+`transparent_recovery`, because the existing ZIP-316 Revision 0 account format gives it no
+UFVK to anchor an account to.
 
 Spending imported Sapling does **not** need an upstream change: PCZT is
 account-id driven and `Signer::sign_sapling` takes a raw `ask`. Only the
@@ -179,6 +179,18 @@ passphrase is prompt-only — never a flag, so it cannot reach shell history
 or `ps` (T-S6). Wired in `crates/zeck-cli/src/main.rs`; covered by
 `crates/zeck-cli/tests/wallet_file_cli.rs`, which runs the real binary
 against the golden fixtures.
+
+### NU7 qualification
+
+The coordinated NU7 SDK requires Rust 1.89. Keep `RUSTFLAGS=''` and
+`CARGO_INCREMENTAL=0` consistent across Cargo invocations. The ordinary
+regtest schedule remains pre-NU7; `tests/regtest/zebrad-nu7*.toml` use
+independent profiles and state. `nu7_readiness.rs` includes an actual old-SDK
+SQLite migration fixture and two ignored live boundary tests. The fast chain
+and empty fixtures do not qualify funded supported sweeps or imported Sapling
+PCZT. See `docs/qualification/nu7-supported-recovery.md` for the release gate.
+Never restore removed Sprout scan, spend, P2P or journal machinery when porting
+historical tests or documentation.
 
 ### Test seed (BIP-39 test vector, no real funds)
 `abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art`

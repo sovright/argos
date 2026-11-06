@@ -197,6 +197,14 @@
             </p>
           </section>
 
+          <section id="nu7-supported">
+            <h2>Supported recovery at NU7</h2>
+            <p>Argos checks the current consensus branch, transaction expiry and shielded
+              bundle limits before submitting or retrying a supported sweep. Large recoveries
+              may produce several transactions. Keep every reported transaction ID until its
+              outcome is known; an unknown broadcast outcome stops later recovery work.</p>
+          </section>
+
           <section id="sprout">
             <h2>Sprout after NU7</h2>
             <p>NU7 disallows version 4 transactions, the only format supporting Sprout

@@ -6,11 +6,11 @@ fund-recovery flow against a real Zcash node — scan, sweep, broadcast, resume
 — in scenarios that aren't reachable from pure unit tests (GoAway frames mid
 scan, hostile compact blocks, mid-scan crashes, reorgs, etc.).
 
-The harness is **opt-in** and **never runs in CI**:
+The funded recovery harness is **opt-in**. CI separately runs the short,
+independent NU7 block/proxy boundary profile described below:
 
 - The integration tests are tagged `#[ignore]` so default `cargo test` skips them.
-- Booting a regtest stack on every PR would inflate CI runtime past the cache
-  TTL and is not worth it for tests this rarely fail.
+- The full funded chain is prepared locally; CI does not mine its ZIP 212 preparation height.
 - Contributors run this locally before merging changes to scan/sweep logic.
 
 ## What boots
@@ -26,11 +26,13 @@ so a zcashd chain can never activate Ironwood (NU6.3), and the post-activation
 sweep path is untestable on it by construction. Zebra implements NU6.3 with
 per-upgrade configurable Regtest activation heights.
 
-Both images are pinned (`zfnd/zebra:6.2.3`, `electriccoinco/lightwalletd:v0.5.1`)
-rather than tracking `latest`: the activation heights and consensus rules under
-test are version-sensitive, and a silently updated node would change what the
-tests mean. lightwalletd v0.5.1 is the first release carrying the Ironwood
-compact-block fields the client backend expects to decode.
+Both images are pinned by release tag and image digest (`zfnd/zebra:7.0.0`,
+`electriccoinco/lightwalletd:v0.6.0`), rather than tracking `latest`: activation
+heights and consensus rules under test are version-sensitive. lightwalletd
+preserves the Ironwood compact-block fields the client backend expects. The
+ordinary recovery chain deliberately omits NU7 activation and matches
+`ArgosParams::regtest_all_active()`. The `fixtures` profile retains zcashd
+v6.20.0 solely to generate wallet-import fixtures.
 
 Both bound to **loopback only**. Never expose these ports — the regtest RPC
 credentials are well-known and a remote miner with control of those ports
@@ -111,8 +113,8 @@ height.
 
 Do **not** try to fix the subsidy with `pre_blossom_halving_interval` in
 `zebrad-regtest.toml`. Zebra accepts the key on Regtest and ignores it —
-`Parameters::new_regtest` hardcodes the interval. Measured against the pinned
-v6.2.3 with it set to 1,000,000: 6.25 ZEC at height 1, 5.96e-6 at 6,000, 0.0
+`Parameters::new_regtest` hardcodes the interval. Measured against the former
+v6.2.3 pin with it set to 1,000,000: 6.25 ZEC at height 1, 5.96e-6 at 6,000, 0.0
 at 32,400, identical to the default.
 
 **The treasury cannot be topped up.** Its own funding is coinbase, so whatever
@@ -166,7 +168,8 @@ Both flags are required:
 
 Without `--features argos-network`, the integration test file is gated out
 by `#![cfg(feature = "argos-network")]` and compiles to an empty test
-binary. CI runs the default form only.
+binary. CI runs the feature-enabled local fake-lightwalletd cases; real-node
+cases remain ignored except for the separate NU7 boundary job.
 
 Each integration test prints a `[regtest]` header noting the harness URL it
 connected to, so a mid-test failure is easy to attribute to the stack vs to
@@ -287,3 +290,102 @@ filter `automatic_transparent_range_recovers_low_and_high_indices`. It funds
 account-0 receive indices 7 and 997, scans one shielded account with the default
 transparent range, and checks that the mined sweep consumes both addresses'
 UTXOs. The explicit range must survive resume before sweeping.
+
+
+## Dedicated NU7 qualification
+
+The `nu7` profile has independent state, RPC `127.0.0.1:18252`, and
+lightwalletd `127.0.0.1:9077`. Its NU7 activation is **32,500**, matching
+`qualified_params_at(32_500)` in `nu7_readiness.rs`. Earlier upgrades activate at 1.
+The height is after ZIP 212 enforcement at 32,257 so PCZT experiments can be
+performed on either side. Mining to that height can take over an hour.
+
+For a quick branch-boundary check, `nu7-fast` uses a separate volume,
+activation height **10**, RPC `127.0.0.1:18262`, and lightwalletd
+`127.0.0.1:9087`. ZIP 212 is not enforced at this height; it provides no PCZT
+qualification evidence.
+
+```sh
+cd tests/regtest
+docker compose --profile nu7-fast up -d zebrad-nu7-fast lightwalletd-nu7-fast
+ARGOS_NU7_PROFILE=fast ./nu7.sh before   # mines exactly to height 9
+cd ../..
+CARGO_INCREMENTAL=0 RUSTFLAGS='' \
+  cargo +1.89 test -p argos-core --features argos-network --locked --test nu7_readiness \
+  private_ -- --ignored --nocapture --test-threads=1
+```
+
+The node test starts at height 9 and mines blocks 10 and 11. A repeat run
+at height 10 or 11 reuses the accepted blocks and mines only any missing
+block through 11; it never rewinds or deletes state. It parses the actual
+node's complete serialized blocks and checks every embedded transaction's
+branch before, at, and after activation. The separate proxy test requires
+lightwalletd to report branch `77190ad9` and serve compact block 10. This is actual
+node acceptance of synthetic regtest coinbase blocks, **not evidence of
+funded transparent, Sapling, Orchard, Ironwood, or PCZT sweep acceptance**.
+Those recovery gates require separately prepared synthetic regtest balances
+and observed mined sweep transactions on the full profile.
+
+For the full profile, use `docker compose --profile nu7 up -d zebrad-nu7
+lightwalletd-nu7` and `./nu7.sh before` to stop at 32,499. `./nu7.sh at` and
+`./nu7.sh after` are explicit manual controls for either profile; set
+`ARGOS_NU7_PROFILE=fast` to address the fast profile. The node test supports
+reusing the three retained boundary blocks while the tip remains at 9-11.
+The controller refuses to rewind or delete an existing chain. Use separate,
+intentionally created volumes for repeated boundary rehearsals. It always
+addresses a fixed private loopback RPC, never a public endpoint. It performs
+no funding and never starts a VM automatically.
+
+Offline qualification runs without Docker:
+
+```sh
+CARGO_INCREMENTAL=0 RUSTFLAGS='' \
+  cargo +1.89 test -p argos-core --features argos-network --locked --test nu7_readiness
+```
+
+These tests pin both production activation heights and branch `77190ad9`,
+parse independently encoded empty v5/v6 wire transactions, reject placeholder
+branches/truncation, preserve the real branch through PCZT creation/encoding,
+check the actual builder's 40/120-block expiry behavior, preserve the legacy
+regtest schedule, and reopen a
+persisted account across the local activation. The retained pre-NU7 SQLite
+fixture additionally verifies migration from the old SDK family and a second
+reopen; see [fixture reproduction](legacy-wallet-db/README.md). Empty parser
+fixtures and empty wallet databases hold no notes or spendable value.
+
+The pinned release/image provenance and current qualification limits are recorded
+in [NU7 supported-recovery qualification](../../docs/qualification/nu7-supported-recovery.md).
+No historical test output from the superseded Sprout branch is current evidence
+for this branch.
+
+### Native lightwalletd fallback on Apple Silicon
+
+The official lightwalletd image is amd64-only. If emulation fails, build a
+native proxy in a separate checkout of the official
+[v0.6.0 tag](https://github.com/zcash/lightwalletd/tree/v0.6.0), commit
+`e7436d2adb9ab5828eb8a27de534e16218841fc2`:
+
+```sh
+git clone --branch v0.6.0 --depth 1 https://github.com/zcash/lightwalletd.git /private/tmp/argos-nu7-lightwalletd
+cd /private/tmp/argos-nu7-lightwalletd
+test "$(git rev-parse HEAD)" = e7436d2adb9ab5828eb8a27de534e16218841fc2
+go build -o lightwalletd .
+./lightwalletd --no-tls-very-insecure --grpc-bind-addr=127.0.0.1:9088 \
+  --rpchost=127.0.0.1 --rpcport=18262 \
+  --rpcuser=argos-regtest --rpcpassword=argos-regtest \
+  --data-dir=/private/tmp/argos-nu7-native-proxy-data --log-file=/dev/stdout
+```
+
+Keep the fast Zebra profile running; stop the emulated proxy if it is failing.
+From the Argos repository root, select the permitted native loopback endpoint:
+
+```sh
+ARGOS_NU7_LIGHTWALLETD_URL=http://127.0.0.1:9088 \
+  CARGO_INCREMENTAL=0 RUSTFLAGS='' \
+  cargo +1.89 test -p argos-core --features argos-network --locked --test nu7_readiness \
+  private_ -- --ignored --nocapture --test-threads=1
+```
+
+The test refuses arbitrary proxy endpoints. Record the actual Go version,
+source revision and output when using this fallback. Building a native proxy
+or accepting synthetic coinbase blocks does not satisfy the funded gate.

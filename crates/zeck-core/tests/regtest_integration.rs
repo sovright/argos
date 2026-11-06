@@ -4331,8 +4331,12 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
     let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
     let account_index = 4u32;
     let account = zip32::AccountId::try_from(account_index).unwrap();
-    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account);
-    let internal_dfvk = extsk.derive_internal().to_diversifiable_full_viewing_key();
+    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account)
+        .expect("valid fixture Sapling key");
+    let internal_dfvk = extsk
+        .derive_internal()
+        .expect("valid fixture internal key")
+        .to_diversifiable_full_viewing_key();
     let (address_index, internal_address) = (1u32..100)
         .find_map(|index| {
             internal_dfvk
@@ -4497,8 +4501,12 @@ async fn imported_multi_action_quote_matches_built_transaction_fee() {
     let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
     let account_index = 4u32;
     let account = zip32::AccountId::try_from(account_index).unwrap();
-    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account);
-    let internal_dfvk = extsk.derive_internal().to_diversifiable_full_viewing_key();
+    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account)
+        .expect("valid fixture Sapling key");
+    let internal_dfvk = extsk
+        .derive_internal()
+        .expect("valid fixture internal key")
+        .to_diversifiable_full_viewing_key();
     let (address_index, internal_address) = (1u32..100)
         .find_map(|index| {
             internal_dfvk

@@ -1,0 +1,3 @@
+# Public synthetic pre-upgrade schema fixture; not a user's wallet database.
+!pre-nu7.sqlite
+/target/

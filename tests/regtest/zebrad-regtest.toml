@@ -47,6 +47,8 @@ NU6 = 1
 "NU6.1" = 1
 "NU6.2" = 1
 "NU6.3" = 1
+# NU7 is deliberately omitted. Zebra replaces the activation map with these
+# explicit entries, so the ordinary fixture chain remains pre-NU7.
 
 [state]
 # Persistent, not ephemeral: setup.sh is idempotent and re-runnable, and the

@@ -1041,8 +1041,9 @@ function updateScanEstimate() {
   }
 }
 
-// Piecewise height→date (Sapling 150 s/block until Blossom @ 653,600,
-// then 75 s/block). Mirrors crates/argos-core/src/birthday.rs and lets us
+// Approximate height→date with historical 150/75-second timing, then
+// 25 seconds from each network's NU7 height. Calendar estimates never decide
+// whether a transaction may spend. This lets us
 // give the user instant round-trip feedback as they type a height.
 const SAPLING_ACTIVATION_HEIGHT_JS = 419_200;
 const SAPLING_ACTIVATION_DATE_JS = Date.UTC(2018, 9, 28); // Oct 28 2018
@@ -1050,13 +1051,15 @@ const BLOSSOM_ACTIVATION_HEIGHT_JS = 653_600;
 const BLOSSOM_ACTIVATION_DATE_JS = Date.UTC(2019, 11, 11); // Dec 11 2019
 const PRE_BLOSSOM_BLOCK_SECONDS = 150;
 const POST_BLOSSOM_BLOCK_SECONDS = 75;
+const POST_NU7_BLOCK_SECONDS = 25;
+const NU7_ACTIVATION_HEIGHTS_JS = { mainnet: 3_543_405, testnet: 4_465_026 };
 
 // Below Sapling it counts back at the same 150 s, floored at the genesis
 // date: a wallet.dat birthday can be pre-Sapling, and a hint stuck at 2018
 // beside it would misstate the wallet's age.
 const MAINNET_GENESIS_DATE_JS = Date.UTC(2016, 9, 28); // Oct 28 2016
 
-function approxDateFromHeight(height) {
+function approxDateFromHeight(height, network = "mainnet") {
   if (!Number.isFinite(height)) {
     return new Date(SAPLING_ACTIVATION_DATE_JS);
   }
@@ -1069,6 +1072,12 @@ function approxDateFromHeight(height) {
     anchorMs = BLOSSOM_ACTIVATION_DATE_JS;
     anchorHeight = BLOSSOM_ACTIVATION_HEIGHT_JS;
     blockSeconds = POST_BLOSSOM_BLOCK_SECONDS;
+    const activation = NU7_ACTIVATION_HEIGHTS_JS[network];
+    if (activation != null && height >= activation) {
+      anchorMs += (activation - anchorHeight) * POST_BLOSSOM_BLOCK_SECONDS * 1000;
+      anchorHeight = activation;
+      blockSeconds = POST_NU7_BLOCK_SECONDS;
+    }
   }
   return new Date(
     Math.max(MAINNET_GENESIS_DATE_JS, anchorMs + (height - anchorHeight) * blockSeconds * 1000),
@@ -1094,7 +1103,7 @@ function updateBirthdayHint() {
     setBirthdayHint("", "");
     return;
   }
-  const approx = formatApproxMonth(approxDateFromHeight(height));
+  const approx = formatApproxMonth(approxDateFromHeight(height, $("network-select").value));
   setBirthdayHint(`Block ${height.toLocaleString()} ≈ ${approx}.`, "");
 }
 
@@ -1159,8 +1168,14 @@ async function runBirthdayAutodetect() {
   // Phase-2 detection can run for minutes. If the user opens another wallet
   // or edits the seed meanwhile, the result belongs to the old source.
   const generation = walletOpenGeneration;
+  const probe = {
+    lightwalletdUrl: $("lightwalletd-url").value.trim(),
+    network: $("network-select").value,
+  };
   const isCurrent = () =>
     generation === walletOpenGeneration &&
+    probe.network === $("network-select").value &&
+    probe.lightwalletdUrl === $("lightwalletd-url").value.trim() &&
     (source.kind === "wallet" || seedInput.value.trim() === seedVal);
   $("birthday-autodetect").disabled = true;
   $("birthday-estimate").disabled = true;
@@ -1172,10 +1187,6 @@ async function runBirthdayAutodetect() {
   });
 
   try {
-    const probe = {
-      lightwalletdUrl: $("lightwalletd-url").value.trim(),
-      network: $("network-select").value,
-    };
     const result =
       source.kind === "wallet"
         ? await invoke("detect_birthday_from_wallet_file", {
@@ -1187,14 +1198,14 @@ async function runBirthdayAutodetect() {
           })
         : await invoke("detect_birthday", { ...probe, seed: seedVal.toLowerCase() });
     if (!isCurrent()) {
-      setBirthdayHint("Auto-detect result discarded: the wallet or seed changed while it ran.", "");
+      setBirthdayHint("Auto-detect result discarded: the recovery source or network settings changed while it ran.", "");
       return;
     }
     $("birthday-height").value = result.birthday;
     invalidateScanAuthority();
     birthdayTouched = true;
     updateScanEstimate();
-    const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
+    const approx = formatApproxMonth(approxDateFromHeight(result.birthday, probe.network));
     setBirthdayHint(birthdayDetectHint(result, approx), "success");
   } catch (err) {
     if (isCurrent()) setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
@@ -1213,25 +1224,31 @@ $("birthday-estimate").addEventListener("click", async () => {
     setBirthdayHint("Pick a date first.", "error");
     return;
   }
+  const request = {
+    date: dateVal,
+    network: $("network-select").value,
+    lightwalletdUrl: $("lightwalletd-url").value.trim(),
+  };
+  const isCurrent = () => request.date === $("birthday-date").value &&
+    request.network === $("network-select").value &&
+    request.lightwalletdUrl === $("lightwalletd-url").value.trim();
   $("birthday-estimate").disabled = true;
   setBirthdayHint("Looking up block height for that date…", "");
   setStatus("config-status", "", "");
   try {
-    const height = await invoke("estimate_birthday_from_date", {
-      date: dateVal,
-      lightwalletdUrl: $("lightwalletd-url").value.trim(),
-    });
+    const height = await invoke("estimate_birthday_from_date", request);
+    if (!isCurrent()) return;
     $("birthday-height").value = height;
     invalidateScanAuthority();
     birthdayTouched = true;
     updateScanEstimate();
-    const approx = formatApproxMonth(approxDateFromHeight(height));
+    const approx = formatApproxMonth(approxDateFromHeight(height, $("network-select").value));
     setBirthdayHint(
-      `✓ Birthday set to block ${Number(height).toLocaleString()} (≈ ${approx}, with ~1 week safety margin).`,
+      `✓ Birthday set to block ${Number(height).toLocaleString()} (≈ ${approx}, with a conservative safety margin).`,
       "success",
     );
   } catch (err) {
-    setBirthdayHint(`✗ Estimate failed: ${err}`, "error");
+    if (isCurrent()) setBirthdayHint(`✗ Estimate failed: ${err}`, "error");
   } finally {
     $("birthday-estimate").disabled = false;
   }

@@ -6,8 +6,8 @@ use std::{
     },
 };
 
+use crate::workspace::WalletRng;
 use async_trait::async_trait;
-use rand_core::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use rustls::crypto::ring::default_provider;
 use secrecy::ExposeSecret;
@@ -1094,7 +1094,10 @@ fn select_mixed_sapling(
             let index = AccountId::try_from(zip32_index).map_err(|_| {
                 ZeckError::InvalidConfig(format!("account index {zip32_index} is out of range"))
             })?;
-            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), index);
+            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), index)
+                .ok_or_else(|| {
+                ZeckError::Internal("Sapling spending-key derivation failed".to_owned())
+            })?;
             sapling_seen.insert(extsk.to_diversifiable_full_viewing_key().to_bytes());
         }
     }
@@ -1272,7 +1275,7 @@ async fn register_mixed_keys(
             ZeckError::Internal("mixed wallet has no account to watch transparent keys".to_owned())
         })?
         .wallet_account_id;
-    let secp = secp256k1::Secp256k1::signing_only();
+
     let existing = wallet_db
         .get_transparent_receivers(anchor_id, true, true)
         .map_err(|err| ZeckError::Wallet(format!("loading mixed transparent receivers: {err}")))?;
@@ -1280,7 +1283,7 @@ async fn register_mixed_keys(
     for &key_index in &selected_transparent {
         let key = &resolved[key_index];
         if !existing.contains_key(&key.address) {
-            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, key.secret_key());
+            let pubkey = secp256k1::PublicKey::from_secret_key(key.secret_key());
             wallet_db
                 .import_standalone_transparent_pubkey(anchor_id, pubkey)
                 .map_err(|err| {
@@ -2107,7 +2110,7 @@ async fn import_accounts_into(
 }
 
 async fn import_accounts_into_wallet<C>(
-    wallet_db: &mut WalletDb<C, crate::workspace::ArgosParams, SystemClock, OsRng>,
+    wallet_db: &mut WalletDb<C, crate::workspace::ArgosParams, SystemClock, WalletRng>,
     seed: &[u8; 64],
     birthday: &AccountBirthday,
     transparent_mode: &TransparentImportMode<'_>,
@@ -4258,6 +4261,7 @@ mod tests {
             argos_wallet_import::SaplingKey {
                 extsk: secrecy::Secret::new(
                     sapling_crypto::zip32::ExtendedSpendingKey::master(&[seed; 32])
+                        .expect("valid fixture Sapling key")
                         .to_bytes()
                         .to_vec(),
                 ),
@@ -4510,9 +4514,8 @@ mod tests {
             bytes[102..106].copy_from_slice(&1u32.to_le_bytes());
             // Replace the writer's HD secret/address pair with a distinct
             // public no-funds standalone key, retaining writer field layout.
-            let secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-            let pubkey =
-                secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+            let secret = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+            let pubkey = secp256k1::PublicKey::from_secret_key(&secret);
             let address = crate::imported::encode_transparent_address(
                 &zcash_transparent::address::TransparentAddress::from_pubkey(&pubkey),
                 ZeckNetwork::Mainnet,
@@ -4740,8 +4743,10 @@ mod tests {
                 seed.expose_secret(),
                 ZeckNetwork::Mainnet.coin_type(),
                 AccountId::try_from(0).unwrap(),
-            );
-            let separate = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x71; 32]);
+            )
+            .expect("valid fixture Sapling key");
+            let separate = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x71; 32])
+                .expect("valid fixture Sapling key");
             for bytes in [
                 hd_key.to_bytes().to_vec(),
                 hd_key.to_bytes().to_vec(),
@@ -5179,7 +5184,7 @@ mod tests {
                 db_path,
                 consensus_network(config.network),
                 SystemClock,
-                rand_core::OsRng,
+                crate::workspace::wallet_rng(),
             )
             .expect("WalletDb::for_path should succeed");
 
@@ -5280,9 +5285,13 @@ mod tests {
 
             {
                 let cache = MemoryBlockCache::new();
-                let mut wallet_db =
-                    WalletDb::for_path(&wallet_db_path, network, SystemClock, rand_core::OsRng)
-                        .expect("wallet_db");
+                let mut wallet_db = WalletDb::for_path(
+                    &wallet_db_path,
+                    network,
+                    SystemClock,
+                    crate::workspace::wallet_rng(),
+                )
+                .expect("wallet_db");
 
                 // Prime the wallet's commitment-tree state and chain tip — the
                 // same calls that `zcash_client_backend::sync` issues before
@@ -5340,7 +5349,7 @@ mod tests {
                 workspace2.wallet_db_path(),
                 network,
                 SystemClock,
-                rand_core::OsRng,
+                crate::workspace::wallet_rng(),
             )
             .expect("wallet_db reopen");
 
@@ -5555,7 +5564,7 @@ mod tests {
                 rusqlite::Connection,
                 crate::workspace::ArgosParams,
                 SystemClock,
-                rand_core::OsRng,
+                crate::workspace::WalletRng,
             > {
                 crate::workspace::open_wallet_db(
                     self.workspace.wallet_db_path(),

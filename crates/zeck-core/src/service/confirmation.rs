@@ -8,7 +8,7 @@ pub(super) async fn broadcast_transactions(
         rusqlite::Connection,
         crate::workspace::ArgosParams,
         SystemClock,
-        rand_core::OsRng,
+        crate::workspace::WalletRng,
     >,
     account_index: u32,
     txids: Vec<TxId>,
@@ -31,6 +31,12 @@ pub(super) async fn broadcast_transactions(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(|err| ZeckError::Wallet(format!("opening wallet fee records: {err}")))?;
+    let target_height = wallet_db
+        .chain_height()
+        .map_err(|err| ZeckError::Wallet(format!("reading broadcast target height: {err}")))?
+        .ok_or_else(|| ZeckError::Wallet("broadcast requires a scanned chain height".to_owned()))?
+        + 1;
+    let params = consensus_network(ctx.network);
     let mut prepared = Vec::with_capacity(txids.len());
     for txid in txids {
         let tx = wallet_db
@@ -42,6 +48,7 @@ pub(super) async fn broadcast_transactions(
                 ))
             })?;
 
+        crate::nu7_limits::validate_transaction(&params, target_height, &tx)?;
         let mut tx_bytes = Vec::new();
         tx.write(&mut tx_bytes).map_err(|err| {
             ZeckError::TransactionBuild(format!("serializing transaction {txid}: {err}"))
@@ -147,6 +154,10 @@ where
         )));
     }
     for tx in prepared {
+        // Proving and earlier batch confirmations may cross an activation or
+        // expiry. Recheck every exact transaction immediately before journaling.
+        let tip = submitter.validated_tip(network).await?;
+        crate::broadcast::validate_retry_at_tip(&tx.raw_tx, network, tip)?;
         let txid = tx.txid;
         let fee_zatoshis = tx.fee_zatoshis;
         let expiry_height = tx.expiry_height;
