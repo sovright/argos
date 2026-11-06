@@ -65,3 +65,12 @@
 ## Compatibility decisions
 
 Preserved the legacy zero-count fingerprint slot for supported-only wallets, so this removal does not change their existing workspace identity. Recognized Sprout record counts never influence supported spending-authority identity or birthdays. Shared filesystem authentication formats and surviving production guards remain unchanged. Existing user artifacts and historical design/audit records are preserved. No production broadcast, hosted Windows execution, merge, release or deployment was performed.
+
+## PR #301 review follow-up
+
+Addressed both inline comments on the original `345a7d7` head:
+
+- Added shared CLI/GUI notice text and README guidance that old mixed-wallet scans use a new workspace, require a supported-fund rescan, and should reconcile prior broadcasts before recovering again. Documented that old Sprout checkpoints contain raw spending keys and remain sensitive.
+- Split CLI Terms of Service handling into a read-only review before seed/passphrase access and deferred persistence after supported spending authority is known. Explicit consent and previously stored acceptance remain supported; unsupported-only wallets still create no workspace or acceptance record. Reconciliation keeps its immediate gate and local inspection remains ungated.
+
+Verification: Rust 1.88 CLI suite 103 passed, 0 failed; 17 targeted GUI tests passed; Rust 1.88 Clippy for the CLI across all targets/features with warnings denied, workspace formatting, and diff checks passed. New regressions cover all secret-source entry paths, deferred writes, persisted acceptance in the selected versioned default, and the mixed-wallet migration notice. Original-head hosted CI was fully green, including Windows x64/ARM64 and macOS authority checks. The follow-up head requires its own hosted CI results.

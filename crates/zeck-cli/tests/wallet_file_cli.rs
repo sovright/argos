@@ -566,6 +566,13 @@ fn nu7_warning_reaches_wallet_inspection_only_when_sprout_records_exist() {
     let warning = nu7_warning(&out.stderr);
     assert!(warning.contains("NU7"), "{warning}");
     assert!(warning.contains("unspendable"), "{warning}");
+    for guidance in [
+        "new workspace",
+        "rescan supported funds",
+        "Reconcile previously broadcast transactions",
+    ] {
+        assert!(warning.contains(guidance), "missing {guidance}: {warning}");
+    }
     assert!(!warning.contains("Start recovery"), "{warning}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Transparent keys  103"), "{stdout}");
@@ -803,6 +810,13 @@ fn a_mixed_wallet_explains_sprout_retirement_and_preserves_supported_recovery() 
         stderr.contains("can still recover supported transparent and Sapling funds"),
         "the retirement notice must explain supported recovery: {stderr}"
     );
+    for guidance in [
+        "new workspace",
+        "rescan supported funds",
+        "Reconcile previously broadcast transactions",
+    ] {
+        assert!(stderr.contains(guidance), "missing {guidance}: {stderr}");
+    }
     assert!(
         !stderr.contains("Sapling key(s) in this wallet are NOT scanned"),
         "Sapling is scanned via the imported account path; listing it as uncovered means \
@@ -1481,6 +1495,7 @@ fn sprout_only_recovery_stops_before_birthday_destination_and_storage() {
             wallet.to_str().unwrap(),
             "--data-dir",
             data_dir.to_str().unwrap(),
+            "--accept-tos",
             "--birthday-auto-detect",
             "--lightwalletd-url",
             "invalid-server",
@@ -1533,4 +1548,105 @@ fn a_supported_key_merged_into_a_sprout_only_wallet_can_recover() {
         stderr.contains("can take hours"),
         "supported recovery must reach scan setup: {stderr}"
     );
+}
+
+#[test]
+fn tos_is_checked_before_seed_and_wallet_secrets_without_creating_storage() {
+    let encrypted_wallet = fixture("sprout-encrypted.dat");
+    let missing = "/nonexistent/argos-tos-before-secrets";
+    for source in [
+        vec!["--seed-file", missing],
+        vec!["--wallet-file", missing],
+        vec!["--wallet-file", encrypted_wallet.to_str().unwrap()],
+        vec![],
+    ] {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("uncreated-workspace");
+        let mut args = vec!["--data-dir", data_dir.to_str().unwrap()];
+        args.extend(source);
+        args.push("scan");
+        let out = argos(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains("Terms of Service must be accepted"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("failed to read") && !stderr.contains("failed to inspect"),
+            "secrets were accessed before consent: {stderr}"
+        );
+        assert!(
+            !stderr.contains("This wallet is encrypted"),
+            "wallet decryption was reached before consent: {stderr}"
+        );
+        assert!(
+            !stderr.contains("seed phrase"),
+            "seed prompt was reached before consent: {stderr}"
+        );
+        assert!(
+            !data_dir.exists(),
+            "the read-only TOS gate must not create storage"
+        );
+    }
+}
+
+#[test]
+fn tos_flag_is_usable_before_secrets_but_does_not_persist_until_authority_is_known() {
+    let outer = tempfile::tempdir().unwrap();
+    let data_dir = outer.path().join("uncreated-workspace");
+    let out = argos(&[
+        "--accept-tos",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--seed-file",
+        "/nonexistent/argos-accepted-tos-seed",
+        "scan",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("failed to inspect seed file"), "{stderr}");
+    assert!(
+        !stderr.contains("Terms of Service must be accepted"),
+        "{stderr}"
+    );
+    assert!(
+        !data_dir.exists(),
+        "failed source loading must not write acceptance or create a workspace"
+    );
+}
+
+#[test]
+fn tos_lookup_uses_the_selected_versioned_default_and_keeps_acceptance_unchanged() {
+    let outer = tempfile::tempdir().unwrap();
+    let legacy = outer.path().join("argos_data");
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::write(legacy.join("wallet.sqlite"), b"preserve legacy wallet").unwrap();
+    let data_dir = outer.path().join("argos_data_v2");
+    argos_core::service::ensure_recovery_data_dir(&data_dir).unwrap();
+    argos_core::record_tos_acceptance(&data_dir, 123).unwrap();
+    let acceptance_path = data_dir.join("tos-acceptance.json");
+    let acceptance = std::fs::read(&acceptance_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argos"));
+    command
+        .current_dir(outer.path())
+        .args([
+            "--seed-file",
+            "/nonexistent/argos-persisted-tos-seed",
+            "scan",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = spawn_argos(&mut command).wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("failed to inspect seed file"), "{stderr}");
+    assert!(
+        !stderr.contains("Terms of Service must be accepted"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(acceptance_path).unwrap(), acceptance);
+    assert!(!legacy.join("tos-acceptance.json").exists());
+    assert!(!legacy.join(".argos-private-artifact-root-v1").exists());
 }

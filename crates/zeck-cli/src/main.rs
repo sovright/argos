@@ -1184,6 +1184,16 @@ async fn main() -> Result<()> {
         .await;
     }
 
+    // Check consent before reading spending material or prompting for a
+    // passphrase. This lookup/prompt does not create a workspace or persist
+    // acceptance: a wallet with no supported authority must leave no artifacts.
+    let reviewed_tos = if command_requires_tos(&cli.command) {
+        select_recovery_data_dir(&mut cli)?;
+        Some(review_tos_acceptance(&cli.data_dir, cli.accept_tos)?)
+    } else {
+        None
+    };
+
     // `key_source` is what the scanner and sweeper use. `seed_phrase` is
     // the same key material in the one form two local-only paths still
     // need it in — birthday auto-detection and `show-keys` — and is
@@ -1272,13 +1282,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    select_recovery_data_dir(&mut cli)?;
-
-    // Initialize recovery storage only after supported spending authority is
-    // known. Inspection and unsupported-only wallets require no workspace.
-    if command_requires_tos(&cli.command) {
+    // Initialize recovery storage and persist acceptance only after supported
+    // spending authority is known. Reuse the directory selected for the review.
+    if let Some(acceptance) = reviewed_tos {
         argos_core::service::ensure_recovery_data_dir(&cli.data_dir)?;
-        ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
+        persist_reviewed_tos_acceptance(&cli.data_dir, acceptance)?;
+    } else {
+        select_recovery_data_dir(&mut cli)?;
     }
 
     // Only the seed-phrase sweep attaches a memo or a donation; the
@@ -1668,24 +1678,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Require Terms of Service acceptance before a network/funds-moving command.
-///
-/// Skips silently if the current TOS version was already accepted under
-/// `data_dir`. Otherwise: `--accept-tos` records acceptance non-interactively;
-/// an interactive TTY gets a short notice and a `y/N` prompt; a non-interactive
-/// run without the flag errors with guidance (so it fails closed).
-fn ensure_tos_accepted(data_dir: &Path, accept_flag: bool) -> Result<()> {
-    if argos_core::is_tos_accepted(data_dir) {
-        return Ok(());
-    }
+enum ReviewedTosAcceptance {
+    Persisted,
+    CommandLine,
+    Interactive,
+}
 
+/// Read existing consent or obtain it before handling spending material.
+/// This phase never creates directories or writes acceptance records.
+fn review_tos_acceptance(data_dir: &Path, accept_flag: bool) -> Result<ReviewedTosAcceptance> {
+    if argos_core::is_tos_accepted(data_dir) {
+        return Ok(ReviewedTosAcceptance::Persisted);
+    }
     if accept_flag {
-        record_tos(data_dir)?;
-        eprintln!(
-            "Argos Terms of Service ({}) accepted via --accept-tos.",
-            argos_core::TOS_VERSION
-        );
-        return Ok(());
+        return Ok(ReviewedTosAcceptance::CommandLine);
     }
 
     let notice = format!(
@@ -1717,12 +1723,37 @@ fn ensure_tos_accepted(data_dir: &Path, accept_flag: bool) -> Result<()> {
         .context("reading Terms of Service response")?;
     let answer = answer.trim().to_ascii_lowercase();
     if answer == "y" || answer == "yes" {
-        record_tos(data_dir)?;
-        eprintln!("Terms of Service accepted.");
-        Ok(())
+        Ok(ReviewedTosAcceptance::Interactive)
     } else {
         bail!("Terms of Service not accepted; aborting.");
     }
+}
+
+/// Persist consent only after the caller has established supported authority.
+fn persist_reviewed_tos_acceptance(
+    data_dir: &Path,
+    acceptance: ReviewedTosAcceptance,
+) -> Result<()> {
+    match acceptance {
+        ReviewedTosAcceptance::Persisted => {}
+        ReviewedTosAcceptance::CommandLine => {
+            record_tos(data_dir)?;
+            eprintln!(
+                "Argos Terms of Service ({}) accepted via --accept-tos.",
+                argos_core::TOS_VERSION
+            );
+        }
+        ReviewedTosAcceptance::Interactive => {
+            record_tos(data_dir)?;
+            eprintln!("Terms of Service accepted.");
+        }
+    }
+    Ok(())
+}
+
+/// Reconciliation has no secret-source phase and retains its immediate gate.
+fn ensure_tos_accepted(data_dir: &Path, accept_flag: bool) -> Result<()> {
+    persist_reviewed_tos_acceptance(data_dir, review_tos_acceptance(data_dir, accept_flag)?)
 }
 
 /// Record TOS acceptance under `data_dir` stamped with the current Unix time.

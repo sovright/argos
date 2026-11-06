@@ -126,7 +126,7 @@ impl std::fmt::Debug for SaplingKey {
 }
 
 /// Sprout cannot be spent under the NU7 consensus rules. Shared by frontends.
-pub const SPROUT_UNSPENDABLE_NOTICE: &str = "This wallet contains Sprout records. Sprout funds are unspendable under the NU7 consensus rules. Argos can still recover supported transparent and Sapling funds from this wallet.";
+pub const SPROUT_UNSPENDABLE_NOTICE: &str = "This wallet contains Sprout records. Sprout funds are unspendable under the NU7 consensus rules. Argos can still recover supported transparent and Sapling funds from this wallet. Mixed wallets previously scanned with Sprout keys use a new workspace and must rescan supported funds. Reconcile previously broadcast transactions before recovering again.";
 
 /// No `Debug`/`Clone` derive: it holds `Vec<TransparentKey>` etc., which
 /// carry `Secret`s. Add a manual redacted impl or a clone path if a caller

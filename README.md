@@ -145,7 +145,15 @@ sweeping, and pack tooling. A wallet containing Sprout records still imports
 its supported transparent and Sapling keys; the Sprout notice is separate
 from the supported-pool balance.
 
+Mixed wallets previously scanned with Sprout keys get a new workspace and
+must rescan their supported funds. Reconcile previously broadcast transactions
+before recovering again; supported-only wallets keep their existing workspace
+identity.
+
 Existing wallets, checkpoints, journals, and packs are left untouched.
+Old Sprout checkpoints contain raw spending keys: keep them private even though
+Sprout spends are currently disabled. Those keys would still authorize spending
+if consensus rules later re-enabled it; this is not a promise of future recovery.
 Preserve old recovery artifacts and transaction records. This version does
 not reconcile or clean up artifacts created by the removed Sprout workflow.
 
