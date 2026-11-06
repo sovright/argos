@@ -260,7 +260,8 @@ jobs:
         with:
           toolchain: "1.89"
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Reviewed 2026-03-12 commit; the moving v2 tag has since advanced.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
       - name: Install protoc
         timeout-minutes: 10
