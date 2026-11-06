@@ -5104,6 +5104,7 @@ mod tests {
                 secret: secrecy::Secret::new([1u8; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
             });
         }
         let found = detect(&keys, pasted);
@@ -5136,6 +5137,7 @@ mod tests {
             secret: secrecy::Secret::new([2u8; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
         });
         let found = detect(&keys, 0);
         assert_eq!(found.source, argos_core::WalletBirthdaySource::None);
@@ -5450,6 +5452,7 @@ mod tests {
                 secret: secrecy::Secret::new([1u8; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
             }],
             ..Default::default()
         }

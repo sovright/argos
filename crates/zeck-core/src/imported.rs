@@ -12,7 +12,7 @@
 //! is account-id driven and accepts raw per-pool keys, which is what makes
 //! this work at all; see `docs/` for the full argument.
 
-use argos_wallet_import::{ImportedKeys, SecretBytes};
+use argos_wallet_import::{ImportedKeys, PubkeyForm, SecretBytes};
 use rand_core::OsRng;
 use secrecy::ExposeSecret;
 use zcash_address::unified::{Encoding, Fvk, Ufvk};
@@ -186,9 +186,35 @@ const NO_ORCHARD: &str = "n/a (imported wallet has no Orchard key)";
 /// Pairing them is what makes the rest of the transparent path possible:
 /// lightwalletd is queried by address, and the builder signs by key, so
 /// every step needs both halves together.
+///
+/// The address is `Hash160` of the public key in the form the wallet filed
+/// it in ([`PubkeyForm`]). Only a compressed key can be registered with the
+/// wallet database or signed for: upstream derives and signs compressed
+/// P2PKH only, so an uncompressed key handed to either would be watched or
+/// spent at an address that never held its coins. [`Self::is_sweepable`]
+/// says which, and the accessors that feed those paths refuse the other.
 pub struct ImportedTransparentKey {
     secret: ImportedTransparentSecret,
     pub address: TransparentAddress,
+    form: PubkeyForm,
+}
+
+/// The P2PKH address of `pubkey` serialized in `form`.
+///
+/// Compressed goes through upstream's `from_pubkey`, exactly as before.
+/// Uncompressed hashes the 65-byte serialization; upstream has no public
+/// constructor for it, so the hash is taken here with upstream's own
+/// `Hash160`.
+pub fn transparent_address_for(
+    pubkey: &secp256k1::PublicKey,
+    form: PubkeyForm,
+) -> TransparentAddress {
+    match form {
+        PubkeyForm::Compressed => TransparentAddress::from_pubkey(pubkey),
+        PubkeyForm::Uncompressed => TransparentAddress::PublicKeyHash(
+            zcash_transparent::util::hash160::hash(&pubkey.serialize_uncompressed()),
+        ),
+    }
 }
 
 /// Non-cloneable owner for a parsed transparent spending key.
@@ -212,7 +238,11 @@ impl Drop for ImportedTransparentSecret {
 }
 
 impl ImportedTransparentKey {
-    pub(crate) fn new(secret: &mut secp256k1::SecretKey, address: TransparentAddress) -> Self {
+    pub(crate) fn new(
+        secret: &mut secp256k1::SecretKey,
+        address: TransparentAddress,
+        form: PubkeyForm,
+    ) -> Self {
         let owner = Self {
             secret: ImportedTransparentSecret {
                 key: *secret,
@@ -220,6 +250,7 @@ impl ImportedTransparentKey {
                 drop_probe: None,
             },
             address,
+            form,
         };
         // The upstream type is Copy, so moving it cannot transfer unique
         // ownership. Scrub the parsed caller local after making the single
@@ -228,18 +259,60 @@ impl ImportedTransparentKey {
         owner
     }
 
+    /// The form the wallet filed this key's public key in.
+    pub fn pubkey_form(&self) -> PubkeyForm {
+        self.form
+    }
+
+    /// Whether Argos can watch this key through the wallet database and
+    /// sign for it: compressed only, until an uncompressed signing path
+    /// exists.
+    pub fn is_sweepable(&self) -> bool {
+        self.form == PubkeyForm::Compressed
+    }
+
+    fn require_sweepable(&self) -> ZeckResult<()> {
+        if self.is_sweepable() {
+            Ok(())
+        } else {
+            Err(ZeckError::Internal(
+                "an uncompressed transparent key reached a path that registers or signs \
+                 compressed P2PKH only"
+                    .to_owned(),
+            ))
+        }
+    }
+
     /// Borrow the sole retained parsed owner for public-key derivation.
     pub fn secret_key(&self) -> &secp256k1::SecretKey {
         &self.secret.key
+    }
+
+    /// The public key to register as a standalone wallet receiver.
+    ///
+    /// Upstream's `import_standalone_transparent_pubkey` watches the
+    /// compressed address of whatever key it is given, so an uncompressed
+    /// key is refused here rather than registered at the wrong address.
+    pub(crate) fn standalone_receiver_pubkey(
+        &self,
+        secp: &secp256k1::Secp256k1<secp256k1::SignOnly>,
+    ) -> ZeckResult<secp256k1::PublicKey> {
+        self.require_sweepable()?;
+        Ok(secp256k1::PublicKey::from_secret_key(
+            secp,
+            &self.secret.key,
+        ))
     }
 
     /// Make the copy required by upstream's by-value transparent signer.
     ///
     /// `TransparentSigningSet` owns this copy and does not expose a way to
     /// scrub it in the currently pinned release. Keep the signing set scoped
-    /// to one transaction build.
-    pub(crate) fn signing_key_copy(&self) -> secp256k1::SecretKey {
-        self.secret.key
+    /// to one transaction build. Refused for an uncompressed key: the signer
+    /// would produce a compressed-key scriptSig its coins cannot accept.
+    pub(crate) fn signing_key_copy(&self) -> ZeckResult<secp256k1::SecretKey> {
+        self.require_sweepable()?;
+        Ok(self.secret.key)
     }
 
     #[cfg(test)]
@@ -254,6 +327,7 @@ impl ImportedTransparentKey {
                 drop_probe: Some(probe),
             },
             address,
+            form: PubkeyForm::Compressed,
         };
         secret.non_secure_erase();
         owner
@@ -267,15 +341,23 @@ impl std::fmt::Debug for ImportedTransparentKey {
         f.debug_struct("ImportedTransparentKey")
             .field("secret", &"<redacted>")
             .field("address", &self.address)
+            .field("form", &self.form)
             .finish()
     }
 }
 
 /// Resolve every transparent key in a wallet file to its address.
 ///
-/// Order follows the file, and duplicates are preserved: two records
-/// yielding the same address is a fact about the wallet worth surfacing
-/// rather than silently collapsing.
+/// Order follows the file and the result is aligned with
+/// `keys.transparent`: entry `i` is `keys.transparent[i]`. Callers select
+/// keys by that index, so nothing is filtered out here; uncompressed keys
+/// are present with their own address and [`ImportedTransparentKey::is_sweepable`]
+/// false. A caller that registers or signs must skip those, or use
+/// [`sweepable_transparent_keys`].
+///
+/// Duplicates are preserved: two records yielding the same address is a
+/// fact about the wallet worth surfacing rather than silently collapsing.
+/// The same secret in its two forms is two keys at two addresses.
 pub fn imported_transparent_keys(keys: &ImportedKeys) -> ZeckResult<Vec<ImportedTransparentKey>> {
     let secp = secp256k1::Secp256k1::signing_only();
     keys.transparent
@@ -286,10 +368,36 @@ pub fn imported_transparent_keys(keys: &ImportedKeys) -> ZeckResult<Vec<Imported
             let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
             Ok(ImportedTransparentKey::new(
                 &mut secret,
-                TransparentAddress::from_pubkey(&pubkey),
+                transparent_address_for(&pubkey, key.pubkey_form),
+                key.pubkey_form,
             ))
         })
         .collect()
+}
+
+/// The transparent keys Argos can sweep, in file order.
+///
+/// Not aligned with `keys.transparent`: for callers that take the whole
+/// set, never for selection by index.
+pub fn sweepable_transparent_keys(keys: &ImportedKeys) -> ZeckResult<Vec<ImportedTransparentKey>> {
+    Ok(imported_transparent_keys(keys)?
+        .into_iter()
+        .filter(ImportedTransparentKey::is_sweepable)
+        .collect())
+}
+
+/// Addresses of the keys Argos holds but cannot sweep yet, in file order.
+///
+/// Addresses only: no secret leaves this module for a key no path can
+/// spend.
+pub fn unsweepable_transparent_addresses(
+    keys: &ImportedKeys,
+) -> ZeckResult<Vec<TransparentAddress>> {
+    Ok(imported_transparent_keys(keys)?
+        .into_iter()
+        .filter(|key| !key.is_sweepable())
+        .map(|key| key.address)
+        .collect())
 }
 
 /// Encode a transparent address for display on `network`.
@@ -408,8 +516,11 @@ pub fn register_imported_accounts(
         .get_transparent_receivers(anchor.wallet_account_id, true, true)
         .map_err(|err| ZeckError::Wallet(format!("loading transparent receivers: {err}")))?;
 
-    for imported in imported_transparent_keys(keys)? {
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, imported.secret_key());
+    // An uncompressed key is not registered: the database would watch its
+    // compressed address, which never held its coins. The import already
+    // reports it, so the file stays the user's copy of it.
+    for imported in sweepable_transparent_keys(keys)? {
+        let pubkey = imported.standalone_receiver_pubkey(&secp)?;
         let address = imported.address;
 
         if !existing.contains_key(&address) {
@@ -670,6 +781,75 @@ mod tests {
              succeeds, transparent-only wallet import is unblocked"
         );
     }
+
+    fn secret_one_in(forms: &[PubkeyForm]) -> ImportedKeys {
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        let mut keys = ImportedKeys::default();
+        for form in forms {
+            keys.transparent
+                .push(argos_wallet_import::keys::TransparentKey {
+                    secret: secrecy::Secret::new(secret),
+                    provenance: argos_wallet_import::Provenance::Standalone,
+                    created_at: None,
+                    pubkey_form: *form,
+                });
+        }
+        keys
+    }
+
+    #[test]
+    fn each_form_of_a_secret_resolves_to_the_address_that_holds_its_coins() {
+        // Secret key 1. Both addresses were computed outside this code, as
+        // Base58Check(t1 prefix || RIPEMD160(SHA256(pubkey))) over the 33-
+        // and 65-byte serializations of the secp256k1 generator.
+        let keys = secret_one_in(&[PubkeyForm::Compressed, PubkeyForm::Uncompressed]);
+        let resolved = imported_transparent_keys(&keys).expect("resolve");
+        let encoded: Vec<String> = resolved
+            .iter()
+            .map(|key| encode_transparent_address(&key.address, ZeckNetwork::Mainnet))
+            .collect();
+        assert_eq!(
+            encoded,
+            [
+                "t1UYsZVJkLPeMjxEtACvSxfWuNmddpWfxzs",
+                "t1X9yaRpCHJpWX1HrGUxEu39xyQinmo3Ana"
+            ],
+            "aligned with the file, each key at its own address"
+        );
+        assert_eq!(resolved[0].pubkey_form(), PubkeyForm::Compressed);
+        assert_eq!(resolved[1].pubkey_form(), PubkeyForm::Uncompressed);
+
+        // The compressed address is still upstream's own derivation.
+        let secp = secp256k1::Secp256k1::signing_only();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, resolved[0].secret_key());
+        assert_eq!(
+            resolved[0].address,
+            TransparentAddress::from_pubkey(&pubkey)
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_key_is_never_registered_or_signed_for() {
+        let keys = secret_one_in(&[PubkeyForm::Uncompressed, PubkeyForm::Compressed]);
+        let resolved = imported_transparent_keys(&keys).expect("resolve");
+        let secp = secp256k1::Secp256k1::signing_only();
+
+        assert!(!resolved[0].is_sweepable());
+        assert!(resolved[0].signing_key_copy().is_err());
+        assert!(resolved[0].standalone_receiver_pubkey(&secp).is_err());
+        assert!(resolved[1].is_sweepable());
+        assert!(resolved[1].signing_key_copy().is_ok());
+        assert!(resolved[1].standalone_receiver_pubkey(&secp).is_ok());
+
+        let sweepable = sweepable_transparent_keys(&keys).expect("sweepable");
+        assert_eq!(sweepable.len(), 1);
+        assert_eq!(sweepable[0].address, resolved[1].address);
+        assert_eq!(
+            unsweepable_transparent_addresses(&keys).expect("unsweepable"),
+            vec![resolved[0].address]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -888,6 +1068,7 @@ mod db_tests {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             }],
             ..Default::default()
         };
@@ -897,6 +1078,46 @@ mod db_tests {
         assert!(
             err.to_string().contains("shielded"),
             "the refusal must explain the ZIP-316 constraint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_key_is_not_registered_at_either_address() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = seedless_wallet_db(dir.path());
+        let mut keys = fixture_keys("sprout-plaintext.dat");
+        let file_keys = keys.transparent.len();
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        keys.transparent
+            .push(argos_wallet_import::keys::TransparentKey {
+                secret: secrecy::Secret::new(secret),
+                provenance: argos_wallet_import::Provenance::Standalone,
+                created_at: None,
+                pubkey_form: PubkeyForm::Uncompressed,
+            });
+        let resolved = imported_transparent_keys(&keys).expect("resolve");
+        let uncompressed_address = resolved[file_keys].address;
+        let secp = secp256k1::Secp256k1::signing_only();
+        let compressed_address = TransparentAddress::from_pubkey(
+            &secp256k1::PublicKey::from_secret_key(&secp, resolved[file_keys].secret_key()),
+        );
+
+        let accounts =
+            register_imported_accounts(&mut db, &keys, &birthday()).expect("registration");
+
+        assert_eq!(
+            accounts[0].transparent_addresses.len(),
+            file_keys,
+            "the file's own compressed keys, and only those"
+        );
+        let receivers = db
+            .get_transparent_receivers(accounts[0].wallet_account_id, true, true)
+            .expect("receivers");
+        assert!(!receivers.contains_key(&uncompressed_address));
+        assert!(
+            !receivers.contains_key(&compressed_address),
+            "registering the key would watch an address that never held its coins"
         );
     }
 }

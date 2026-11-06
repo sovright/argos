@@ -380,6 +380,41 @@ pub struct ScanProgress {
     /// search doesn't read as the scan starting over.
     #[serde(default)]
     pub gap_extension: Option<GapExtension>,
+    /// What sits at the addresses of keys Argos holds but cannot sweep yet:
+    /// transparent keys the wallet filed in uncompressed form. Looked up at
+    /// their own addresses and reported here, never added to an account's
+    /// balance, because no sweep moves them. Empty when the key set has none.
+    #[serde(default)]
+    pub unsweepable_transparent: Vec<UnsweepableTransparentFunds>,
+}
+
+/// Coins found at the address of a transparent key Argos cannot sweep yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsweepableTransparentFunds {
+    /// The address, encoded for the scan's network.
+    pub address: String,
+    /// Unspent value at the address. Zero is reported too: the address was
+    /// checked and holds nothing.
+    pub zatoshis: u64,
+    pub utxo_count: u32,
+}
+
+impl UnsweepableTransparentFunds {
+    /// The sweep's record of these coins: listed as skipped, so a sweep that
+    /// leaves them behind never reads as a complete recovery. Account 0,
+    /// because the wallet file's transparent keys hang from the first account
+    /// on every route.
+    pub fn as_skipped_sweep(&self) -> Option<SkippedSweepAccount> {
+        (self.zatoshis > 0).then(|| SkippedSweepAccount {
+            account_index: 0,
+            gross_zatoshis: self.zatoshis,
+            reason: format!(
+                "{} is controlled by an uncompressed transparent key, which Argos cannot \
+                 sweep yet. Keep the original wallet file: it is the only copy of that key.",
+                self.address
+            ),
+        })
+    }
 }
 
 /// Snapshot of all detected sleep gaps during the current scan. The poller

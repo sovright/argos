@@ -107,6 +107,20 @@ fn import_records(pairs: &[bdb::RawRecord], master: Option<&MasterKey>) -> Impor
     out
 }
 
+/// The diagnostic for a transparent key kept in its uncompressed form.
+///
+/// The key is read and its form is kept, so its address is the one that
+/// holds its coins. Argos's sweep signs compressed P2PKH only, so the coins
+/// cannot be moved yet, and the wallet file stays their only copy: the key
+/// is not in any seed. Graded `KeyMaterialMissing`, which keeps the import
+/// from reading as complete and tells the user to keep the file.
+pub(crate) fn uncompressed_key_not_swept(record_type: &str) -> ImportDiagnostic {
+    ImportDiagnostic::UnrecoveredStandaloneKey {
+        record_type: record_type.to_owned(),
+        pool: "uncompressed transparent",
+    }
+}
+
 /// The keys a collector actually recovered, named by the remainder of
 /// their record key after the type: the serialized public key for
 /// `key`/`ckey`, the incoming viewing key for `sapzkey`/`csapzkey`. Those

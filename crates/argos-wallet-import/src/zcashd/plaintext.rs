@@ -7,13 +7,13 @@ use crate::{
     identity,
     keys::{
         merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
-        SaplingKey, SproutKey, TransparentKey,
+        PubkeyForm, SaplingKey, SproutKey, TransparentKey,
     },
     secret_bytes::SecretArray,
     zcashd::{
         metadata::{is_metadata_record, KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
-        RecoveredKeyIds,
+        uncompressed_key_not_swept, RecoveredKeyIds,
     },
 };
 
@@ -77,7 +77,7 @@ fn networkinfo(value: &[u8]) -> Option<EmbeddedNetwork> {
 /// OCTET STRING": a mismatch (short-form header, garbage, or any other
 /// shape) means we cannot safely locate the secret, so we refuse to guess
 /// rather than risk returning a plausible-looking but wrong key.
-fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
+fn compressed_secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
     let header = der.get(..8)?;
     let expected_fixed: [(usize, u8); 7] = [
         (0, 0x30),
@@ -94,6 +94,37 @@ fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
         }
     }
     der.get(8..40)
+}
+
+/// zcashd's DER header for an uncompressed key, `ec_seckey_export_der` in
+/// `key.cpp`: SEQUENCE with a two-byte length (`82 01 13`, 275 bytes), the
+/// version INTEGER 1, then the OCTET STRING of the 32-byte secret. One byte
+/// longer than the compressed header, so the secret starts at offset 9.
+const UNCOMPRESSED_KEY_DER_HEADER: [u8; 9] = [0x30, 0x82, 0x01, 0x13, 0x02, 0x01, 0x01, 0x04, 0x20];
+
+/// zcashd's `CKey::PRIVATE_KEY_SIZE`: the whole uncompressed DER blob, the
+/// four header bytes plus the 0x0113 bytes they announce.
+const UNCOMPRESSED_KEY_DER_LEN: usize = 279;
+
+/// The secret of an uncompressed key's DER blob, under the same rule as the
+/// compressed form: every header byte is checked, and here the total length
+/// too, before any slice is taken.
+fn uncompressed_secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
+    if der.len() != UNCOMPRESSED_KEY_DER_LEN || der.get(..9)? != UNCOMPRESSED_KEY_DER_HEADER {
+        return None;
+    }
+    der.get(9..41)
+}
+
+/// The secret of a `key` record's DER blob, and the form the blob encodes.
+///
+/// The form read here is checked against the stored public key's form by the
+/// caller; neither alone decides the key's address.
+fn secret_from_key_der(der: &[u8]) -> Option<(&[u8], PubkeyForm)> {
+    if let Some(secret) = compressed_secret_from_key_der(der) {
+        return Some((secret, PubkeyForm::Compressed));
+    }
+    uncompressed_secret_from_key_der(der).map(|secret| (secret, PubkeyForm::Uncompressed))
 }
 
 /// Extract every unencrypted key record.
@@ -197,27 +228,54 @@ pub fn collect_plaintext(
                 // from garbage, or return the genuine secret shifted by one
                 // byte when the DER uses a short-form length header instead
                 // of the long form zcashd always emits.
+                //
+                // An uncompressed key (`importprivkey` of an uncompressed
+                // WIF) is the 279-byte form `30 82 01 13 | 02 01 01 | 04 20 |
+                // <secret>`, secret at offset 9, under a 65-byte public key.
+                // That layout is zcashd's `ec_seckey_export_der`; no fixture
+                // holds such a record yet, so the identity check below, not
+                // the offset, is what keeps a wrong slice from becoming a key.
                 match read_length_prefixed(value).and_then(secret_from_key_der) {
-                    Some(s) => match <[u8; 32]>::try_from(s) {
+                    Some((s, der_form)) => match <[u8; 32]>::try_from(s) {
                         Ok(secret) => {
                             let public_key = read_length_prefixed(&rec.rest);
                             let secret = SecretArray::new(secret);
-                            if let Some(secret) = public_key.and_then(|public_key| {
+                            match public_key.and_then(|public_key| {
                                 identity::retain_transparent_secret(secret, public_key)
                             }) {
-                                out.transparent.push(TransparentKey {
-                                    secret,
-                                    provenance: Provenance::HdDerived,
-                                    created_at: metadata
-                                        .created_at(MetadataKind::Transparent, &rec.rest),
-                                });
-                                recovered.transparent.insert(rec.rest);
-                            } else {
-                                out.diagnostics
-                                    .push(ImportDiagnostic::PublicIdentifierMismatch {
-                                        record_type: "key".to_owned(),
-                                        identifier: "public key",
+                                Some((secret, pubkey_form)) if pubkey_form == der_form => {
+                                    out.transparent.push(TransparentKey {
+                                        secret,
+                                        provenance: Provenance::HdDerived,
+                                        created_at: metadata
+                                            .created_at(MetadataKind::Transparent, &rec.rest),
+                                        pubkey_form,
                                     });
+                                    if pubkey_form == PubkeyForm::Uncompressed {
+                                        out.diagnostics.push(uncompressed_key_not_swept("key"));
+                                    }
+                                    recovered.transparent.insert(rec.rest);
+                                }
+                                // zcashd writes both from one `fCompressed`, so
+                                // a disagreement is a damaged or foreign record.
+                                // Neither form can be trusted to name the
+                                // address, so the key is not kept.
+                                Some(_) => {
+                                    out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                                        record_type: "key".to_owned(),
+                                        reason: "private key encoding does not match the form of \
+                                                 its public key"
+                                            .to_owned(),
+                                    })
+                                }
+                                None => {
+                                    out.diagnostics.push(
+                                        ImportDiagnostic::PublicIdentifierMismatch {
+                                            record_type: "key".to_owned(),
+                                            identifier: "public key",
+                                        },
+                                    );
+                                }
                             }
                         }
                         Err(_) => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {

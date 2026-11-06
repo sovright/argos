@@ -10,7 +10,9 @@
 //! field later, both reintroduce the leak with no compiler complaint. These
 //! tests fail loudly if that happens.
 
-use argos_wallet_import::keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey};
+use argos_wallet_import::keys::{
+    ImportedKeys, Provenance, PubkeyForm, SaplingKey, SproutKey, TransparentKey,
+};
 use argos_wallet_import::zcashd::{derive_master_key, MkeyRecord};
 use argos_wallet_import::ImportDiagnostic;
 use secrecy::{Secret, SecretString};
@@ -55,6 +57,7 @@ fn transparent_key_debug_is_redacted() {
         secret: Secret::new([TRANSPARENT_MARKER; 32]),
         provenance: Provenance::HdDerived,
         created_at: None,
+        pubkey_form: PubkeyForm::Compressed,
     };
     let rendered = format!("{k:?}");
     assert_no_marker(&rendered, TRANSPARENT_MARKER, "transparent");
@@ -135,6 +138,7 @@ fn an_imported_key_set_does_not_leak_through_debug() {
         secret: Secret::new([TRANSPARENT_MARKER; 32]),
         provenance: Provenance::HdDerived,
         created_at: None,
+        pubkey_form: PubkeyForm::Compressed,
     });
     keys.sprout.push(SproutKey {
         a_sk: Secret::new([SPROUT_MARKER; 32]),

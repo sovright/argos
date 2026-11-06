@@ -121,11 +121,16 @@ pub(crate) fn retain_sprout_secret(
     (sprout_address_from_spending_key(secret.as_array()) == *address).then(|| secret.into_secret())
 }
 
+/// Keep `secret` only if it yields `public_key` exactly, and report the form
+/// the wallet filed that public key in. The form comes from the stored bytes
+/// the secret was just checked against and from nothing else, so a key's
+/// address can only be the one the wallet recorded.
 pub(crate) fn retain_transparent_secret(
     secret: SecretArray<32>,
     public_key: &[u8],
-) -> Option<secrecy::Secret<[u8; 32]>> {
-    transparent_matches_pubkey(secret.as_array(), public_key).then(|| secret.into_secret())
+) -> Option<(secrecy::Secret<[u8; 32]>, crate::keys::PubkeyForm)> {
+    let form = crate::keys::PubkeyForm::of_serialized_len(public_key.len())?;
+    transparent_matches_pubkey(secret.as_array(), public_key).then(|| (secret.into_secret(), form))
 }
 
 #[cfg(test)]

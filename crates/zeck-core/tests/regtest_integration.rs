@@ -119,6 +119,7 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
         secret: Secret::new(common::standalone_transparent::STANDALONE_TRANSPARENT_SECRET),
         provenance: Provenance::Standalone,
         created_at: None,
+        pubkey_form: argos_core::argos_wallet_import::PubkeyForm::Compressed,
     });
     let data_parent = tempfile::tempdir().unwrap();
     let data_dir = data_parent.path().join("argos-data");
@@ -187,6 +188,254 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
         "{error}"
     );
     assert!(fake.captured_submissions().lock().unwrap().is_empty());
+}
+
+/// The standalone test secret in each of `forms`, in that order, and the
+/// address each resolves to on testnet.
+fn standalone_secret_in(
+    forms: &[argos_core::argos_wallet_import::PubkeyForm],
+) -> (argos_core::argos_wallet_import::ImportedKeys, Vec<String>) {
+    use argos_core::argos_wallet_import::keys::{Provenance, TransparentKey};
+    let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+    for form in forms {
+        keys.transparent.push(TransparentKey {
+            secret: secrecy::Secret::new(
+                common::standalone_transparent::STANDALONE_TRANSPARENT_SECRET,
+            ),
+            provenance: Provenance::Standalone,
+            created_at: None,
+            pubkey_form: *form,
+        });
+    }
+    let addresses = argos_core::imported::imported_transparent_keys(&keys)
+        .unwrap()
+        .iter()
+        .map(|key| {
+            argos_core::imported::encode_transparent_address(&key.address, ZeckNetwork::Testnet)
+        })
+        .collect();
+    (keys, addresses)
+}
+
+fn utxo_at(
+    address: &str,
+    txid_byte: u8,
+    value_zat: i64,
+) -> zcash_client_backend::proto::service::GetAddressUtxosReply {
+    zcash_client_backend::proto::service::GetAddressUtxosReply {
+        address: address.to_owned(),
+        txid: vec![txid_byte; 32],
+        index: 0,
+        script: Vec::new(),
+        value_zat,
+        height: 3_400_000,
+    }
+}
+
+/// Scan `keys` against `url` through the real service and wait for the scan
+/// to finish, whatever way it finishes.
+async fn scan_to_the_end(
+    keys: argos_core::argos_wallet_import::ImportedKeys,
+    url: &str,
+    data_dir: PathBuf,
+) -> (RecoveryService, ScanHandle, argos_core::ScanProgress) {
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: 1_000_000,
+                num_accounts: None,
+                gap_limit: 20,
+                transparent_scan: None,
+                lightwalletd_url: url.to_owned(),
+                confirmation_sources: Vec::new(),
+                data_dir,
+                network: ZeckNetwork::Testnet,
+                label: "uncompressed key coverage".to_owned(),
+            },
+            std::sync::Arc::new(argos_core::key_source::ImportedKeySource::new(keys)),
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            if progress.phase.is_terminal() {
+                break progress;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    (service, handle, progress)
+}
+
+fn testnet_destination() -> String {
+    argos_core::derive_accounts(
+        &SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()),
+        ZeckNetwork::Testnet,
+        1,
+    )
+    .unwrap()[0]
+        .unified_address
+        .clone()
+}
+
+fn sweep_request() -> SweepRequest {
+    SweepRequest {
+        destination: testnet_destination(),
+        memo: None,
+        max_fee_zatoshis: Some(100_000),
+        donation_rate: None,
+        donor_email: None,
+    }
+}
+
+/// One secret imported both ways: the scan finds both addresses' coins, the
+/// sweep reviews only the compressed key's, and the uncompressed key's coins
+/// are reported and named as skipped instead of vanishing.
+#[tokio::test]
+async fn local_uncompressed_coins_are_reported_and_skipped_never_swept() {
+    use argos_core::argos_wallet_import::PubkeyForm;
+    use common::fake_lightwalletd::FakeLightwalletd;
+
+    let (keys, addresses) =
+        standalone_secret_in(&[PubkeyForm::Compressed, PubkeyForm::Uncompressed]);
+    let (compressed, uncompressed) = (&addresses[0], &addresses[1]);
+    assert_ne!(compressed, uncompressed, "one secret, two addresses");
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .scripted_address_utxos(vec![
+            utxo_at(compressed, 0x71, 250_000),
+            utxo_at(uncompressed, 0x72, 400_000),
+        ])
+        .build()
+        .await
+        .unwrap();
+    let data_parent = tempfile::tempdir().unwrap();
+
+    let (service, handle, progress) =
+        scan_to_the_end(keys, &fake.url, data_parent.path().join("argos-data")).await;
+
+    assert_eq!(progress.phase, ScanPhase::Complete, "{:?}", progress.error);
+    assert_eq!(
+        progress.accounts[0].transparent_zatoshis, 250_000,
+        "the account holds only what a sweep moves"
+    );
+    assert_eq!(
+        progress.unsweepable_transparent,
+        vec![argos_core::models::UnsweepableTransparentFunds {
+            address: uncompressed.clone(),
+            zatoshis: 400_000,
+            utxo_count: 1,
+        }]
+    );
+
+    let reviewed = service
+        .propose_sweep(&handle, sweep_request())
+        .await
+        .unwrap();
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    assert_eq!(
+        reviewed.proposal.transactions[0].gross_zatoshis, 250_000,
+        "the uncompressed key's coins are in no leg"
+    );
+    let skipped: Vec<_> = reviewed
+        .proposal
+        .skipped_accounts
+        .iter()
+        .filter(|skip| skip.reason.contains(uncompressed.as_str()))
+        .collect();
+    assert_eq!(skipped.len(), 1, "{:?}", reviewed.proposal.skipped_accounts);
+    assert_eq!(skipped[0].gross_zatoshis, 400_000);
+    assert!(fake.captured_submissions().lock().unwrap().is_empty());
+}
+
+/// A wallet whose only funds sit at an uncompressed key's address: nothing is
+/// broadcast, the outcome names the coins as skipped, and the recovery does
+/// not read as complete.
+#[tokio::test]
+async fn local_uncompressed_only_sweep_leaves_the_recovery_incomplete() {
+    use argos_core::argos_wallet_import::PubkeyForm;
+    use argos_core::sweep_guidance::{completion_guidance, CompletionGuidanceInput};
+    use common::fake_lightwalletd::FakeLightwalletd;
+
+    let (keys, addresses) = standalone_secret_in(&[PubkeyForm::Uncompressed]);
+    let uncompressed = &addresses[0];
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .scripted_address_utxos(vec![utxo_at(uncompressed, 0x73, 400_000)])
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let data_parent = tempfile::tempdir().unwrap();
+
+    let (service, handle, progress) =
+        scan_to_the_end(keys, &fake.url, data_parent.path().join("argos-data")).await;
+    assert_eq!(progress.phase, ScanPhase::Complete, "{:?}", progress.error);
+    assert_eq!(progress.unsweepable_transparent.len(), 1);
+    assert_eq!(progress.unsweepable_transparent[0].zatoshis, 400_000);
+
+    let reviewed = service
+        .propose_sweep(&handle, sweep_request())
+        .await
+        .unwrap();
+    assert!(reviewed.proposal.transactions.is_empty());
+    let named = |skips: &[argos_core::models::SkippedSweepAccount]| {
+        skips
+            .iter()
+            .filter(|skip| {
+                skip.reason.contains(uncompressed.as_str()) && skip.gross_zatoshis == 400_000
+            })
+            .count()
+    };
+    assert_eq!(named(reviewed.proposal.skipped_accounts.as_slice()), 1);
+
+    let outcome = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
+        .await
+        .unwrap();
+    assert!(outcome.transactions.is_empty());
+    assert!(fake.captured_submissions().lock().unwrap().is_empty());
+    assert_eq!(
+        named(outcome.skipped_accounts.as_slice()),
+        1,
+        "named once, never twice"
+    );
+    let guidance = completion_guidance(&CompletionGuidanceInput::from_outcome(&outcome, false));
+    assert!(!guidance.recovery_complete);
+}
+
+/// A failed lookup of the uncompressed addresses ends the scan in an error.
+/// It is never shown as an empty balance.
+#[tokio::test]
+async fn local_failed_uncompressed_lookup_is_an_error_not_a_zero() {
+    use argos_core::argos_wallet_import::PubkeyForm;
+    use common::fake_lightwalletd::FakeLightwalletd;
+
+    // No scripted UTXOs and no upstream: every `GetAddressUtxos` fails.
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .build()
+        .await
+        .unwrap();
+    let (keys, _) = standalone_secret_in(&[PubkeyForm::Compressed, PubkeyForm::Uncompressed]);
+    let data_parent = tempfile::tempdir().unwrap();
+
+    let (_service, _handle, progress) =
+        scan_to_the_end(keys, &fake.url, data_parent.path().join("argos-data")).await;
+
+    assert_eq!(progress.phase, ScanPhase::Error);
+    assert!(progress.error.is_some());
+    assert!(progress.unsweepable_transparent.is_empty());
 }
 
 #[tokio::test]

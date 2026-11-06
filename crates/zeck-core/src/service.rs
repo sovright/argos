@@ -2080,6 +2080,7 @@ impl RecoveryService {
         )?;
         attach_direct_sweep_leg(&mut plan, &session.runtime, &standalone_transparent_indices)
             .await?;
+        attach_unsweepable_skips(&mut plan.quote, &progress);
         enforce_max_fee(plan.quote.total_fee_zatoshis, request.max_fee_zatoshis)?;
         let mut intent = ReviewedSweepIntent::capture(request, &session, &progress);
         intent.bind_plan(&plan)?;
@@ -2332,9 +2333,33 @@ impl RecoveryService {
                 "workspace removal was interrupted; retry cleanup before sweeping".to_owned(),
             ));
         }
+        // Read before the session moves into the sweep. Each route assembles
+        // its own outcome. The HD route already carries the review's skips
+        // (these among them); the others do not. So each skip is added here
+        // unless the outcome already has it: a sweep that leaves these coins
+        // behind must not read as a complete recovery (`recovery_complete`
+        // requires no skips), and none may be listed twice.
+        let unsweepable = session
+            .state
+            .lock()
+            .await
+            .progress
+            .unsweepable_transparent
+            .clone();
         let outcome = self
             .execute_sweep_locked(session, proposal_id, &registry_lease)
-            .await;
+            .await
+            .map(|mut outcome| {
+                for skip in unsweepable
+                    .iter()
+                    .filter_map(crate::models::UnsweepableTransparentFunds::as_skipped_sweep)
+                {
+                    if !outcome.skipped_accounts.contains(&skip) {
+                        outcome.skipped_accounts.push(skip);
+                    }
+                }
+                outcome
+            });
         if let Ok(ref completed) = outcome {
             self.last_sweep_outcomes
                 .lock()
@@ -2467,6 +2492,9 @@ impl RecoveryService {
             &standalone_transparent_indices,
         )
         .await?;
+        // The same skips the review carried: `authorize_current_plan`
+        // compares the whole quote, so the two plans must be built alike.
+        attach_unsweepable_skips(&mut current_plan.quote, &progress);
         let exact_fees = intent.authorize_current_plan(&current_plan)?;
         hd_leg_plan(&current_plan.legs, &tracked_accounts)?;
         let quoted_transactions = intent.quoted_transactions;
@@ -3235,6 +3263,24 @@ fn build_exact_sweep_proposal(
     })
 }
 
+/// Name every funded address of an uncompressed key as skipped in `quote`.
+///
+/// Those coins are in no leg: no sweep moves them yet. Applied to the
+/// reviewed plan and to the plan rebuilt at execute time alike, because
+/// `require_current_quote` compares the whole quote and the two must match.
+/// A skip already present is not added again.
+fn attach_unsweepable_skips(quote: &mut SweepProposal, progress: &ScanProgress) {
+    for skip in progress
+        .unsweepable_transparent
+        .iter()
+        .filter_map(crate::models::UnsweepableTransparentFunds::as_skipped_sweep)
+    {
+        if !quote.skipped_accounts.contains(&skip) {
+            quote.skipped_accounts.push(skip);
+        }
+    }
+}
+
 async fn attach_direct_sweep_leg(
     plan: &mut ExactSweepPlan,
     runtime: &RuntimeScanConfig,
@@ -3246,9 +3292,15 @@ async fn attach_direct_sweep_leg(
     let imported = runtime.key_source.imported_keys().ok_or_else(|| {
         ZeckError::StaleSweepProposal("direct sweep keys are no longer available".to_owned())
     })?;
+    // Aligned with the key file, because the indices below select from it.
     let all_keys = crate::imported::imported_transparent_keys(imported)?;
     let selected = if standalone_indices.is_empty() {
+        // The whole set, less what cannot be signed for: an uncompressed
+        // key's coins would make the builder refuse every input.
         all_keys
+            .into_iter()
+            .filter(crate::imported::ImportedTransparentKey::is_sweepable)
+            .collect()
     } else {
         let mut available = all_keys.into_iter().map(Some).collect::<Vec<_>>();
         standalone_indices
@@ -6065,6 +6117,7 @@ mod tests {
             sleep_event: None,
             in_sandblasting_zone: false,
             gap_extension: None,
+            unsweepable_transparent: Vec::new(),
         }
     }
 
@@ -7029,6 +7082,7 @@ mod tests {
             sleep_event: None,
             in_sandblasting_zone: false,
             gap_extension: None,
+            unsweepable_transparent: Vec::new(),
         }
     }
 
@@ -7153,6 +7207,7 @@ mod tests {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             }],
             ..Default::default()
         };
@@ -7843,6 +7898,7 @@ mod propose_workspace_guard_tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         let source = Arc::new(ImportedKeySource::new(keys));
         let source_dropped = Arc::downgrade(&source);
@@ -8263,6 +8319,7 @@ mod propose_workspace_guard_tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         assert_eq!(
             crate::key_source::classify_recovery_route(&keys),
@@ -8308,6 +8365,7 @@ mod propose_workspace_guard_tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         Arc::new(ImportedKeySource::new(keys))
     }
@@ -9581,6 +9639,7 @@ mod propose_workspace_guard_tests {
                     secret: Secret::new([byte; 32]),
                     provenance: Provenance::Standalone,
                     created_at: None,
+                    pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
                 });
             }
             Arc::new(ImportedKeySource::new(keys)) as Arc<dyn KeySource>
@@ -9754,6 +9813,7 @@ mod propose_workspace_guard_tests {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
             created_at: None,
+            pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
         });
         let address = crate::imported::encode_transparent_address(
             &crate::imported::imported_transparent_keys(&keys).unwrap()[0].address,
@@ -10948,7 +11008,11 @@ mod zip317_fee_fidelity_tests {
         let mut secret = secp256k1::SecretKey::from_slice(&[0x24; 32]).unwrap();
         let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
         let address = zcash_transparent::address::TransparentAddress::from_pubkey(&public);
-        let key = crate::imported::ImportedTransparentKey::new(&mut secret, address);
+        let key = crate::imported::ImportedTransparentKey::new(
+            &mut secret,
+            address,
+            argos_wallet_import::PubkeyForm::Compressed,
+        );
         let recipient = sapling::zip32::ExtendedSpendingKey::master(&[9; 32])
             .default_address()
             .1;

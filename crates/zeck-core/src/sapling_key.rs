@@ -628,6 +628,7 @@ mod tests {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
                 created_at: None,
+                pubkey_form: argos_wallet_import::PubkeyForm::Compressed,
             }],
             ..Default::default()
         };
