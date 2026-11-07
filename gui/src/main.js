@@ -1237,7 +1237,10 @@ $("birthday-estimate").addEventListener("click", async () => {
   setStatus("config-status", "", "");
   try {
     const height = await invoke("estimate_birthday_from_date", request);
-    if (!isCurrent()) return;
+    if (!isCurrent()) {
+      setBirthdayHint("Estimate discarded: the date or network settings changed while it ran.", "");
+      return;
+    }
     $("birthday-height").value = height;
     invalidateScanAuthority();
     birthdayTouched = true;

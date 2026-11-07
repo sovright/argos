@@ -23,7 +23,10 @@ pub const MAINNET_ACTIVATION_HEIGHT: u32 = 3_543_405;
 pub const TESTNET_ACTIVATION_HEIGHT: u32 = 4_465_026;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TIP_AGE: u64 = 30 * 60;
-const MAX_FUTURE_TIME: u64 = 5 * 60;
+/// Miners' timestamps legitimately run ahead of real time, and a local clock
+/// can run slow. Freshness is enforced by `MAX_TIP_AGE`; this bound only
+/// rejects a tip that is implausibly far ahead.
+const MAX_FUTURE_TIME: u64 = 30 * 60;
 
 pub fn activation_height(network: ZeckNetwork) -> Option<u32> {
     consensus_network(network)
@@ -72,12 +75,17 @@ fn validate_tip_evidence(
     #[cfg(not(feature = "argos-network"))]
     let local_clock = false;
     let timestamp = u64::from(block.time);
-    if !local_clock
-        && (timestamp == 0
-            || now.saturating_sub(timestamp) > MAX_TIP_AGE
-            || timestamp.saturating_sub(now) > MAX_FUTURE_TIME)
-    {
-        return Err(evidence_error("tip timestamp is stale or in the future"));
+    if !local_clock {
+        if timestamp == 0 || now.saturating_sub(timestamp) > MAX_TIP_AGE {
+            return Err(evidence_error(
+                "the server's latest block is too old to be a fresh chain tip; nothing was submitted. Try again later or use another lightwalletd server, and check that this computer's clock is not running fast",
+            ));
+        }
+        if timestamp.saturating_sub(now) > MAX_FUTURE_TIME {
+            return Err(evidence_error(
+                "the server's latest block is timestamped well ahead of this computer's clock; nothing was submitted. Check that the system clock is correct, then try again",
+            ));
+        }
     }
     Ok(height)
 }
@@ -300,8 +308,16 @@ mod tests {
         let mut bad = block.clone();
         bad.hash[0] ^= 1;
         assert!(validate_tip_evidence(ZeckNetwork::Mainnet, &info, &latest, &bad, now).is_err());
+        // A miner timestamp ten minutes ahead, or a local clock that slow,
+        // is ordinary and must not block submission.
+        let mut ahead = block.clone();
+        ahead.time = (now + 10 * 60) as u32;
+        assert!(validate_tip_evidence(ZeckNetwork::Mainnet, &info, &latest, &ahead, now).is_ok());
         let mut bad = block;
         bad.time = (now + MAX_FUTURE_TIME + 1) as u32;
-        assert!(validate_tip_evidence(ZeckNetwork::Mainnet, &info, &latest, &bad, now).is_err());
+        let err = validate_tip_evidence(ZeckNetwork::Mainnet, &info, &latest, &bad, now)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clock"), "{err}");
     }
 }
