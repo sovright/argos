@@ -62,7 +62,9 @@ NU7 sweep or imported-Sapling PCZT transaction has been observed mined for
 this release. The evidence behind 2.0.0 is the offline and fast-profile layers
 above, plus the unit and proposal tests listed below. The rehearsal stays the
 outstanding qualification item for supported recovery after NU7.
-No release, real-wallet funding or mainnet spending is authorized here.
+
+Apart from the 2.0.0 waiver above, no release, real-wallet funding or mainnet
+spending is authorized by this document.
 
 ## Local carry-forward results
 

@@ -1,6 +1,9 @@
-//! ZIP 218 transaction limits and lossless batching of recovery proposals.
+//! ZIP 218 shielded limits and lossless batching of recovery proposals.
 //!
-//! The consensus limits apply to blocks; a transaction must fit by itself.
+//! The consensus limits apply to whole blocks, shared by every transaction in
+//! them. A transaction must fit by itself, but one that fills the budget can
+//! only be mined in a block with no other shielded activity, so recovery
+//! batches leave most of the budget to other transactions.
 //! Counts include builder padding, and transparent inputs do not consume this budget.
 use nonempty::NonEmpty;
 #[allow(deprecated)]
@@ -24,6 +27,9 @@ use crate::error::{ZeckError, ZeckResult};
 pub const SAPLING_IO_LIMIT: usize = 300;
 pub const ORCHARD_ACTION_LIMIT: usize = 330;
 pub const GLOBAL_SHIELDED_LIMIT: usize = 330;
+/// Target notes per recovery transaction: with output padding, about a
+/// quarter of the per-block Sapling (82 of 300) and global (86 of 330) budgets.
+pub const RECOVERY_BATCH_NOTES: usize = 80;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ShieldedCounts {
@@ -156,17 +162,27 @@ pub(crate) fn independent_step<N: Clone>(
 /// Splitting is only required at NU7, and never imposes a transparent-input cap.
 /// Send-max has no change; an optional donation is apportioned from the reduced
 /// net amount after the additional transaction fees, preserving its fraction.
+///
+/// Batches aim for [`RECOVERY_BATCH_NOTES`] notes, well inside the per-block
+/// budget. Only when the wallet's value cannot pay the output padding of that
+/// many transactions does it fall back to fewer, larger batches, down to the
+/// fewest that fit a block.
 pub(crate) fn bound_send_max<P: Parameters, N: Clone>(
     params: &P,
     proposal: Proposal<StandardFeeRule, N>,
 ) -> ZeckResult<Proposal<StandardFeeRule, N>> {
     let height = BlockHeight::from(proposal.min_target_height());
-    if !params.is_nu_active(NetworkUpgrade::Nu7, height)
-        || validate_proposal(params, &proposal).is_ok()
-    {
+    if !params.is_nu_active(NetworkUpgrade::Nu7, height) {
         return Ok(proposal);
     }
+    let fits_block = validate_proposal(params, &proposal).is_ok();
     let original = proposal.steps().first();
+    let note_count = original
+        .shielded_inputs()
+        .map_or(0, |inputs| inputs.notes().len());
+    if fits_block && (proposal.steps().len() != 1 || note_count <= RECOVERY_BATCH_NOTES) {
+        return Ok(proposal);
+    }
     // An exactly balanced donation split still carries a zero-valued change
     // output (the SDK's change strategy emits one when change is zero). It
     // holds no value, and the batches below are built without change, so it
@@ -183,6 +199,11 @@ pub(crate) fn bound_send_max<P: Parameters, N: Clone>(
         || original.transaction_request().payments().is_empty()
         || original.transaction_request().payments().len() > 2
     {
+        // Headroom is a mining preference; a proposal that already fits a
+        // block is never refused for lacking it.
+        if fits_block {
+            return Ok(proposal);
+        }
         return Err(build_error(
             "oversized recovery proposal is not an independent send-max",
         ));
@@ -193,10 +214,11 @@ pub(crate) fn bound_send_max<P: Parameters, N: Clone>(
         .notes();
     // A batch with 298 notes plus the mandatory two Sapling outputs fits the
     // Sapling budget. Other pools' padded outputs still fit the global budget.
-    // Balance batch lengths to avoid leaving an uneconomic one-note tail.
-    let batch_count = notes.len().div_ceil(SAPLING_IO_LIMIT - 2);
-    let batch_size = notes.len() / batch_count;
-    let larger_batches = notes.len() % batch_count;
+    let fewest_batches = notes.len().div_ceil(SAPLING_IO_LIMIT - 2);
+    let preferred_batches = notes
+        .len()
+        .div_ceil(RECOVERY_BATCH_NOTES)
+        .max(fewest_batches);
     let payments: Vec<_> = original.transaction_request().payments().values().collect();
     let original_net: u64 = payments.iter().try_fold(0u64, |sum, p| {
         sum.checked_add(u64::from(
@@ -208,110 +230,132 @@ pub(crate) fn bound_send_max<P: Parameters, N: Clone>(
     if original_net == 0 {
         return Err(build_error("send-max payment amount is zero"));
     }
-    // Distribute fee-paying value, not just note counts. Contiguous chunks
-    // can strand near-marginal notes in a batch with no value for output
-    // padding even when the complete wallet can pay every batch's fees.
-    // Stable value ordering and index tie-breaks make review deterministic.
-    let mut notes: Vec<_> = notes.iter().cloned().collect();
-    notes.sort_by_key(|note| std::cmp::Reverse(u64::from(note.note().value())));
-    let mut batches = vec![Vec::new(); batch_count];
-    let mut available = std::collections::BinaryHeap::new();
-    for index in 0..batch_count {
-        available.push(std::cmp::Reverse((0u64, 0usize, index)));
-    }
-    for note in notes {
-        let std::cmp::Reverse((surplus, count, index)) = available
-            .pop()
-            .expect("batch capacity covers every selected note");
-        let surplus = surplus
-            .checked_add(u64::from(note.note().value()).saturating_sub(5_000))
-            .ok_or_else(|| build_error("batch fee-paying value overflow"))?;
-        batches[index].push(note);
-        let capacity = batch_size + usize::from(index < larger_batches);
-        if count + 1 < capacity {
-            available.push(std::cmp::Reverse((surplus, count + 1, index)));
+    let split = |batch_count: usize| -> ZeckResult<Vec<Step<N>>> {
+        // Balance batch lengths to avoid leaving an uneconomic one-note tail.
+        let batch_size = notes.len() / batch_count;
+        let larger_batches = notes.len() % batch_count;
+        // Distribute fee-paying value, not just note counts. Contiguous chunks
+        // can strand near-marginal notes in a batch with no value for output
+        // padding even when the complete wallet can pay every batch's fees.
+        // Stable value ordering and index tie-breaks make review deterministic.
+        let mut notes: Vec<_> = notes.iter().cloned().collect();
+        notes.sort_by_key(|note| std::cmp::Reverse(u64::from(note.note().value())));
+        let mut batches = vec![Vec::new(); batch_count];
+        let mut available = std::collections::BinaryHeap::new();
+        for index in 0..batch_count {
+            available.push(std::cmp::Reverse((0u64, 0usize, index)));
+        }
+        for note in notes {
+            let std::cmp::Reverse((surplus, count, index)) = available
+                .pop()
+                .expect("batch capacity covers every selected note");
+            let surplus = surplus
+                .checked_add(u64::from(note.note().value()).saturating_sub(5_000))
+                .ok_or_else(|| build_error("batch fee-paying value overflow"))?;
+            batches[index].push(note);
+            let capacity = batch_size + usize::from(index < larger_batches);
+            if count + 1 < capacity {
+                available.push(std::cmp::Reverse((surplus, count + 1, index)));
+            }
+        }
+        let mut steps = Vec::new();
+        for chunk in batches {
+            let inputs = ShieldedInputs::from_parts(
+                NonEmpty::from_vec(chunk.clone()).expect("nonempty chunk"),
+            );
+            let gross: u64 = chunk.iter().try_fold(0u64, |sum, n| {
+                sum.checked_add(u64::from(n.note().value()))
+                    .ok_or_else(|| build_error("input value overflow"))
+            })?;
+            // A balanced candidate preserves the recipient/pool structure, letting
+            // the SDK count version-specific padding before computing the real fee.
+            let make_step = |fee: Zatoshis| -> ZeckResult<Step<N>> {
+                let net = gross
+                    .checked_sub(u64::from(fee))
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| build_error("recovery batch does not cover its ZIP 317 fee"))?;
+                let mut remaining = net;
+                let mut batch_payments = Vec::new();
+                for (i, payment) in payments.iter().enumerate() {
+                    let amount = if i + 1 == payments.len() {
+                        remaining
+                    } else {
+                        ((u128::from(net)
+                            * u128::from(u64::from(payment.amount().expect("checked amount"))))
+                            / u128::from(original_net)) as u64
+                    };
+                    remaining -= amount;
+                    batch_payments.push(
+                        zip321::Payment::new(
+                            payment.recipient_address().clone(),
+                            Some(Zatoshis::from_u64(amount).map_err(build_error)?),
+                            payment.memo().cloned(),
+                            payment.label().cloned(),
+                            payment.message().cloned(),
+                            payment.other_params().to_vec(),
+                        )
+                        .map_err(build_error)?,
+                    );
+                }
+                Step::from_parts(
+                    &[],
+                    zip321::TransactionRequest::new(batch_payments).map_err(build_error)?,
+                    original.payment_pools().clone(),
+                    vec![],
+                    Some(inputs.clone()),
+                    original.anchor_height(),
+                    vec![],
+                    TransactionBalance::new(vec![], fee).map_err(build_error)?,
+                    false,
+                    params.is_nu_active(NetworkUpgrade::Nu6_3, height),
+                )
+                .map_err(build_error)
+            };
+            let candidate = make_step(Zatoshis::ZERO)?;
+            let count = counts(params, height, &candidate)?;
+            count.validate()?;
+            let fee = proposal
+                .fee_rule()
+                .fee_required(
+                    params,
+                    height,
+                    [],
+                    [],
+                    count.sapling_spends,
+                    count.sapling_outputs,
+                    count.orchard,
+                    count.ironwood,
+                )
+                .map_err(build_error)?;
+            steps.push(make_step(fee)?);
+        }
+        Ok(steps)
+    };
+    // A proposal that already fits a block keeps its single transaction
+    // rather than being rebuilt as one batch.
+    let lowest = if fits_block { 2 } else { fewest_batches };
+    let mut last_error = None;
+    for batch_count in (lowest..=preferred_batches).rev() {
+        match split(batch_count) {
+            Ok(steps) => {
+                let bounded = Proposal::multi_step(
+                    *proposal.fee_rule(),
+                    proposal.min_target_height(),
+                    proposal.confirmations_policy(),
+                    NonEmpty::from_vec(steps).expect("selected notes"),
+                )
+                .map_err(build_error)?
+                .with_proposed_version(proposal.proposed_version());
+                validate_proposal(params, &bounded)?;
+                return Ok(bounded);
+            }
+            Err(error) => last_error = Some(error),
         }
     }
-    let mut steps = Vec::new();
-    for chunk in batches {
-        let inputs =
-            ShieldedInputs::from_parts(NonEmpty::from_vec(chunk.clone()).expect("nonempty chunk"));
-        let gross: u64 = chunk.iter().try_fold(0u64, |sum, n| {
-            sum.checked_add(u64::from(n.note().value()))
-                .ok_or_else(|| build_error("input value overflow"))
-        })?;
-        // A balanced candidate preserves the recipient/pool structure, letting
-        // the SDK count version-specific padding before computing the real fee.
-        let make_step = |fee: Zatoshis| -> ZeckResult<Step<N>> {
-            let net = gross
-                .checked_sub(u64::from(fee))
-                .filter(|n| *n > 0)
-                .ok_or_else(|| build_error("recovery batch does not cover its ZIP 317 fee"))?;
-            let mut remaining = net;
-            let mut batch_payments = Vec::new();
-            for (i, payment) in payments.iter().enumerate() {
-                let amount = if i + 1 == payments.len() {
-                    remaining
-                } else {
-                    ((u128::from(net)
-                        * u128::from(u64::from(payment.amount().expect("checked amount"))))
-                        / u128::from(original_net)) as u64
-                };
-                remaining -= amount;
-                batch_payments.push(
-                    zip321::Payment::new(
-                        payment.recipient_address().clone(),
-                        Some(Zatoshis::from_u64(amount).map_err(build_error)?),
-                        payment.memo().cloned(),
-                        payment.label().cloned(),
-                        payment.message().cloned(),
-                        payment.other_params().to_vec(),
-                    )
-                    .map_err(build_error)?,
-                );
-            }
-            Step::from_parts(
-                &[],
-                zip321::TransactionRequest::new(batch_payments).map_err(build_error)?,
-                original.payment_pools().clone(),
-                vec![],
-                Some(inputs.clone()),
-                original.anchor_height(),
-                vec![],
-                TransactionBalance::new(vec![], fee).map_err(build_error)?,
-                false,
-                params.is_nu_active(NetworkUpgrade::Nu6_3, height),
-            )
-            .map_err(build_error)
-        };
-        let candidate = make_step(Zatoshis::ZERO)?;
-        let count = counts(params, height, &candidate)?;
-        count.validate()?;
-        let fee = proposal
-            .fee_rule()
-            .fee_required(
-                params,
-                height,
-                [],
-                [],
-                count.sapling_spends,
-                count.sapling_outputs,
-                count.orchard,
-                count.ironwood,
-            )
-            .map_err(build_error)?;
-        steps.push(make_step(fee)?);
+    if fits_block {
+        return Ok(proposal);
     }
-    let bounded = Proposal::multi_step(
-        *proposal.fee_rule(),
-        proposal.min_target_height(),
-        proposal.confirmations_policy(),
-        NonEmpty::from_vec(steps).expect("selected notes"),
-    )
-    .map_err(build_error)?
-    .with_proposed_version(proposal.proposed_version());
-    validate_proposal(params, &bounded)?;
-    Ok(bounded)
+    Err(last_error.expect("at least one batch count is attempted"))
 }
 
 #[cfg(test)]
@@ -613,10 +657,11 @@ mod tests {
         assert!(initial.orchard <= ORCHARD_ACTION_LIMIT);
         assert!(validate_proposal(&params, &original).is_err());
         let bounded = bound_send_max(&params, original.clone()).unwrap();
-        assert_eq!(bounded.steps().len(), 2);
+        assert_eq!(bounded.steps().len(), 5);
+        // Each batch pads its single Ironwood output to two actions.
         assert_eq!(
             assert_multi_pool_batches(&original, &bounded, [0, 329, 0]),
-            (329 + 4) * 5_000
+            (329 + 2 * 5) * 5_000
         );
     }
 
@@ -629,7 +674,7 @@ mod tests {
         assert_eq!((initial.orchard, initial.ironwood), (0, 331));
         assert!(validate_proposal(&params, &original).is_err());
         let bounded = bound_send_max(&params, original.clone()).unwrap();
-        assert_eq!(bounded.steps().len(), 2);
+        assert_eq!(bounded.steps().len(), 5);
         assert_eq!(
             assert_multi_pool_batches(&original, &bounded, [0, 0, 331]),
             331 * 5_000
@@ -657,7 +702,7 @@ mod tests {
         assert!(initial.ironwood <= ORCHARD_ACTION_LIMIT);
         assert!(validate_proposal(&params, &original).is_err());
         let bounded = bound_send_max(&params, original.clone()).unwrap();
-        assert_eq!(bounded.steps().len(), 2);
+        assert_eq!(bounded.steps().len(), 5);
         for step in bounded.steps() {
             for pool in [PoolType::SAPLING, PoolType::ORCHARD, PoolType::IRONWOOD] {
                 assert!(step.input_count_in_pool(pool) > 0);
@@ -673,10 +718,20 @@ mod tests {
     fn real_multi_pool_proposals_observe_padded_limits_at_nu7_activation() {
         let params = zcash_protocol::consensus::MAIN_NETWORK;
         let activation = params.activation_height(NetworkUpgrade::Nu7).unwrap();
-        for pool_counts in [[0, 328, 0], [0, 0, 330], [100, 100, 128]] {
+        for pool_counts in [[0, 80, 0], [0, 0, 80], [20, 20, 40]] {
             let original = multi_pool_proposal(pool_counts, activation);
             let bounded = bound_send_max(&params, original.clone()).unwrap();
             assert_eq!(bounded.steps().len(), 1);
+            assert_multi_pool_batches(&original, &bounded, pool_counts);
+        }
+        // These fit one block on their own, but only by filling its budget,
+        // so they are still split to leave room for other transactions.
+        for pool_counts in [[0, 328, 0], [0, 0, 330], [100, 100, 128]] {
+            let original = multi_pool_proposal(pool_counts, activation);
+            assert!(validate_proposal(&params, &original).is_ok());
+            let bounded = bound_send_max(&params, original.clone()).unwrap();
+            let notes: usize = pool_counts.iter().sum();
+            assert_eq!(bounded.steps().len(), notes.div_ceil(RECOVERY_BATCH_NOTES));
             assert_multi_pool_batches(&original, &bounded, pool_counts);
         }
         for pool_counts in [[0, 329, 0], [0, 0, 331], [100, 100, 129]] {
@@ -702,7 +757,7 @@ mod tests {
         let proposal = sapling_proposal(901, height);
         assert!(validate_proposal(&params, &proposal).is_err());
         let bounded = bound_send_max(&params, proposal).unwrap();
-        assert_eq!(bounded.steps().len(), 4);
+        assert_eq!(bounded.steps().len(), 12);
         validate_proposal(&params, &bounded).unwrap();
         let mut ids: Vec<_> = bounded
             .steps()
@@ -721,6 +776,7 @@ mod tests {
         for (index, step) in bounded.steps().iter().enumerate() {
             let independent = independent_step(&bounded, index).unwrap();
             assert_eq!(independent.steps().len(), 1);
+            assert!(step.shielded_inputs().unwrap().notes().len() <= RECOVERY_BATCH_NOTES);
             let fee = u64::from(step.balance().fee_required());
             assert_eq!(
                 fee,
@@ -754,6 +810,8 @@ mod tests {
         values[0] = 100_000;
         values[1] = 100_000;
         let proposal = sapling_values_proposal(&values, height, Some(recipient));
+        // Four 80-note batches would leave two without a note able to pay
+        // their output padding, so batching falls back to two larger ones.
         let bounded = bound_send_max(&params, proposal).unwrap();
         assert_eq!(bounded.steps().len(), 2);
         let mut accounted = 0;
@@ -897,19 +955,63 @@ mod tests {
                 .len(),
             1
         );
+        for (notes, batches) in [(80, 1), (81, 2), (298, 4), (299, 4)] {
+            assert_eq!(
+                bound_send_max(&params, sapling_proposal(notes, activation))
+                    .unwrap()
+                    .steps()
+                    .len(),
+                batches,
+                "{notes} notes"
+            );
+        }
+    }
+
+    /// Headroom is a preference. A proposal that already fits a block but
+    /// cannot be split (here, real change) is kept as one transaction.
+    #[test]
+    fn unsplittable_proposal_that_fits_a_block_is_kept() {
+        let params = zcash_protocol::consensus::MAIN_NETWORK;
+        let height = params.activation_height(NetworkUpgrade::Nu7).unwrap();
+        let template = sapling_proposal(150, height);
+        let step = template.steps().first();
+        let payment = step.transaction_request().payments().get(&0).unwrap();
+        let original = Proposal::single_step(
+            zip321::TransactionRequest::new(vec![zip321::Payment::new(
+                payment.recipient_address().clone(),
+                Some(Zatoshis::from_u64(u64::from(payment.amount().unwrap()) - 1).unwrap()),
+                payment.memo().cloned(),
+                None,
+                None,
+                vec![],
+            )
+            .unwrap()])
+            .unwrap(),
+            step.payment_pools().clone(),
+            vec![],
+            step.shielded_inputs().cloned(),
+            step.anchor_height().unwrap(),
+            TransactionBalance::new(
+                vec![zcash_client_backend::fees::ChangeValue::sapling(
+                    Zatoshis::from_u64(1).unwrap(),
+                    None,
+                )],
+                step.balance().fee_required(),
+            )
+            .unwrap(),
+            StandardFeeRule::Zip317,
+            height.into(),
+            template.confirmations_policy(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(validate_proposal(&params, &original).is_ok());
+        let kept = bound_send_max(&params, original.clone()).unwrap();
+        assert_eq!(kept.steps().len(), 1);
         assert_eq!(
-            bound_send_max(&params, sapling_proposal(298, activation))
-                .unwrap()
-                .steps()
-                .len(),
-            1
-        );
-        assert_eq!(
-            bound_send_max(&params, sapling_proposal(299, activation))
-                .unwrap()
-                .steps()
-                .len(),
-            2
+            kept.steps().first().balance(),
+            original.steps().first().balance()
         );
     }
 
